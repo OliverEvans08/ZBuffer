@@ -1,4 +1,4 @@
-# 3D Engine
+# ZBuffer
 
 A software-rendered 3D engine built in Java. This project aims to implement the core features of a 3D engine, such as rendering objects, handling user input, and camera movement. The engine is designed with optimization in mind, including caching and vertex simplification for better performance.
 
