@@ -5,6 +5,9 @@
       <module fileurl="file://$PROJECT_DIR$/.idea/modules/Tempp.iml" filepath="$PROJECT_DIR$/.idea/modules/Tempp.iml" />
       <module fileurl="file://$PROJECT_DIR$/.idea/modules/Tempp.main.iml" filepath="$PROJECT_DIR$/.idea/modules/Tempp.main.iml" />
       <module fileurl="file://$PROJECT_DIR$/.idea/modules/Tempp.test.iml" filepath="$PROJECT_DIR$/.idea/modules/Tempp.test.iml" />
+      <module fileurl="file://$PROJECT_DIR$/.idea/modules/jge.Tempp.iml" filepath="$PROJECT_DIR$/.idea/modules/jge.Tempp.iml" />
+      <module fileurl="file://$PROJECT_DIR$/.idea/modules/jge.Tempp.main.iml" filepath="$PROJECT_DIR$/.idea/modules/jge.Tempp.main.iml" />
+      <module fileurl="file://$PROJECT_DIR$/.idea/modules/jge.Tempp.test.iml" filepath="$PROJECT_DIR$/.idea/modules/jge.Tempp.test.iml" />
     </modules>
   </component>
 </project>
