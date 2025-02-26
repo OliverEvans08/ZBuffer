@@ -7,7 +7,7 @@ A software-rendered 3D engine built in Java. This project aims to implement the 
 - **Camera Movement**: Implement camera controls for navigating the 3D environment.
 - **Input Handling**: Handle keyboard and mouse input for user interaction.
 - **Optimized Performance**: Includes caching for trigonometric values, vertex transformation, and distance-based vertex simplification.
-- **Particle System**: (Optional, if you plan to implement it) Add particles in the view.
+- **Particle System**: Add particles in the view.
 - **Flight Mode**: Toggle between flight and regular movement mode.
 
 ## Requirements
