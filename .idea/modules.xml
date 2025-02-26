@@ -2,7 +2,9 @@
 <project version="4">
   <component name="ProjectModuleManager">
     <modules>
-      <module fileurl="file://$PROJECT_DIR$/.idea/ZBuffer.iml" filepath="$PROJECT_DIR$/.idea/ZBuffer.iml" />
+      <module fileurl="file://$PROJECT_DIR$/.idea/modules/Tempp.iml" filepath="$PROJECT_DIR$/.idea/modules/Tempp.iml" />
+      <module fileurl="file://$PROJECT_DIR$/.idea/modules/Tempp.main.iml" filepath="$PROJECT_DIR$/.idea/modules/Tempp.main.iml" />
+      <module fileurl="file://$PROJECT_DIR$/.idea/modules/Tempp.test.iml" filepath="$PROJECT_DIR$/.idea/modules/Tempp.test.iml" />
     </modules>
   </component>
 </project>
