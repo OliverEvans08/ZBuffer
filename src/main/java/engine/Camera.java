@@ -70,15 +70,12 @@ public class Camera {
         }
     }
 
-    public void moveCamera(double dx, double dy, double dz, double delta) {
-        double cosYaw = Math.cos(yaw), sinYaw = Math.sin(yaw);
-        this.x += (dx * cosYaw - dz * sinYaw) * delta;
-        this.y += dy * delta;
-        this.z += (dz * cosYaw + dx * sinYaw) * delta;
-    }
-
     public void moveCamera(double delta) {
-        moveCamera(dx, dy, dz, delta);
+        double cosYaw = Math.cos(yaw);
+        double sinYaw = Math.sin(yaw);
+        x += (dx * cosYaw - dz * sinYaw) * delta;
+        y += dy * delta;
+        z += (dz * cosYaw + dx * sinYaw) * delta;
     }
 
     public boolean collidesWith(GameObject obj) {
@@ -114,7 +111,7 @@ public class Camera {
 
         if (penetrationX < penetrationY && penetrationX < penetrationZ) {
             x += (x - bounds[0] < bounds[1] - x) ? -penetrationX : penetrationX;
-        } else if (penetrationY < penetrationX && penetrationY < penetrationZ) {
+        } else if (penetrationY < penetrationX) {
             y += (y - bounds[2] < bounds[3] - y) ? -penetrationY : penetrationY;
             onGround = true;
             yVelocity = 0;

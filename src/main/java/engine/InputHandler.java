@@ -67,48 +67,28 @@ public class InputHandler implements KeyListener, MouseMotionListener, MouseList
 
     private void handleMovementKeys(int keyCode) {
         switch (keyCode) {
-            case KeyEvent.VK_W:
-                camera.dz += MOVE_SPEED;
-                break;
-            case KeyEvent.VK_S:
-                camera.dz -= MOVE_SPEED;
-                break;
-            case KeyEvent.VK_A:
-                camera.dx -= MOVE_SPEED;
-                break;
-            case KeyEvent.VK_D:
-                camera.dx += MOVE_SPEED;
-                break;
-            case KeyEvent.VK_SPACE:
-                handleJumpOrFlight(true);
-                break;
-            case KeyEvent.VK_SHIFT:
-                handleJumpOrFlight(false);
-                break;
-            default:
-                break;
+            case KeyEvent.VK_W: camera.dz += MOVE_SPEED; break;
+            case KeyEvent.VK_S: camera.dz -= MOVE_SPEED; break;
+            case KeyEvent.VK_A: camera.dx -= MOVE_SPEED; break;
+            case KeyEvent.VK_D: camera.dx += MOVE_SPEED; break;
+            case KeyEvent.VK_SPACE: handleJumpOrFlight(true); break;
+            case KeyEvent.VK_SHIFT: handleJumpOrFlight(false); break;
+            default: break;
         }
     }
 
     private boolean handleActionKeys(int keyCode) {
         switch (keyCode) {
-            case KeyEvent.VK_F:
-                addParticleInView();
-                return true;
-            case KeyEvent.VK_G:
-                toggleFlightMode();
-                return true;
-            case KeyEvent.VK_P:
-                gameEngine.clickGUI.setOpen(!gameEngine.clickGUI.isOpen());
-                return true;
-            default:
-                return false;
+            case KeyEvent.VK_F: addParticleInView(); return true;
+            case KeyEvent.VK_G: toggleFlightMode(); return true;
+            case KeyEvent.VK_P: toggleGUI(); return true;
+            default: return false;
         }
     }
 
     private void handleJumpOrFlight(boolean isAscending) {
         if (camera.flightMode) {
-            camera.dy += (isAscending ? MOVE_SPEED : -MOVE_SPEED);
+            camera.dy += isAscending ? MOVE_SPEED : -MOVE_SPEED;
         } else if (isAscending) {
             camera.jump();
         }
@@ -116,6 +96,10 @@ public class InputHandler implements KeyListener, MouseMotionListener, MouseList
 
     private void toggleFlightMode() {
         camera.setFlightMode(!camera.flightMode);
+    }
+
+    private void toggleGUI() {
+        gameEngine.clickGUI.setOpen(!gameEngine.clickGUI.isOpen());
     }
 
     private void addParticleInView() {
@@ -126,7 +110,7 @@ public class InputHandler implements KeyListener, MouseMotionListener, MouseList
             double newX = camera.x + Math.cos(pitch) * Math.sin(yaw);
             double newY = camera.y + Math.sin(pitch);
             double newZ = camera.z + Math.cos(pitch) * Math.cos(yaw);
-
+            // Here you can add the logic to actually spawn the particle (e.g. gameEngine.addParticle(newX, newY, newZ))
         }
     }
 
