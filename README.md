@@ -17,7 +17,7 @@ A software-rendered 3D engine built in Java. This project aims to implement the 
 ## Setup Instructions
 1. Clone the repository:
     ```bash
-    git clone https://github.com/your-username/3d-engine.git
+    git clone https://github.com/OliverEvans08/ZBuffer
     ```
 
 2. Navigate to the project directory:
