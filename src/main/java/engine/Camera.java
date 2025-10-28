@@ -21,7 +21,7 @@ public class Camera {
     public double dx = 0, dy = 0, dz = 0;
     public double yVelocity = 0;
 
-    private final GameEngine gameEngine;
+    final GameEngine gameEngine;
 
     public Camera(double x, double y, double z, double pitch, double yaw, GameEngine gameEngine) {
         this.x = x;
@@ -95,7 +95,6 @@ public class Camera {
 
         final double halfW = WIDTH * 0.5;
         for (GameObject obj : gameEngine.rootObjects) {
-            // Only collide with solid objects
             if (!obj.isFull()) continue;
 
             double[] b = getTransformedObjectBounds(obj);

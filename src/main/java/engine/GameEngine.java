@@ -1,5 +1,11 @@
 package engine;
 
+import engine.core.GameClock;
+import engine.event.EventBus;
+import engine.event.events.GuiToggleRequestedEvent;
+import engine.event.events.GuiToggledEvent;
+import engine.event.events.TickEvent;
+import engine.systems.PlayerController;
 import gui.ClickGUI;
 import objects.GameObject;
 import objects.fixed.Cube;
@@ -14,59 +20,72 @@ import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
 
 public class GameEngine extends JPanel implements Runnable {
+
     public static final int WIDTH = 1920;
     public static final int HEIGHT = 1080;
 
+    // Core
+    public final EventBus eventBus;
+    private final GameClock clock;
+
+    // Subsystems
     public final Camera camera;
     public final InputHandler inputHandler;
     public final Renderer renderer;
     public final SoundEngine soundEngine;
     public final ClickGUI clickGUI;
+    private final PlayerController playerController;
 
+    // Scene graph roots
     public List<GameObject> rootObjects;
+
+    // Stats
     public long lastTime = System.nanoTime();
     public int frames = 0;
     public int fps = 0;
 
+    // Back buffer
     private VolatileImage buffer;
 
+    // Settings
     private double fovDegrees = 70.0;
     private double renderDistance = 200.0;
 
     public GameEngine() {
-        camera = new Camera(0, 0.0, 0, 0, 0, this);
-        rootObjects = new CopyOnWriteArrayList<>();
-        renderer = new Renderer(camera, this);
-        soundEngine = new SoundEngine("./src/main/java/sound/wavs");
-        clickGUI = new ClickGUI(this);
-        inputHandler = new InputHandler(camera, this);
+        // Event + clock
+        this.eventBus = new EventBus();
+        this.clock = new GameClock(1.0 / 60.0); // fixed 60 Hz tick
+
+        // World
+        this.camera = new Camera(0, 0.0, 0, 0, 0, this);
+        this.rootObjects = new CopyOnWriteArrayList<>();
+        this.renderer = new Renderer(camera, this);
+        this.soundEngine = new SoundEngine("./src/main/java/sound/wavs");
+        this.clickGUI = new ClickGUI(this);
+
+        // Input wired to EventBus (no direct world mutation)
+        this.inputHandler = new InputHandler(eventBus, this);
+
+        // Systems that react to events and mutate state
+        this.playerController = new PlayerController(camera, eventBus);
 
         setupWindow();
         setupInputListeners();
-
-        // Start with mouse grabbed (GUI closed).
         inputHandler.centerCursor(this);
-
         initializeGameObjects();
+
+        // Basic UI events
+        eventBus.subscribe(GuiToggleRequestedEvent.class, e -> clickGUI.setOpen(!clickGUI.isOpen()));
+        // When GUI actually toggles, publish an explicit signal
+        // (ClickGUI will call onGuiToggled below which emits GuiToggledEvent)
 
         new Thread(this, "GameLoop").start();
     }
 
-    public double getFovRadians() {
-        return Math.toRadians(fovDegrees);
-    }
-
-    public void setFovDegrees(double fovDegrees) {
-        this.fovDegrees = Math.max(30.0, Math.min(120.0, fovDegrees));
-    }
-
-    public double getRenderDistance() {
-        return Math.max(5.0, renderDistance);
-    }
-
-    public void setRenderDistance(double renderDistance) {
-        this.renderDistance = Math.max(5.0, renderDistance);
-    }
+    public double getFovRadians() { return Math.toRadians(fovDegrees); }
+    public void setFovDegrees(double fovDegrees) { this.fovDegrees = Math.max(30.0, Math.min(120.0, fovDegrees)); }
+    public double getRenderDistance() { return Math.max(5.0, renderDistance); }
+    public void setRenderDistance(double renderDistance) { this.renderDistance = Math.max(5.0, renderDistance); }
 
     private void setupWindow() {
         setPreferredSize(new Dimension(WIDTH, HEIGHT));
@@ -123,7 +142,6 @@ public class GameEngine extends JPanel implements Runnable {
 
             Graphics2D g2d = buffer.createGraphics();
             try {
-                // Keep AA off for speed
                 g2d.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_OFF);
                 renderer.clearScreen(g2d, WIDTH, HEIGHT);
                 renderer.render(g2d, rootObjects, WIDTH, HEIGHT);
@@ -172,28 +190,37 @@ public class GameEngine extends JPanel implements Runnable {
 
     @Override
     public void run() {
-        long lastLoopTime = System.nanoTime();
-        final double tick = 1.0 / 60.0;
-
-        double delta = 0;
+        long lastNanos = System.nanoTime();
         while (true) {
             long now = System.nanoTime();
-            delta += (now - lastLoopTime) / 1_000_000_000.0;
-            lastLoopTime = now;
+            double elapsed = (now - lastNanos) / 1_000_000_000.0;
+            lastNanos = now;
 
-            while (delta >= tick) {
-                updateGameLoop(tick);
-                delta -= tick;
+            // Accumulate and run fixed update steps
+            clock.addElapsed(elapsed);
+            while (clock.stepReady()) {
+                double dt = clock.fixedDeltaSeconds();
+                eventBus.publish(new TickEvent(TickEvent.Phase.PRE, dt));
+
+                fixedUpdate(dt);
+
+                eventBus.publish(new TickEvent(TickEvent.Phase.POST, dt));
+                clock.consumeStep();
             }
 
+            // Render (as fast as Swing allows)
             repaint();
             calculateFPS(now);
             try { Thread.sleep(1); } catch (InterruptedException ignored) {}
         }
     }
 
-    private void updateGameLoop(double delta) {
-        inputHandler.updateCameraMovement();
+    private void fixedUpdate(double delta) {
+        // Systems first (input intents -> apply to world)
+        inputHandler.updatePerTick(); // gathers state & emits MovementIntent, etc.
+        playerController.updatePerTick(delta); // optional hook (small smoothing, etc.)
+
+        // World simulation
         camera.update(delta);
         soundEngine.tick();
 
@@ -221,16 +248,16 @@ public class GameEngine extends JPanel implements Runnable {
     }
 
     /**
-     * Called by ClickGUI whenever it opens/closes so we can toggle mouse grab.
+     * Called by ClickGUI whenever it actually toggles.
      */
     public void onGuiToggled(boolean open) {
         if (open) {
             showCursor();
         } else {
-            inputHandler.centerCursor(this); // recenters & hides
+            inputHandler.centerCursor(this);
         }
-        // Ensure we retain keyboard focus either way
         requestFocusInWindow();
+        eventBus.publish(new GuiToggledEvent(open));
     }
 
     private void drawDebugInfo(Graphics g) {
