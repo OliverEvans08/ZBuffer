@@ -1,8 +1,5 @@
 package util;
 
-import util.Vector3d;
-
-import java.awt.*;
 import java.util.ArrayList;
 
 public class ObjectUtils {
@@ -24,14 +21,8 @@ public class ObjectUtils {
             p2 = 2 * dz - dx;
             while (x != x1) {
                 x += xs;
-                if (p1 >= 0) {
-                    y += ys;
-                    p1 -= 2 * dx;
-                }
-                if (p2 >= 0) {
-                    z += zs;
-                    p2 -= 2 * dx;
-                }
+                if (p1 >= 0) { y += ys; p1 -= 2 * dx; }
+                if (p2 >= 0) { z += zs; p2 -= 2 * dx; }
                 p1 += 2 * dy;
                 p2 += 2 * dz;
                 v.add(new Vector3d(x, y, z));
@@ -41,14 +32,8 @@ public class ObjectUtils {
             p2 = 2 * dz - dy;
             while (y != y1) {
                 y += ys;
-                if (p1 >= 0) {
-                    x += xs;
-                    p1 -= 2 * dy;
-                }
-                if (p2 >= 0) {
-                    z += zs;
-                    p2 -= 2 * dy;
-                }
+                if (p1 >= 0) { x += xs; p1 -= 2 * dy; }
+                if (p2 >= 0) { z += zs; p2 -= 2 * dy; }
                 p1 += 2 * dx;
                 p2 += 2 * dz;
                 v.add(new Vector3d(x, y, z));
@@ -58,14 +43,8 @@ public class ObjectUtils {
             p2 = 2 * dx - dz;
             while (z != z1) {
                 z += zs;
-                if (p1 >= 0) {
-                    y += ys;
-                    p1 -= 2 * dz;
-                }
-                if (p2 >= 0) {
-                    x += xs;
-                    p2 -= 2 * dz;
-                }
+                if (p1 >= 0) { y += ys; p1 -= 2 * dz; }
+                if (p2 >= 0) { x += xs; p2 -= 2 * dz; }
                 p1 += 2 * dy;
                 p2 += 2 * dx;
                 v.add(new Vector3d(x, y, z));

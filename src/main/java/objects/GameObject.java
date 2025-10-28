@@ -4,17 +4,13 @@ import util.Matrix4;
 import util.Transform;
 import util.Vector3;
 
-import javax.imageio.ImageIO;
 import java.awt.*;
-import java.awt.image.BufferedImage;
-import java.io.File;
-import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 
 public abstract class GameObject {
     public Transform transform;
-    private List<GameObject> children;
+    private final List<GameObject> children;
     private GameObject parent;
     private boolean full = false;
     private Color color = Color.WHITE;
@@ -40,35 +36,41 @@ public abstract class GameObject {
     public abstract int[][] getEdges();
     public abstract void update(double delta);
 
+    /**
+     * Optional faces for filled rendering; default none.
+     * Provide triangles as {i0,i1,i2}. If you want quads, submit two tri faces.
+     */
+    public List<int[]> getFaces() {
+        int[][] arr = getFacesArray();
+        if (arr == null) return null;
+        List<int[]> out = new ArrayList<>(arr.length);
+        for (int[] f : arr) out.add(f.clone());
+        return out;
+    }
+
+    /**
+     * Internal hook for simple array faces; override if you provide faces.
+     */
+    public int[][] getFacesArray() { return null; }
+
     public double[][] getTransformedVertices() {
-        double[][] originalVertices = getVertices();
-        double[][] transformedVertices = new double[originalVertices.length][3];
+        double[][] local = getVertices();
+        double[][] out = new double[local.length][3];
+        Matrix4 M = getWorldTransform(); // IMPORTANT: world transform, not just local
 
-        for (int i = 0; i < originalVertices.length; i++) {
-            Vector3 vertex = new Vector3(originalVertices[i][0], originalVertices[i][1], originalVertices[i][2]);
-            Vector3 transformed = transform.getTransformationMatrix().transform(vertex);
-
-            transformedVertices[i][0] = transformed.x;
-            transformedVertices[i][1] = transformed.y;
-            transformedVertices[i][2] = transformed.z;
+        for (int i = 0; i < local.length; i++) {
+            util.Vector3 v = new Vector3(local[i][0], local[i][1], local[i][2]);
+            Vector3 t = M.transform(v);
+            out[i][0] = t.x;
+            out[i][1] = t.y;
+            out[i][2] = t.z;
         }
-
-        return transformedVertices;
+        return out;
     }
 
-    public Color getColor() {
-        return color;
-    }
+    public Color getColor() { return color; }
+    public void setColor(Color color) { this.color = color; }
 
-    public void setColor(Color color) {
-        this.color = color;
-    }
-
-    public boolean isFull() {
-        return full;
-    }
-
-    public void setFull(boolean full) {
-        this.full = full;
-    }
+    public boolean isFull() { return full; }
+    public void setFull(boolean full) { this.full = full; }
 }

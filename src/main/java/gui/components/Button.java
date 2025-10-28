@@ -40,23 +40,9 @@ public class Button {
         g.drawString(label, bounds.x + (bounds.width - textWidth) / 2, bounds.y + (bounds.height + textHeight) / 2);
     }
 
-    public boolean contains(int x, int y) {
-        return bounds.contains(x, y);
-    }
-
-    public void toggle() {
-        toggled = !toggled;
-    }
-
-    public boolean isToggled() {
-        return toggled;
-    }
-
-    public void setLabel(String label) {
-        this.label = label;
-    }
-
-    public void updateHoverStatus(int mouseX, int mouseY) {
-        isHovering = bounds.contains(mouseX, mouseY);
-    }
+    public boolean contains(int x, int y) { return bounds.contains(x, y); }
+    public void toggle() { toggled = !toggled; }
+    public boolean isToggled() { return toggled; }
+    public void setLabel(String label) { this.label = label; }
+    public void updateHoverStatus(int mouseX, int mouseY) { isHovering = bounds.contains(mouseX, mouseY); }
 }

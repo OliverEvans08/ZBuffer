@@ -1,18 +1,23 @@
 package engine;
 
 import objects.GameObject;
-import objects.fixed.GameCube;
 
 public class Camera {
-    public static final double WIDTH = 0.5;
-    public static final double HEIGHT = 5.0;
-    public static final double GRAVITY = -100;
-    public static final double JUMP_STRENGTH = 50;
+
+    public static final double WIDTH = 0.6;
+    public static final double HEIGHT = 1.8;
+
+    public static final double EYE_HEIGHT = 1.6;
+
+    public static final double GRAVITY = -30.0;
+    public static final double JUMP_STRENGTH = 10.0;
 
     public double x, y, z;
     public double pitch, yaw;
+
     public boolean flightMode = false;
     public boolean onGround = true;
+
     public double dx = 0, dy = 0, dz = 0;
     public double yVelocity = 0;
 
@@ -27,25 +32,48 @@ public class Camera {
         this.gameEngine = gameEngine;
     }
 
+    public double getEyeY() {
+        return y + EYE_HEIGHT;
+    }
+
     public void setFlightMode(boolean enabled) {
         this.flightMode = enabled;
+        if (enabled) {
+            onGround = false;
+            yVelocity = 0;
+        }
     }
 
     public void jump() {
-        if (onGround) {
+        if (!flightMode && onGround) {
             yVelocity = JUMP_STRENGTH;
             onGround = false;
-            gameEngine.soundEngine.fireSound("jump.wav");
+            if (gameEngine != null && gameEngine.soundEngine != null) {
+                gameEngine.soundEngine.fireSound("jump.wav");
+            }
         }
     }
 
     public void update(double delta) {
+        normalizeAngles();
+
         if (!flightMode) {
             applyGravity(delta);
             handleCollisions();
         }
         moveCamera(delta);
         resetMovementDeltas();
+    }
+
+    private void normalizeAngles() {
+        final double limit = Math.toRadians(89.9);
+        if (pitch > limit) pitch = limit;
+        if (pitch < -limit) pitch = -limit;
+
+        final double twoPi = Math.PI * 2.0;
+        yaw = yaw % twoPi;
+        if (yaw > Math.PI) yaw -= twoPi;
+        if (yaw < -Math.PI) yaw += twoPi;
     }
 
     private void applyGravity(double delta) {
@@ -63,60 +91,83 @@ public class Camera {
     }
 
     private void handleCollisions() {
+        if (gameEngine == null || gameEngine.rootObjects == null) return;
+
+        final double halfW = WIDTH * 0.5;
         for (GameObject obj : gameEngine.rootObjects) {
-            if (collidesWith(obj)) {
-                resolveCollision(obj);
+            // Only collide with solid objects
+            if (!obj.isFull()) continue;
+
+            double[] b = getTransformedObjectBounds(obj);
+            if (intersectsAABB(b, halfW)) {
+                resolveCollisionWithBounds(b, halfW);
             }
         }
     }
 
     public void moveCamera(double delta) {
-        double cosYaw = Math.cos(yaw);
-        double sinYaw = Math.sin(yaw);
-        x += (dx * cosYaw - dz * sinYaw) * delta;
-        y += dy * delta;
-        z += (dz * cosYaw + dx * sinYaw) * delta;
-    }
+        final double cy = Math.cos(yaw);
+        final double sy = Math.sin(yaw);
 
-    public boolean collidesWith(GameObject obj) {
-        double[] bounds = getTransformedObjectBounds(obj);
-        return (x + WIDTH / 2 > bounds[0] && x - WIDTH / 2 < bounds[1]) &&
-                (y + HEIGHT > bounds[2] && y < bounds[3]) &&
-                (z + WIDTH / 2 > bounds[4] && z - WIDTH / 2 < bounds[5]);
-    }
+        x += (dx * cy - dz * sy) * delta;
+        z += (dz * cy + dx * sy) * delta;
 
-    private double[] getTransformedObjectBounds(GameObject obj) {
-        double[][] transformedVertices = obj.getTransformedVertices();
-        double minX = Double.MAX_VALUE, maxX = -Double.MAX_VALUE;
-        double minY = Double.MAX_VALUE, maxY = -Double.MAX_VALUE;
-        double minZ = Double.MAX_VALUE, maxZ = -Double.MAX_VALUE;
-
-        for (double[] vertex : transformedVertices) {
-            minX = Math.min(minX, vertex[0]);
-            maxX = Math.max(maxX, vertex[0]);
-            minY = Math.min(minY, vertex[1]);
-            maxY = Math.max(maxY, vertex[1]);
-            minZ = Math.min(minZ, vertex[2]);
-            maxZ = Math.max(maxZ, vertex[2]);
+        if (flightMode) {
+            y += dy * delta;
         }
+    }
 
+    private boolean intersectsAABB(double[] b, double halfW) {
+        return (x + halfW > b[0] && x - halfW < b[1]) &&
+                (y + HEIGHT > b[2] && y < b[3]) &&
+                (z + halfW > b[4] && z - halfW < b[5]);
+    }
+
+    public boolean collidesWith(objects.GameObject obj) {
+        double[] b = getTransformedObjectBounds(obj);
+        return intersectsAABB(b, WIDTH * 0.5);
+    }
+
+    private double[] getTransformedObjectBounds(objects.GameObject obj) {
+        double[][] verts = obj.getTransformedVertices();
+        double minX = Double.POSITIVE_INFINITY, maxX = Double.NEGATIVE_INFINITY;
+        double minY = Double.POSITIVE_INFINITY, maxY = Double.NEGATIVE_INFINITY;
+        double minZ = Double.POSITIVE_INFINITY, maxZ = Double.NEGATIVE_INFINITY;
+
+        for (double[] v : verts) {
+            if (v[0] < minX) minX = v[0];
+            if (v[0] > maxX) maxX = v[0];
+            if (v[1] < minY) minY = v[1];
+            if (v[1] > maxY) maxY = v[1];
+            if (v[2] < minZ) minZ = v[2];
+            if (v[2] > maxZ) maxZ = v[2];
+        }
         return new double[]{minX, maxX, minY, maxY, minZ, maxZ};
     }
 
-    private void resolveCollision(GameObject obj) {
-        double[] bounds = getTransformedObjectBounds(obj);
-        double penetrationX = Math.min(x + WIDTH / 2 - bounds[0], bounds[1] - x + WIDTH / 2);
-        double penetrationY = Math.min(y + HEIGHT - bounds[2], bounds[3] - y);
-        double penetrationZ = Math.min(z + WIDTH / 2 - bounds[4], bounds[5] - z + WIDTH / 2);
+    private void resolveCollisionWithBounds(double[] b, double halfW) {
+        double penX = Math.min((x + halfW) - b[0], b[1] - (x - halfW));
+        double penY = Math.min((y + HEIGHT) - b[2], b[3] - y);
+        double penZ = Math.min((z + halfW) - b[4], b[5] - (z - halfW));
 
-        if (penetrationX < penetrationY && penetrationX < penetrationZ) {
-            x += (x - bounds[0] < bounds[1] - x) ? -penetrationX : penetrationX;
-        } else if (penetrationY < penetrationX) {
-            y += (y - bounds[2] < bounds[3] - y) ? -penetrationY : penetrationY;
-            onGround = true;
-            yVelocity = 0;
+        if (penX <= penY && penX <= penZ) {
+            double leftDist = (x + halfW) - b[0];
+            double rightDist = b[1] - (x - halfW);
+            if (leftDist < rightDist) x -= penX; else x += penX;
+        } else if (penY <= penX && penY <= penZ) {
+            double downDist = (y + HEIGHT) - b[2];
+            double upDist = b[3] - y;
+            if (downDist < upDist) {
+                y -= penY;
+                yVelocity = 0;
+                onGround = true;
+            } else {
+                y += penY;
+            }
         } else {
-            z += (z - bounds[4] < bounds[5] - z) ? -penetrationZ : penetrationZ;
+            double frontDist = (z + halfW) - b[4];
+            double backDist = b[5] - (z - halfW);
+            if (frontDist < backDist) z -= penZ; else z += penZ;
         }
     }
 

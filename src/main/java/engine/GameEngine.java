@@ -30,22 +30,42 @@ public class GameEngine extends JPanel implements Runnable {
 
     private VolatileImage buffer;
 
+    private double fovDegrees = 70.0;
+    private double renderDistance = 200.0;
+
     public GameEngine() {
-        camera = new Camera(0, 1.0, 0, 0, 0, this);
+        camera = new Camera(0, 0.0, 0, 0, 0, this);
         rootObjects = new CopyOnWriteArrayList<>();
         renderer = new Renderer(camera, this);
         soundEngine = new SoundEngine("./src/main/java/sound/wavs");
-        clickGUI = new ClickGUI();
+        clickGUI = new ClickGUI(this);
         inputHandler = new InputHandler(camera, this);
 
         setupWindow();
         setupInputListeners();
+
+        // Start with mouse grabbed (GUI closed).
         inputHandler.centerCursor(this);
-        hideCursor();
 
         initializeGameObjects();
-        createVolatileBuffer();
-        new Thread(this).start();
+
+        new Thread(this, "GameLoop").start();
+    }
+
+    public double getFovRadians() {
+        return Math.toRadians(fovDegrees);
+    }
+
+    public void setFovDegrees(double fovDegrees) {
+        this.fovDegrees = Math.max(30.0, Math.min(120.0, fovDegrees));
+    }
+
+    public double getRenderDistance() {
+        return Math.max(5.0, renderDistance);
+    }
+
+    public void setRenderDistance(double renderDistance) {
+        this.renderDistance = Math.max(5.0, renderDistance);
     }
 
     private void setupWindow() {
@@ -61,9 +81,11 @@ public class GameEngine extends JPanel implements Runnable {
     }
 
     private void initializeGameObjects() {
-        rootObjects.add(new Cube(10, 0, 0, 0));
+        Cube c = new Cube(2.0, 5.0, 1.0, 8.0);
+        c.setFull(true);
+        rootObjects.add(c);
 
-        for (int i = 0; i < 10; i ++) {
+        for (int i = 0; i < 10; i++) {
             rootObjects.add(new GameCube());
         }
     }
@@ -71,35 +93,87 @@ public class GameEngine extends JPanel implements Runnable {
     @Override
     protected void paintComponent(Graphics g) {
         super.paintComponent(g);
-        render();
-        g.drawImage(buffer, 0, 0, null);
+
+        if (!(g instanceof Graphics2D)) {
+            renderDirect(null, g);
+            return;
+        }
+
+        Graphics2D screenG2 = (Graphics2D) g;
+        GraphicsConfiguration gc = screenG2.getDeviceConfiguration();
+        if (gc == null) {
+            GraphicsEnvironment ge = GraphicsEnvironment.getLocalGraphicsEnvironment();
+            GraphicsDevice gd = ge.getDefaultScreenDevice();
+            gc = gd.getDefaultConfiguration();
+        }
+
+        ensureBackBuffer(gc);
+
+        if (buffer == null) {
+            renderDirect(screenG2, g);
+            return;
+        }
+
+        boolean valid;
+        do {
+            int code = buffer.validate(gc);
+            if (code == VolatileImage.IMAGE_INCOMPATIBLE) {
+                recreateBackBuffer(gc);
+            }
+
+            Graphics2D g2d = buffer.createGraphics();
+            try {
+                // Keep AA off for speed
+                g2d.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_OFF);
+                renderer.clearScreen(g2d, WIDTH, HEIGHT);
+                renderer.render(g2d, rootObjects, WIDTH, HEIGHT);
+                clickGUI.render(g2d);
+                if (clickGUI.isDebug()) {
+                    drawDebugInfo(g2d);
+                }
+            } finally {
+                g2d.dispose();
+            }
+            valid = !buffer.contentsLost();
+        } while (!valid);
+
+        screenG2.drawImage(buffer, 0, 0, null);
     }
 
-    private void createVolatileBuffer() {
-        if (buffer == null || buffer.validate(getGraphicsConfiguration()) == VolatileImage.IMAGE_INCOMPATIBLE) {
-            buffer = createVolatileImage(WIDTH, HEIGHT);
+    private void renderDirect(Graphics2D screenG2, Graphics gRaw) {
+        Graphics2D g2 = screenG2 != null ? screenG2 : (Graphics2D) gRaw;
+        g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_OFF);
+        renderer.clearScreen(g2, WIDTH, HEIGHT);
+        renderer.render(g2, rootObjects, WIDTH, HEIGHT);
+        clickGUI.render(g2);
+        if (clickGUI.isDebug()) {
+            drawDebugInfo(g2);
         }
     }
 
-    private void render() {
-        createVolatileBuffer();
-        Graphics2D g2d = buffer.createGraphics();
-        try {
-            renderer.clearScreen(g2d, WIDTH, HEIGHT);
-            renderer.render(g2d, rootObjects, WIDTH, HEIGHT);
-            clickGUI.render(g2d);
-            if (clickGUI.isDebug()) {
-                drawDebugInfo(g2d);
+    private void ensureBackBuffer(GraphicsConfiguration gc) {
+        if (buffer == null) {
+            recreateBackBuffer(gc);
+        } else {
+            int code = buffer.validate(gc);
+            if (code == VolatileImage.IMAGE_INCOMPATIBLE) {
+                recreateBackBuffer(gc);
             }
-        } finally {
-            g2d.dispose();
+        }
+    }
+
+    private void recreateBackBuffer(GraphicsConfiguration gc) {
+        if (gc != null) {
+            buffer = gc.createCompatibleVolatileImage(WIDTH, HEIGHT, Transparency.OPAQUE);
+        } else {
+            buffer = null;
         }
     }
 
     @Override
     public void run() {
         long lastLoopTime = System.nanoTime();
-        final double nsPerTick = 1.0 / 60.0;
+        final double tick = 1.0 / 60.0;
 
         double delta = 0;
         while (true) {
@@ -107,13 +181,14 @@ public class GameEngine extends JPanel implements Runnable {
             delta += (now - lastLoopTime) / 1_000_000_000.0;
             lastLoopTime = now;
 
-            while (delta >= nsPerTick) {
-                updateGameLoop(nsPerTick);
-                delta -= nsPerTick;
+            while (delta >= tick) {
+                updateGameLoop(tick);
+                delta -= tick;
             }
 
             repaint();
             calculateFPS(now);
+            try { Thread.sleep(1); } catch (InterruptedException ignored) {}
         }
     }
 
@@ -141,21 +216,36 @@ public class GameEngine extends JPanel implements Runnable {
                 new BufferedImage(1, 1, BufferedImage.TYPE_INT_ARGB), new Point(0, 0), "blank cursor"));
     }
 
+    public void showCursor() {
+        setCursor(Cursor.getDefaultCursor());
+    }
+
+    /**
+     * Called by ClickGUI whenever it opens/closes so we can toggle mouse grab.
+     */
+    public void onGuiToggled(boolean open) {
+        if (open) {
+            showCursor();
+        } else {
+            inputHandler.centerCursor(this); // recenters & hides
+        }
+        // Ensure we retain keyboard focus either way
+        requestFocusInWindow();
+    }
+
     private void drawDebugInfo(Graphics g) {
         g.setColor(Color.WHITE);
         g.drawString("FPS: " + fps, 10, 20);
-        g.drawString("Camera X: " + camera.x, 10, 40);
-        g.drawString("Camera Y: " + camera.y, 10, 60);
-        g.drawString("Camera Z: " + camera.z, 10, 80);
+        g.drawString("Feet Y: " + String.format("%.3f", camera.y), 10, 40);
+        g.drawString("Eye  Y: " + String.format("%.3f", camera.getEyeY()), 10, 60);
+        g.drawString("X/Z: " + String.format("%.3f / %.3f", camera.x, camera.z), 10, 80);
         g.drawString("Flight Mode: " + camera.flightMode, 10, 100);
-        g.drawString("Yaw: " + Math.toDegrees(camera.yaw), 10, 120);
-        g.drawString("Pitch: " + Math.toDegrees(camera.pitch), 10, 140);
+        g.drawString("Yaw: " + String.format("%.1f°", Math.toDegrees(camera.yaw)), 10, 120);
+        g.drawString("Pitch: " + String.format("%.1f°", Math.toDegrees(camera.pitch)), 10, 140);
         g.drawString("Loaded Objects: " + rootObjects.size(), 10, 160);
         g.drawString("GUI Open: " + clickGUI.isOpen(), 10, 180);
-    }
-
-    public void showCursor() {
-        setCursor(Cursor.getDefaultCursor());
+        g.drawString("FOV: " + String.format("%.1f°", fovDegrees), 10, 200);
+        g.drawString("RenderDist: " + String.format("%.0f", getRenderDistance()), 10, 220);
     }
 
     public static void main(String[] args) {

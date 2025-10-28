@@ -1,81 +1,69 @@
 package util;
 
 public class Matrix4 {
-    private double[][] m;
+    private final double[][] m;
 
     public Matrix4() {
         m = new double[4][4];
-        for (int i = 0; i < 4; i++) {
-            m[i][i] = 1;
-        }
+        for (int i = 0; i < 4; i++) m[i][i] = 1.0;
     }
 
     public static Matrix4 translation(Vector3 v) {
-        Matrix4 result = new Matrix4();
-        result.m[0][3] = v.x;
-        result.m[1][3] = v.y;
-        result.m[2][3] = v.z;
-        return result;
+        Matrix4 r = new Matrix4();
+        r.m[0][3] = v.x;
+        r.m[1][3] = v.y;
+        r.m[2][3] = v.z;
+        return r;
     }
 
     public static Matrix4 scale(Vector3 v) {
-        Matrix4 result = new Matrix4();
-        result.m[0][0] = v.x;
-        result.m[1][1] = v.y;
-        result.m[2][2] = v.z;
-        return result;
+        Matrix4 r = new Matrix4();
+        r.m[0][0] = v.x;
+        r.m[1][1] = v.y;
+        r.m[2][2] = v.z;
+        return r;
     }
 
-    public static Matrix4 rotation(Vector3 rotation) {
-        double cosX = Math.cos(rotation.x);
-        double sinX = Math.sin(rotation.x);
-        double cosY = Math.cos(rotation.y);
-        double sinY = Math.sin(rotation.y);
-        double cosZ = Math.cos(rotation.z);
-        double sinZ = Math.sin(rotation.z);
+    public static Matrix4 rotation(Vector3 r) {
+        double cx = Math.cos(r.x), sx = Math.sin(r.x);
+        double cy = Math.cos(r.y), sy = Math.sin(r.y);
+        double cz = Math.cos(r.z), sz = Math.sin(r.z);
 
-        Matrix4 rotationMatrix = new Matrix4();
+        // Rotation order: Y (yaw) then X (pitch) then Z (roll)
+        Matrix4 Rx = new Matrix4();
+        Rx.m[1][1] = cx; Rx.m[1][2] = -sx;
+        Rx.m[2][1] = sx; Rx.m[2][2] = cx;
 
-        Matrix4 rotX = new Matrix4();
-        rotX.m[1][1] = cosX;
-        rotX.m[1][2] = -sinX;
-        rotX.m[2][1] = sinX;
-        rotX.m[2][2] = cosX;
+        Matrix4 Ry = new Matrix4();
+        Ry.m[0][0] = cy; Ry.m[0][2] = sy;
+        Ry.m[2][0] = -sy; Ry.m[2][2] = cy;
 
-        Matrix4 rotY = new Matrix4();
-        rotY.m[0][0] = cosY;
-        rotY.m[0][2] = sinY;
-        rotY.m[2][0] = -sinY;
-        rotY.m[2][2] = cosY;
+        Matrix4 Rz = new Matrix4();
+        Rz.m[0][0] = cz; Rz.m[0][1] = -sz;
+        Rz.m[1][0] = sz; Rz.m[1][1] = cz;
 
-        Matrix4 rotZ = new Matrix4();
-        rotZ.m[0][0] = cosZ;
-        rotZ.m[0][1] = -sinZ;
-        rotZ.m[1][0] = sinZ;
-        rotZ.m[1][1] = cosZ;
-
-        rotationMatrix = rotZ.multiply(rotY).multiply(rotX);
-        return rotationMatrix;
+        return Ry.multiply(Rx).multiply(Rz);
     }
 
     public Vector3 transform(Vector3 v) {
-        return new Vector3(
-                m[0][0] * v.x + m[0][1] * v.y + m[0][2] * v.z + m[0][3],
-                m[1][0] * v.x + m[1][1] * v.y + m[1][2] * v.z + m[1][3],
-                m[2][0] * v.x + m[2][1] * v.y + m[2][2] * v.z + m[2][3]
-        );
+        // implicit w = 1
+        double x = m[0][0]*v.x + m[0][1]*v.y + m[0][2]*v.z + m[0][3];
+        double y = m[1][0]*v.x + m[1][1]*v.y + m[1][2]*v.z + m[1][3];
+        double z = m[2][0]*v.x + m[2][1]*v.y + m[2][2]*v.z + m[2][3];
+        return new Vector3(x, y, z);
     }
 
-    public Matrix4 multiply(Matrix4 other) {
-        Matrix4 result = new Matrix4();
+    public Matrix4 multiply(Matrix4 o) {
+        Matrix4 r = new Matrix4();
         for (int row = 0; row < 4; row++) {
             for (int col = 0; col < 4; col++) {
-                result.m[row][col] = 0;
+                double s = 0;
                 for (int k = 0; k < 4; k++) {
-                    result.m[row][col] += this.m[row][k] * other.m[k][col];
+                    s += this.m[row][k] * o.m[k][col];
                 }
+                r.m[row][col] = s;
             }
         }
-        return result;
+        return r;
     }
 }

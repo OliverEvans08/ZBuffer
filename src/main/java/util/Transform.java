@@ -12,10 +12,10 @@ public class Transform {
     }
 
     public Matrix4 getTransformationMatrix() {
-        Matrix4 scaleMatrix = Matrix4.scale(scale);
-        Matrix4 rotationMatrix = Matrix4.rotation(rotation);
-        Matrix4 translationMatrix = Matrix4.translation(position);
-
-        return translationMatrix.multiply(rotationMatrix).multiply(scaleMatrix);
+        Matrix4 S = Matrix4.scale(scale);
+        Matrix4 R = Matrix4.rotation(rotation);
+        Matrix4 T = Matrix4.translation(position);
+        // World = T * R * S
+        return T.multiply(R).multiply(S);
     }
 }

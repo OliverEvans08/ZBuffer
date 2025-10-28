@@ -1,11 +1,8 @@
 package gui;
 
+import engine.GameEngine;
+import gui.components.Button;
 import gui.components.Slider;
-
-import java.awt.*;
-import java.awt.event.MouseEvent;
-import java.util.ArrayList;
-import java.util.List;
 
 import java.awt.*;
 import java.awt.event.MouseEvent;
@@ -14,41 +11,60 @@ import java.util.List;
 
 public class ClickGUI {
 
+    private final GameEngine engine;
+
     private boolean isOpen = false;
-    public final List<gui.components.Button> buttons = new ArrayList<>();
-    public final List<gui.components.Slider> sliders = new ArrayList<>();
+    public final List<Button> buttons = new ArrayList<>();
+    public final List<Slider> sliders = new ArrayList<>();
 
     private int panelX = 100, panelY = 100;
-    private int panelWidth = 250, panelHeight = 300;
+    private int panelWidth = 260, panelHeight = 150;
     private boolean dragging = false;
     private int dragX, dragY;
     private boolean mousePressed = false;
 
-    public ClickGUI() {
-        buttons.add(new gui.components.Button(panelX + 20, panelY + 20, 200, 50, "Debug"));
-        sliders.add(new Slider(panelX + 20, panelY + 80, 200, 0, 1000, 500, "FOV"));
-        sliders.add(new Slider(panelX + 20, panelY + 80 + 60, 200, 5, 50, 50, "Render Distance"));
+    private Slider fovSlider;
+    private Slider renderSlider;
+
+    public ClickGUI(GameEngine engine) {
+        this.engine = engine;
+
+        buttons.add(new Button(panelX + 20, panelY + 20, 200, 36, "Debug"));
+
+        fovSlider = new Slider(panelX + 20, panelY + 70, 200, 30, 120, 70, "FOV")
+                .onChange(v -> engine.setFovDegrees(v));
+        sliders.add(fovSlider);
+
+        renderSlider = new Slider(panelX + 20, panelY + 110, 200, 50, 500, 200, "Render Distance")
+                .onChange(v -> engine.setRenderDistance(v));
+        sliders.add(renderSlider);
     }
 
     public void render(Graphics graphics) {
-        if (isOpen) {
-            Graphics2D g2d = (Graphics2D) graphics;
-            GradientPaint gradient = new GradientPaint(panelX, panelY, Color.DARK_GRAY, panelX, panelY + panelHeight, Color.BLACK);
-            g2d.setPaint(gradient);
-            g2d.fillRoundRect(panelX, panelY, panelWidth, panelHeight, 20, 20); // Rounded corners
+        if (!isOpen) return;
 
-            for (gui.components.Button button : buttons) {
-                button.render(graphics);
-            }
+        Graphics2D g2d = (Graphics2D) graphics;
+        GradientPaint gradient = new GradientPaint(panelX, panelY, new Color(32, 32, 32),
+                panelX, panelY + panelHeight, new Color(10, 10, 10));
+        g2d.setPaint(gradient);
+        g2d.fillRoundRect(panelX, panelY, panelWidth, panelHeight, 16, 16);
 
-            for (gui.components.Slider slider : sliders) {
-                slider.render(graphics);
-            }
-        }
+        // Header
+        g2d.setColor(new Color(255, 255, 255, 24));
+        g2d.fillRoundRect(panelX, panelY, panelWidth, 24, 16, 16);
+        g2d.setColor(Color.WHITE);
+        g2d.drawString("Settings", panelX + 10, panelY + 16);
+
+        for (Button button : buttons) button.render(graphics);
+        for (Slider slider : sliders) slider.render(graphics);
     }
 
     public void setOpen(boolean open) {
+        if (this.isOpen == open) return;
         this.isOpen = open;
+
+        // Notify engine to toggle cursor capture immediately.
+        engine.onGuiToggled(open);
     }
 
     public boolean isOpen() {
@@ -58,49 +74,18 @@ public class ClickGUI {
     public void clicked(int x, int y) {
         if (!isOpen) return;
 
-        boolean buttonClicked = false;
-        for (gui.components.Button button : buttons) {
+        for (Button button : buttons) {
             if (button.contains(x, y)) {
-                System.out.println("Button clicked at: " + x + ", " + y);
                 button.toggle();
                 handleButtonClick(button);
-                buttonClicked = true;
-                break;
+                return;
             }
         }
 
-        boolean sliderClicked = false;
-        for (gui.components.Slider slider : sliders) {
-            if (!buttonClicked && slider.contains(x, y)) {
-                slider.startDragging(x);
-                sliderClicked = true;
-                break;
-            }
-        }
-
-        if (!buttonClicked && !sliderClicked) {
-            if (x >= panelX && x <= panelX + panelWidth && y >= panelY && y <= panelY + panelHeight) {
-                boolean insideComponent = false;
-
-                for (gui.components.Button button : buttons) {
-                    if (button.contains(x, y)) {
-                        insideComponent = true;
-                        break;
-                    }
-                }
-
-                for (gui.components.Slider slider : sliders) {
-                    if (slider.contains(x, y)) {
-                        insideComponent = true;
-                        break;
-                    }
-                }
-
-                if (!insideComponent) {
-                    dragX = x - panelX;
-                    dragY = y - panelY;
-                    dragging = true;
-                }
+        for (Slider slider : sliders) {
+            if (slider.contains(x, y)) {
+                slider.startDragging(x, y);
+                return;
             }
         }
     }
@@ -108,50 +93,63 @@ public class ClickGUI {
     public void mouseReleased(MouseEvent e) {
         dragging = false;
         mousePressed = false;
-        for (gui.components.Slider slider : sliders) {
-            slider.stopDragging();
-        }
+        for (Slider slider : sliders) slider.stopDragging();
     }
 
     public void mouseDragged(int x, int y) {
+        if (!isOpen) return;
+
         if (dragging) {
             panelX = x - dragX;
             panelY = y - dragY;
 
-            for (int i = 0; i < buttons.size(); i++) {
-                buttons.get(i).bounds.setLocation(panelX + 20, panelY + 20 + (i * 60));
-            }
-
+            // Reposition components
+            buttons.get(0).bounds.setLocation(panelX + 20, panelY + 20);
             for (int i = 0; i < sliders.size(); i++) {
-                sliders.get(i).bounds.setLocation(panelX + 20, panelY + 80 + (i * 60));
+                sliders.get(i).bounds.setLocation(panelX + 20, panelY + 70 + (i * 40));
             }
         } else {
-            for (gui.components.Slider slider : sliders) {
-                slider.drag(x);
-            }
+            for (Slider slider : sliders) slider.drag(x);
         }
     }
 
     public void mouseMoved(MouseEvent e) {
+        if (!isOpen) return;
+
         int mouseX = e.getX();
         int mouseY = e.getY();
 
-        for (gui.components.Button button : buttons) {
-            button.updateHoverStatus(mouseX, mouseY);
-        }
-
-        for (gui.components.Slider slider : sliders) {
-            slider.updateHoverStatus(mouseX, mouseY);
-        }
+        for (Button button : buttons) button.updateHoverStatus(mouseX, mouseY);
+        for (Slider slider : sliders) slider.updateHoverStatus(mouseX, mouseY);
     }
-
 
     public void mousePressed(MouseEvent e) {
         mousePressed = true;
+        if (!isOpen) return;
+
+        int x = e.getX();
+        int y = e.getY();
+
+        boolean insidePanel = (x >= panelX && x <= panelX + panelWidth && y >= panelY && y <= panelY + panelHeight);
+        boolean inHeader = (insidePanel && y <= panelY + 24);
+
+        if (inHeader) {
+            dragX = x - panelX;
+            dragY = y - panelY;
+            dragging = true;
+            return;
+        }
+
+        for (Slider slider : sliders) {
+            if (slider.contains(x, y)) {
+                slider.startDragging(x, y);
+                break;
+            }
+        }
     }
 
-    private void handleButtonClick(gui.components.Button button) {
-        System.out.println("Button state: " + (button.isToggled() ? "Toggled ON" : "Toggled OFF"));
+    private void handleButtonClick(Button button) {
+        // Currently only "Debug" toggle
     }
 
     public boolean isMousePressed() {
@@ -159,11 +157,11 @@ public class ClickGUI {
     }
 
     public Slider getFOVSlider() {
-        return sliders.get(0);
+        return fovSlider;
     }
 
     public Slider getRenderDistanceSlider() {
-        return sliders.get(1);
+        return renderSlider;
     }
 
     public boolean isDebug() {
