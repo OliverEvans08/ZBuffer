@@ -4,6 +4,8 @@ import objects.GameObject;
 
 public class Camera {
 
+    public enum Mode { FIRST_PERSON, THIRD_PERSON }
+
     public static final double WIDTH = 0.6;
     public static final double HEIGHT = 1.8;
 
@@ -21,6 +23,16 @@ public class Camera {
     public double dx = 0, dy = 0, dz = 0;
     public double yVelocity = 0;
 
+    private Mode mode = Mode.FIRST_PERSON;
+
+    /** Third-person settings */
+    private double thirdPersonDistance = 3.2; // distance behind the head along forward vector
+    private double shoulderOffset      = 0.6; // horizontal offset to the right
+
+    /** Derived view state (eye & view angles actually used by the renderer) */
+    private double eyeX, eyeY, eyeZ;
+    private double viewYaw, viewPitch;
+
     final GameEngine gameEngine;
 
     public Camera(double x, double y, double z, double pitch, double yaw, GameEngine gameEngine) {
@@ -30,11 +42,35 @@ public class Camera {
         this.pitch = pitch;
         this.yaw = yaw;
         this.gameEngine = gameEngine;
+        recomputeViewOrigin();
+    }
+
+    public Mode getMode() { return mode; }
+    public boolean isFirstPerson() { return mode == Mode.FIRST_PERSON; }
+    public boolean isThirdPerson() { return mode == Mode.THIRD_PERSON; }
+
+    public void toggleMode() {
+        mode = (mode == Mode.FIRST_PERSON) ? Mode.THIRD_PERSON : Mode.FIRST_PERSON;
+        recomputeViewOrigin();
+    }
+
+    public void setThirdPersonDistance(double d) {
+        this.thirdPersonDistance = Math.max(0.2, d);
+    }
+
+    public void setShoulderOffset(double s) {
+        this.shoulderOffset = Math.max(-1.5, Math.min(1.5, s));
     }
 
     public double getEyeY() {
         return y + EYE_HEIGHT;
     }
+
+    public double getViewX() { return eyeX; }
+    public double getViewY() { return eyeY; }
+    public double getViewZ() { return eyeZ; }
+    public double getViewYaw() { return viewYaw; }
+    public double getViewPitch() { return viewPitch; }
 
     public void setFlightMode(boolean enabled) {
         this.flightMode = enabled;
@@ -62,6 +98,10 @@ public class Camera {
             handleCollisions();
         }
         moveCamera(delta);
+
+        // Always recompute final eye + view from current mode/orientation
+        recomputeViewOrigin();
+
         resetMovementDeltas();
     }
 
@@ -96,7 +136,6 @@ public class Camera {
         final double halfW = WIDTH * 0.5;
         for (GameObject obj : gameEngine.rootObjects) {
             if (!obj.isFull()) continue;
-
             double[] b = getTransformedObjectBounds(obj);
             if (intersectsAABB(b, halfW)) {
                 resolveCollisionWithBounds(b, halfW);
@@ -108,6 +147,7 @@ public class Camera {
         final double cy = Math.cos(yaw);
         final double sy = Math.sin(yaw);
 
+        // Move in the player's local XZ plane using yaw
         x += (dx * cy - dz * sy) * delta;
         z += (dz * cy + dx * sy) * delta;
 
@@ -172,5 +212,64 @@ public class Camera {
 
     private void resetMovementDeltas() {
         dx = dy = dz = 0;
+    }
+
+    /**
+     * Compute the actual camera eye position and the view angles used by the renderer.
+     *
+     * FIRST_PERSON:
+     *   - Eye sits at player pivot (feet + EYE_HEIGHT)
+     *   - View angles are the player's yaw/pitch
+     *
+     * THIRD_PERSON (fixed & corrected):
+     *   - Eye is placed behind the player along the player's forward vector
+     *     determined by yaw & pitch, plus a shoulder offset to the right.
+     *   - View angles are exactly the player's yaw/pitch (no independent look-at).
+     *     This keeps the camera locked with the player and prevents "independent"
+     *     orbiting that loses focus on the body.
+     */
+    private void recomputeViewOrigin() {
+        if (mode == Mode.FIRST_PERSON) {
+            // Eye right at the player's head
+            eyeX = x;
+            eyeY = y + EYE_HEIGHT;
+            eyeZ = z;
+            viewYaw = yaw;
+            viewPitch = pitch;
+            return;
+        }
+
+        // Pivot (player's head)
+        final double pivotX = x;
+        final double pivotY = y + EYE_HEIGHT;
+        final double pivotZ = z;
+
+        // Precompute yaw/pitch trig
+        final double cy = Math.cos(yaw);
+        final double sy = Math.sin(yaw);
+        final double cp = Math.cos(pitch);
+        final double sp = Math.sin(pitch);
+
+        // World-space forward vector for the given yaw/pitch
+        // Derived from inverse view rotation applied to (0,0,1):
+        // forward = (-cp*sy, sp, cp*cy)
+        final double fwdX = -cp * sy;
+        final double fwdY =  sp;
+        final double fwdZ =  cp * cy;
+
+        // World-space right vector (view +X), note: independent of pitch
+        // right = (cos(yaw), 0, sin(yaw))
+        final double rightX = cy;
+        final double rightY = 0.0;
+        final double rightZ = sy;
+
+        // Place eye behind the player along forward vector, then offset to shoulder
+        eyeX = pivotX - fwdX * thirdPersonDistance + rightX * shoulderOffset;
+        eyeY = pivotY - fwdY * thirdPersonDistance + rightY * shoulderOffset;
+        eyeZ = pivotZ - fwdZ * thirdPersonDistance + rightZ * shoulderOffset;
+
+        // The rendered view direction matches player input (no extra look-at math).
+        viewYaw   = yaw;
+        viewPitch = pitch;
     }
 }

@@ -1,3 +1,4 @@
+// File: src/main/java/util/Transform.java
 package util;
 
 public class Transform {
@@ -15,7 +16,7 @@ public class Transform {
         Matrix4 S = Matrix4.scale(scale);
         Matrix4 R = Matrix4.rotation(rotation);
         Matrix4 T = Matrix4.translation(position);
-        // World = T * R * S
+
         return T.multiply(R).multiply(S);
     }
 }

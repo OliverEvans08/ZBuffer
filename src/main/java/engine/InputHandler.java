@@ -1,3 +1,4 @@
+// File: src/main/java/engine/InputHandler.java
 package engine;
 
 import engine.event.EventBus;
@@ -5,6 +6,7 @@ import engine.event.events.GuiToggleRequestedEvent;
 import engine.event.events.MouseLookEvent;
 import engine.event.events.MovementIntentEvent;
 import engine.event.events.ToggleFlightRequestedEvent;
+import engine.event.events.ToggleViewRequestedEvent;
 
 import javax.swing.*;
 import java.awt.*;
@@ -13,8 +15,7 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * Collects raw AWT input, converts to high-level intents, and publishes them on the EventBus.
- * No world state is mutated here.
+ * Adds 'V' to toggle first/third person via ToggleViewRequestedEvent.
  */
 public class InputHandler implements KeyListener, MouseMotionListener, MouseListener {
 
@@ -26,10 +27,8 @@ public class InputHandler implements KeyListener, MouseMotionListener, MouseList
     private static final long ACTION_COOLDOWN_MS = 200;
     private long lastActionTime = 0;
 
-    // Cursor control
     private boolean centerCursor = true;
 
-    // Movement tunables live in PlayerController; here we only emit intents (unit directions).
     public InputHandler(EventBus bus, GameEngine gameEngine) {
         this.bus = bus;
         this.gameEngine = gameEngine;
@@ -39,7 +38,6 @@ public class InputHandler implements KeyListener, MouseMotionListener, MouseList
         try { r = new Robot(); } catch (AWTException e) { r = null; e.printStackTrace(); }
         this.robot = r;
 
-        // IMPORTANT: register global key dispatcher AFTER bus is assigned
         setupGlobalKeyDispatcher();
     }
 
@@ -56,14 +54,14 @@ public class InputHandler implements KeyListener, MouseMotionListener, MouseList
                 bus.publish(new ToggleFlightRequestedEvent());
                 return true;
             }
+            if (event.getKeyCode() == KeyEvent.VK_V) { // toggle view mode
+                bus.publish(new ToggleViewRequestedEvent());
+                return true;
+            }
             return false;
         });
     }
 
-    /**
-     * Called once per fixed tick from GameEngine.
-     * Emits a MovementIntentEvent based on currently held keys.
-     */
     public void updatePerTick() {
         boolean forward = pressedKeys.contains(KeyEvent.VK_W);
         boolean backward = pressedKeys.contains(KeyEvent.VK_S);
@@ -88,8 +86,6 @@ public class InputHandler implements KeyListener, MouseMotionListener, MouseList
         gameEngine.hideCursor();
     }
 
-    // --------- AWT hooks ---------
-
     @Override public void keyPressed(KeyEvent e)  { pressedKeys.add(e.getKeyCode()); }
     @Override public void keyReleased(KeyEvent e) { pressedKeys.remove(e.getKeyCode()); }
     @Override public void keyTyped(KeyEvent e)    {}
@@ -107,10 +103,8 @@ public class InputHandler implements KeyListener, MouseMotionListener, MouseList
         int dx = e.getX() - centerX;
         int dy = e.getY() - centerY;
 
-        // Emit look delta (pixels). PlayerController converts to radians with its sensitivity.
         bus.publish(new MouseLookEvent(dx, dy));
 
-        // recenter after emitting
         centerCursor(gameEngine);
     }
 
