@@ -1,12 +1,8 @@
-// File: src/main/java/engine/InputHandler.java
 package engine;
 
 import engine.event.EventBus;
-import engine.event.events.GuiToggleRequestedEvent;
-import engine.event.events.MouseLookEvent;
-import engine.event.events.MovementIntentEvent;
-import engine.event.events.ToggleFlightRequestedEvent;
-import engine.event.events.ToggleViewRequestedEvent;
+import engine.event.events.*;
+import gui.ClickGUI;
 
 import javax.swing.*;
 import java.awt.*;
@@ -14,9 +10,6 @@ import java.awt.event.*;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
-/**
- * Adds 'V' to toggle first/third person via ToggleViewRequestedEvent.
- */
 public class InputHandler implements KeyListener, MouseMotionListener, MouseListener {
 
     private final EventBus bus;
@@ -27,7 +20,16 @@ public class InputHandler implements KeyListener, MouseMotionListener, MouseList
     private static final long ACTION_COOLDOWN_MS = 200;
     private long lastActionTime = 0;
 
-    private boolean centerCursor = true;
+    private boolean captureMouse = true;
+
+    private volatile boolean ignoreNextMouseMove = false;
+
+    // For relative mouse without constant warps
+    private int lastMouseX = -1;
+    private int lastMouseY = -1;
+
+    // How close to edge before we warp back to center
+    private static final int EDGE_MARGIN = 20;
 
     public InputHandler(EventBus bus, GameEngine gameEngine) {
         this.bus = bus;
@@ -54,7 +56,7 @@ public class InputHandler implements KeyListener, MouseMotionListener, MouseList
                 bus.publish(new ToggleFlightRequestedEvent());
                 return true;
             }
-            if (event.getKeyCode() == KeyEvent.VK_V) { // toggle view mode
+            if (event.getKeyCode() == KeyEvent.VK_V) {
                 bus.publish(new ToggleViewRequestedEvent());
                 return true;
             }
@@ -73,16 +75,36 @@ public class InputHandler implements KeyListener, MouseMotionListener, MouseList
         bus.publish(new MovementIntentEvent(forward, backward, left, right, ascend, descend));
     }
 
+    public void setCaptureMouse(boolean enabled) {
+        this.captureMouse = enabled;
+        if (!enabled) {
+            lastMouseX = -1;
+            lastMouseY = -1;
+        }
+    }
+
     public void centerCursor(JPanel panel) {
-        if (!centerCursor || robot == null || gameEngine.clickGUI.isOpen()) {
+        if (!captureMouse || robot == null) {
             gameEngine.showCursor();
             return;
         }
+        if (gameEngine.clickGUI != null && gameEngine.clickGUI.isOpen()) {
+            gameEngine.showCursor();
+            return;
+        }
+
         int centerX = panel.getWidth() / 2;
         int centerY = panel.getHeight() / 2;
-        Point centerPoint = new Point(centerX, centerY);
-        SwingUtilities.convertPointToScreen(centerPoint, panel);
-        robot.mouseMove(centerPoint.x, centerPoint.y);
+        Point p = new Point(centerX, centerY);
+        SwingUtilities.convertPointToScreen(p, panel);
+
+        ignoreNextMouseMove = true;
+        robot.mouseMove(p.x, p.y);
+
+        // Reset last positions so next delta is clean
+        lastMouseX = centerX;
+        lastMouseY = centerY;
+
         gameEngine.hideCursor();
     }
 
@@ -92,30 +114,64 @@ public class InputHandler implements KeyListener, MouseMotionListener, MouseList
 
     @Override
     public void mouseMoved(MouseEvent e) {
-        if (gameEngine.clickGUI.isOpen()) {
+        ClickGUI gui = gameEngine.clickGUI;
+
+        if (gui != null && gui.isOpen()) {
             gameEngine.showCursor();
-            gameEngine.clickGUI.mouseMoved(e);
+            gui.mouseMoved(e);
             return;
         }
 
-        int centerX = gameEngine.getWidth() / 2;
-        int centerY = gameEngine.getHeight() / 2;
-        int dx = e.getX() - centerX;
-        int dy = e.getY() - centerY;
+        if (!captureMouse) {
+            gameEngine.showCursor();
+            return;
+        }
 
-        bus.publish(new MouseLookEvent(dx, dy));
+        if (ignoreNextMouseMove) {
+            ignoreNextMouseMove = false;
+            lastMouseX = e.getX();
+            lastMouseY = e.getY();
+            return;
+        }
 
-        centerCursor(gameEngine);
+        if (lastMouseX == -1) {
+            lastMouseX = e.getX();
+            lastMouseY = e.getY();
+            return;
+        }
+
+        int dx = e.getX() - lastMouseX;
+        int dy = e.getY() - lastMouseY;
+
+        lastMouseX = e.getX();
+        lastMouseY = e.getY();
+
+        if (dx != 0 || dy != 0) {
+            bus.publish(new MouseLookEvent(dx, dy));
+        }
+
+        // Only warp when close to edges (reduces stutter massively)
+        int w = gameEngine.getWidth();
+        int h = gameEngine.getHeight();
+        if (robot != null && w > 0 && h > 0) {
+            int x = e.getX();
+            int y = e.getY();
+            if (x < EDGE_MARGIN || x > (w - EDGE_MARGIN) || y < EDGE_MARGIN || y > (h - EDGE_MARGIN)) {
+                centerCursor(gameEngine);
+            }
+        }
     }
 
     @Override
     public void mouseDragged(MouseEvent e) {
-        gameEngine.clickGUI.mouseDragged(e.getX(), e.getY());
+        if (gameEngine.clickGUI != null) {
+            gameEngine.clickGUI.mouseDragged(e.getX(), e.getY());
+        }
     }
 
-    @Override public void mouseClicked(MouseEvent e) { gameEngine.clickGUI.clicked(e.getX(), e.getY()); }
-    @Override public void mousePressed(MouseEvent e) { gameEngine.clickGUI.mousePressed(e); }
-    @Override public void mouseReleased(MouseEvent e){ gameEngine.clickGUI.mouseReleased(e); }
+    @Override public void mouseClicked(MouseEvent e) { if (gameEngine.clickGUI != null) gameEngine.clickGUI.clicked(e.getX(), e.getY()); }
+    @Override public void mousePressed(MouseEvent e) { if (gameEngine.clickGUI != null) gameEngine.clickGUI.mousePressed(e); }
+    @Override public void mouseReleased(MouseEvent e){ if (gameEngine.clickGUI != null) gameEngine.clickGUI.mouseReleased(e); }
     @Override public void mouseEntered(MouseEvent e) {}
     @Override public void mouseExited(MouseEvent e)  {}
 

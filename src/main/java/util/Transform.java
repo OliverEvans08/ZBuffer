@@ -1,10 +1,17 @@
-// File: src/main/java/util/Transform.java
 package util;
 
 public class Transform {
     public Vector3 position;
     public Vector3 rotation;
     public Vector3 scale;
+
+    // Cached matrix to avoid allocations every frame
+    private final Matrix4 cached = new Matrix4();
+    private boolean cachedValid = false;
+
+    private double lpX, lpY, lpZ;
+    private double lrX, lrY, lrZ;
+    private double lsX, lsY, lsZ;
 
     public Transform() {
         this.position = new Vector3(0, 0, 0);
@@ -13,10 +20,19 @@ public class Transform {
     }
 
     public Matrix4 getTransformationMatrix() {
-        Matrix4 S = Matrix4.scale(scale);
-        Matrix4 R = Matrix4.rotation(rotation);
-        Matrix4 T = Matrix4.translation(position);
+        if (!cachedValid ||
+                position.x != lpX || position.y != lpY || position.z != lpZ ||
+                rotation.x != lrX || rotation.y != lrY || rotation.z != lrZ ||
+                scale.x != lsX || scale.y != lsY || scale.z != lsZ) {
 
-        return T.multiply(R).multiply(S);
+            cached.setTRS(position, rotation, scale);
+
+            lpX = position.x; lpY = position.y; lpZ = position.z;
+            lrX = rotation.x; lrY = rotation.y; lrZ = rotation.z;
+            lsX = scale.x;    lsY = scale.y;    lsZ = scale.z;
+
+            cachedValid = true;
+        }
+        return cached;
     }
 }

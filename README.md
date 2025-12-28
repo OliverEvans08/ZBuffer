@@ -1,54 +1,70 @@
 # ZBuffer
 
-A software-rendered 3D engine built in Java. This project aims to implement the core features of a 3D engine, such as rendering objects, handling user input, and camera movement. The engine is designed with optimization in mind, including caching and vertex simplification for better performance.
+A **software-rendered 3D engine in pure Java**. It draws triangles directly into a pixel buffer using a Z-buffer (depth buffer), runs a fixed-timestep loop, supports first/third-person cameras with optional flight, basic AABB collisions, a keyframe animation system, a minimal click GUI, and simple sound playback.
+
+---
 
 ## Features
-- **Basic 3D Rendering**: Render 3D objects, including full models and wireframes.
-- **Camera Movement**: Implement camera controls for navigating the 3D environment.
-- **Input Handling**: Handle keyboard and mouse input for user interaction.
-- **Optimized Performance**: Includes caching for trigonometric values, vertex transformation, and distance-based vertex simplification.
-- **Particle System**: Add particles in the view.
-- **Flight Mode**: Toggle between flight and regular movement mode.
 
-## Requirements
-- Java 8 or later
-- IDE (e.g., IntelliJ IDEA, Eclipse) or command-line tools to compile and run Java applications.
+- **Software rasterizer with Z-buffer**
+  - Perspective projection, near/far clipping
+  - Triangle rasterization to an ARGB framebuffer
+  - Simple face shading based on triangle orientation
+- **Camera**
+  - First-person and third-person modes (shoulder offset & follow distance)
+  - Optional **Flight mode** (free vertical movement)
+  - Gravity & jump when not in flight
+- **Movement & collisions**
+  - WASD + mouse-look
+  - AABB collision against objects flagged as “full”
+- **Keyframe Animation** (`engine.animation`)
+  - Channels for position/rotation/scale, loop or one-shot
+  - Absolute or relative application per target
+- **Fixed timestep game loop**
+  - Deterministic updates via `engine.core.GameClock` (default 60 Hz)
+  - Lightweight in-process `engine.event.EventBus`
+- **In-game Click GUI**
+  - Toggle Debug overlay
+  - Sliders for **FOV (30–120°, default 70°)** and **Render Distance (50–500, default 200)**
+- **Sound**
+  - Loads `.wav` files from `src/main/java/sound/wavs`
+  - Used for jump SFX (`jump.wav`)
 
-## Setup Instructions
-1. Clone the repository:
-    ```bash
-    git clone https://github.com/OliverEvans08/ZBuffer
-    ```
+**Built-in objects**
+- `objects.fixed.Cube` – unit cube (scaled/placed via transform)
+- `objects.fixed.GameCube` – falling/rotating cubes that respawn
+- `objects.dynamic.Body` – player body AABB (hidden in first-person)
 
-2. Navigate to the project directory:
-    ```bash
-    cd 3d-engine
-    ```
-
-3. Compile and run the project:
-    - If using an IDE, import the project and run the main class.
-    - If using the command line:
-      ```bash
-      javac -d bin src/*.java
-      java -cp bin engine.Main
-      ```
+---
 
 ## Controls
-- **W**: Move forward
-- **S**: Move backward
-- **A**: Move left
-- **D**: Move right
-- **Space**: Ascend (if in flight mode) / Jump (if not in flight mode)
-- **Shift**: Descend (if in flight mode)
-- **F**: Add particle at the camera's location
-- **G**: Toggle flight mode
-- **P**: Open/Close the GUI (ClickGUI)
 
-## Future Features
-- Improved particle system
-- Object interactions (collision detection, etc.)
-- Lighting system
-- Shader support
+| Action                              | Key / Mouse        |
+|-------------------------------------|--------------------|
+| Move forward / back / left / right  | **W / S / A / D**  |
+| Jump (ground) / Ascend (flight)     | **Space**          |
+| Descend (flight)                    | **Shift**          |
+| Mouse look                          | **Move mouse**     |
+| Toggle Flight mode                  | **G**              |
+| Toggle First/Third person           | **V**              |
+| Open/Close Click GUI                | **P**              |
 
-## License
-This project is licensed under the MIT License - see the LICENSE file for details.
+> When the GUI is open the mouse cursor is visible and interactive. When closed, the cursor is hidden and re-centered (via `java.awt.Robot`) for mouse-look.
+
+---
+
+## Requirements
+
+- **JDK 17** recommended (**minimum JDK 14**) — uses modern `switch` syntax.
+- Desktop Java runtime (AWT/Swing & `javax.sound.sampled`).
+- Windows/macOS/Linux.  
+  - On macOS you may need to allow input control for AWT `Robot` (System Settings → Privacy & Security → Accessibility).
+
+---
+
+## Getting Started
+
+### 1) Clone
+```bash
+git clone <your-repo-url> ZBuffer
+cd ZBuffer

@@ -1,15 +1,8 @@
-// File: src/main/java/engine/animation/Animator.java
 package engine.animation;
 
-import engine.animation.AnimationClip.Channel;
 import objects.GameObject;
 import util.Vector3;
 
-/**
- * Animator applies an AnimationClip to a GameObject's local Transform.
- * Mode.ABSOLUTE: keys REPLACE base values (missing keys keep base).
- * Mode.RELATIVE: keys OFFSET base (pos/rot add, scale multiply).
- */
 public final class Animator {
 
     public enum Mode { ABSOLUTE, RELATIVE }
@@ -22,7 +15,6 @@ public final class Animator {
     private boolean playing = false;
     private Mode mode = Mode.ABSOLUTE;
 
-    // Snapshot of base (bind) transform on play()
     private Vector3 basePos = new Vector3(0,0,0);
     private Vector3 baseRot = new Vector3(0,0,0);
     private Vector3 baseScl = new Vector3(1,1,1);
@@ -42,7 +34,7 @@ public final class Animator {
         this.clip = clip;
         this.time = 0.0;
         this.playing = true;
-        // Bind snapshot
+
         basePos = target.transform.position.copy();
         baseRot = target.transform.rotation.copy();
         baseScl = target.transform.scale.copy();
@@ -64,22 +56,20 @@ public final class Animator {
 
         time += dt * speed;
 
-        // Sample per channel
-        double px = clip.sample(Channel.POS_X, time);
-        double py = clip.sample(Channel.POS_Y, time);
-        double pz = clip.sample(Channel.POS_Z, time);
+        double px = clip.sample(AnimationClip.Channel.POS_X, time);
+        double py = clip.sample(AnimationClip.Channel.POS_Y, time);
+        double pz = clip.sample(AnimationClip.Channel.POS_Z, time);
 
-        double rx = clip.sample(Channel.ROT_X, time);
-        double ry = clip.sample(Channel.ROT_Y, time);
-        double rz = clip.sample(Channel.ROT_Z, time);
+        double rx = clip.sample(AnimationClip.Channel.ROT_X, time);
+        double ry = clip.sample(AnimationClip.Channel.ROT_Y, time);
+        double rz = clip.sample(AnimationClip.Channel.ROT_Z, time);
 
-        double sx = clip.sample(Channel.SCALE_X, time);
-        double sy = clip.sample(Channel.SCALE_Y, time);
-        double sz = clip.sample(Channel.SCALE_Z, time);
+        double sx = clip.sample(AnimationClip.Channel.SCALE_X, time);
+        double sy = clip.sample(AnimationClip.Channel.SCALE_Y, time);
+        double sz = clip.sample(AnimationClip.Channel.SCALE_Z, time);
 
         switch (mode) {
             case ABSOLUTE -> {
-                // Missing channels => keep base
                 target.transform.position.x = Double.isNaN(px) ? basePos.x : px;
                 target.transform.position.y = Double.isNaN(py) ? basePos.y : py;
                 target.transform.position.z = Double.isNaN(pz) ? basePos.z : pz;
@@ -93,7 +83,6 @@ public final class Animator {
                 target.transform.scale.z = Double.isNaN(sz) ? baseScl.z : sz;
             }
             case RELATIVE -> {
-                // Missing channels => 0 offset for pos/rot, 1x for scale
                 target.transform.position.x = basePos.x + (Double.isNaN(px) ? 0.0 : px);
                 target.transform.position.y = basePos.y + (Double.isNaN(py) ? 0.0 : py);
                 target.transform.position.z = basePos.z + (Double.isNaN(pz) ? 0.0 : pz);
@@ -108,7 +97,6 @@ public final class Animator {
             }
         }
 
-        // If non-looping and time exceeded, clamp and stop
         if (!clip.isLoop() && time >= clip.getDuration()) {
             time = clip.getDuration();
             playing = false;

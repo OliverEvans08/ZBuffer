@@ -1,8 +1,5 @@
-// File: src/main/java/engine/GameEngine.java
 package engine;
 
-import engine.animation.AnimationClip;
-import engine.animation.AnimationSystem;
 import engine.core.GameClock;
 import engine.event.EventBus;
 import engine.event.events.*;
@@ -12,13 +9,15 @@ import objects.GameObject;
 import objects.dynamic.Body;
 import objects.fixed.Cube;
 import objects.fixed.GameCube;
+import objects.fixed.Ground;
 import sound.SoundEngine;
 
 import javax.swing.*;
 import java.awt.*;
-import java.awt.image.VolatileImage;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.locks.LockSupport;
 
 public class GameEngine extends JPanel implements Runnable {
 
@@ -37,16 +36,18 @@ public class GameEngine extends JPanel implements Runnable {
 
     public List<GameObject> rootObjects;
 
-    public long lastTime = System.nanoTime();
-    public int frames = 0;
+    private long fpsLastTime = System.nanoTime();
+    private int fpsFrames = 0;
     public int fps = 0;
-
-    private VolatileImage buffer;
 
     private double fovDegrees = 70.0;
     private double renderDistance = 200.0;
 
     private final Body playerBody;
+
+    private static final int TARGET_FPS = 60;
+    private static final long FRAME_NANOS = 1_000_000_000L / TARGET_FPS;
+    private final AtomicBoolean repaintPending = new AtomicBoolean(false);
 
     public GameEngine() {
         this.eventBus = new EventBus();
@@ -71,6 +72,7 @@ public class GameEngine extends JPanel implements Runnable {
 
         setupWindow();
         setupInputListeners();
+
         inputHandler.centerCursor(this);
         initializeGameObjects();
 
@@ -90,6 +92,10 @@ public class GameEngine extends JPanel implements Runnable {
     private void setupWindow() {
         setPreferredSize(new Dimension(WIDTH, HEIGHT));
         setFocusable(true);
+
+        // Let Swing handle buffering (simpler and usually faster than the extra VolatileImage layer here)
+        setDoubleBuffered(true);
+
         requestFocusInWindow();
     }
 
@@ -97,119 +103,72 @@ public class GameEngine extends JPanel implements Runnable {
         addKeyListener(inputHandler);
         addMouseMotionListener(inputHandler);
         addMouseListener(inputHandler);
+
+        addFocusListener(new java.awt.event.FocusAdapter() {
+            @Override public void focusLost(java.awt.event.FocusEvent e) {
+                showCursor();
+                inputHandler.setCaptureMouse(false);
+            }
+            @Override public void focusGained(java.awt.event.FocusEvent e) {
+                inputHandler.setCaptureMouse(true);
+                if (!clickGUI.isOpen()) inputHandler.centerCursor(GameEngine.this);
+            }
+        });
     }
 
     private void initializeGameObjects() {
-        // A "pedestal" cube that we'll animate for demonstration
+        Ground ground = new Ground(250.0, 25.0);
+        ground.setFull(true);
+        rootObjects.add(ground);
+
         Cube c = new Cube(2.0, 5.0, 1.0, 8.0);
         c.setFull(true);
         rootObjects.add(c);
 
-        // A few spinning/falling cubes driven by their own update()
         for (int i = 0; i < 10; i++) {
             rootObjects.add(new GameCube());
         }
-
-        // --- Demo: make c gently bob up/down and rotate with a simple clip
-        // Builder-style, looped 2-second animation (RELATIVE is nice for bobbing)
-        AnimationClip idle = AnimationClip.builder(2.0)
-                .loop(true)
-                // Bob on Y: 0 -> +0.3 -> 0
-                .key(AnimationClip.Channel.POS_Y, 0.0, 0.0)
-                .key(AnimationClip.Channel.POS_Y, 1.0, 0.30)
-                .key(AnimationClip.Channel.POS_Y, 2.0, 0.0)
-                // Slow yaw spin
-                .key(AnimationClip.Channel.ROT_Y, 0.0, 0.0)
-                .key(AnimationClip.Channel.ROT_Y, 2.0, Math.PI * 2.0)
-                .build();
-
-        c.animate().setMode(engine.animation.Animator.Mode.RELATIVE)
-                .setSpeed(1.0)
-                .play(idle);
     }
 
     @Override
     protected void paintComponent(Graphics g) {
+        repaintPending.set(false);
         super.paintComponent(g);
 
-        if (!(g instanceof Graphics2D)) {
-            renderDirect(null, g);
-            return;
-        }
+        if (!(g instanceof Graphics2D)) return;
+        Graphics2D g2d = (Graphics2D) g;
 
-        Graphics2D screenG2 = (Graphics2D) g;
-        GraphicsConfiguration gc = screenG2.getDeviceConfiguration();
-        if (gc == null) {
-            GraphicsEnvironment ge = GraphicsEnvironment.getLocalGraphicsEnvironment();
-            GraphicsDevice gd = ge.getDefaultScreenDevice();
-            gc = gd.getDefaultConfiguration();
-        }
+        // Speed-focused hints
+        g2d.setRenderingHint(RenderingHints.KEY_RENDERING, RenderingHints.VALUE_RENDER_SPEED);
+        g2d.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BILINEAR);
+        g2d.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_OFF);
+        g2d.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING, RenderingHints.VALUE_TEXT_ANTIALIAS_OFF);
 
-        ensureBackBuffer(gc);
+        renderer.render(g2d, rootObjects, getWidth(), getHeight());
 
-        if (buffer == null) {
-            renderDirect(screenG2, g);
-            return;
-        }
-
-        boolean valid;
-        do {
-            int code = buffer.validate(gc);
-            if (code == VolatileImage.IMAGE_INCOMPATIBLE) {
-                recreateBackBuffer(gc);
-            }
-
-            Graphics2D g2d = buffer.createGraphics();
-            try {
-                g2d.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_OFF);
-                renderer.clearScreen(g2d, WIDTH, HEIGHT);
-                renderer.render(g2d, rootObjects, WIDTH, HEIGHT);
-                clickGUI.render(g2d);
-                if (clickGUI.isDebug()) {
-                    drawDebugInfo(g2d);
-                }
-            } finally {
-                g2d.dispose();
-            }
-            valid = !buffer.contentsLost();
-        } while (!valid);
-
-        screenG2.drawImage(buffer, 0, 0, null);
-    }
-
-    private void renderDirect(Graphics2D screenG2, Graphics gRaw) {
-        Graphics2D g2 = screenG2 != null ? screenG2 : (Graphics2D) gRaw;
-        g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_OFF);
-        renderer.clearScreen(g2, WIDTH, HEIGHT);
-        renderer.render(g2, rootObjects, WIDTH, HEIGHT);
-        clickGUI.render(g2);
+        clickGUI.render(g2d);
         if (clickGUI.isDebug()) {
-            drawDebugInfo(g2);
+            drawDebugInfo(g2d);
         }
+
+        countFrame();
     }
 
-    private void ensureBackBuffer(GraphicsConfiguration gc) {
-        if (buffer == null) {
-            recreateBackBuffer(gc);
-        } else {
-            int code = buffer.validate(gc);
-            if (code == VolatileImage.IMAGE_INCOMPATIBLE) {
-                recreateBackBuffer(gc);
-            }
-        }
-    }
-
-    private void recreateBackBuffer(GraphicsConfiguration gc) {
-        if (gc != null) {
-            buffer = gc.createCompatibleVolatileImage(WIDTH, HEIGHT, Transparency.OPAQUE);
-        } else {
-            buffer = null;
+    private void countFrame() {
+        long now = System.nanoTime();
+        fpsFrames++;
+        if (now - fpsLastTime >= 1_000_000_000L) {
+            fps = fpsFrames;
+            fpsFrames = 0;
+            fpsLastTime = now;
         }
     }
 
     @Override
     public void run() {
         long lastNanos = System.nanoTime();
+        long nextRender = System.nanoTime();
+
         while (true) {
             long now = System.nanoTime();
             double elapsed = (now - lastNanos) / 1_000_000_000.0;
@@ -219,16 +178,25 @@ public class GameEngine extends JPanel implements Runnable {
             while (clock.stepReady()) {
                 double dt = clock.fixedDeltaSeconds();
                 eventBus.publish(new TickEvent(TickEvent.Phase.PRE, dt));
-
                 fixedUpdate(dt);
-
                 eventBus.publish(new TickEvent(TickEvent.Phase.POST, dt));
                 clock.consumeStep();
             }
 
-            repaint();
-            calculateFPS(now);
-            try { Thread.sleep(1); } catch (InterruptedException ignored) {}
+            if (now >= nextRender) {
+                nextRender += FRAME_NANOS;
+
+                if (repaintPending.compareAndSet(false, true)) {
+                    SwingUtilities.invokeLater(this::repaint);
+                }
+
+                if (now - nextRender > FRAME_NANOS * 4) {
+                    nextRender = now;
+                }
+            } else {
+                long wait = nextRender - now;
+                LockSupport.parkNanos(Math.min(wait, 2_000_000L));
+            }
         }
     }
 
@@ -237,16 +205,12 @@ public class GameEngine extends JPanel implements Runnable {
         playerController.updatePerTick(delta);
 
         camera.update(delta);
-
-        // --- NEW: drive all animators before per-object updates
-        AnimationSystem.updateAll(rootObjects, delta);
-
         syncPlayerBodyToCamera();
 
         soundEngine.tick();
 
         for (GameObject obj : rootObjects) {
-            obj.update(delta);
+            if (obj != null) obj.update(delta);
         }
     }
 
@@ -255,17 +219,7 @@ public class GameEngine extends JPanel implements Runnable {
         playerBody.getTransform().position.y = camera.y;
         playerBody.getTransform().position.z = camera.z;
 
-        // Keep body facing camera yaw (negative because of view->world convention)
         playerBody.getTransform().rotation.y = -camera.getViewYaw();
-    }
-
-    private void calculateFPS(long now) {
-        frames++;
-        if (now - lastTime >= 1_000_000_000L) {
-            fps = frames;
-            frames = 0;
-            lastTime = now;
-        }
     }
 
     public void hideCursor() {
@@ -282,11 +236,12 @@ public class GameEngine extends JPanel implements Runnable {
     public void onGuiToggled(boolean open) {
         if (open) {
             showCursor();
+            inputHandler.setCaptureMouse(false);
         } else {
+            inputHandler.setCaptureMouse(true);
             inputHandler.centerCursor(this);
         }
         requestFocusInWindow();
-        eventBus.publish(new GuiToggledEvent(open));
     }
 
     private void drawDebugInfo(Graphics g) {
@@ -303,6 +258,8 @@ public class GameEngine extends JPanel implements Runnable {
         g.drawString("FOV: " + String.format("%.1f°", fovDegrees), 10, 200);
         g.drawString("RenderDist: " + String.format("%.0f", getRenderDistance()), 10, 220);
         g.drawString("Cam Mode: " + (camera.isFirstPerson() ? "First" : "Third"), 10, 240);
+        g.drawString("RenderScale: " + String.format("%.2f", renderer.getRenderScale()), 10, 260);
+        g.drawString("FXAA: " + renderer.isFxaaEnabled(), 10, 280);
     }
 
     public static void main(String[] args) {

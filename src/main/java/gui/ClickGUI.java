@@ -18,13 +18,14 @@ public class ClickGUI {
     public final List<Slider> sliders = new ArrayList<>();
 
     private int panelX = 100, panelY = 100;
-    private int panelWidth = 260, panelHeight = 150;
+    private int panelWidth = 260, panelHeight = 190;
     private boolean dragging = false;
     private int dragX, dragY;
     private boolean mousePressed = false;
 
     private Slider fovSlider;
     private Slider renderSlider;
+    private Slider renderScaleSlider;
 
     public ClickGUI(GameEngine engine) {
         this.engine = engine;
@@ -38,6 +39,11 @@ public class ClickGUI {
         renderSlider = new Slider(panelX + 20, panelY + 110, 200, 50, 500, 200, "Render Distance")
                 .onChange(v -> engine.setRenderDistance(v));
         sliders.add(renderSlider);
+
+        int rsInit = (int) Math.round(engine.renderer.getRenderScale() * 100.0);
+        renderScaleSlider = new Slider(panelX + 20, panelY + 150, 200, 25, 100, rsInit, "Render Scale")
+                .onChange(v -> engine.renderer.setRenderScale(v / 100.0));
+        sliders.add(renderScaleSlider);
     }
 
     public void render(Graphics graphics) {
@@ -49,7 +55,6 @@ public class ClickGUI {
         g2d.setPaint(gradient);
         g2d.fillRoundRect(panelX, panelY, panelWidth, panelHeight, 16, 16);
 
-        // Header
         g2d.setColor(new Color(255, 255, 255, 24));
         g2d.fillRoundRect(panelX, panelY, panelWidth, 24, 16, 16);
         g2d.setColor(Color.WHITE);
@@ -62,8 +67,6 @@ public class ClickGUI {
     public void setOpen(boolean open) {
         if (this.isOpen == open) return;
         this.isOpen = open;
-
-        // Notify engine to toggle cursor capture immediately.
         engine.onGuiToggled(open);
     }
 
@@ -103,7 +106,6 @@ public class ClickGUI {
             panelX = x - dragX;
             panelY = y - dragY;
 
-            // Reposition components
             buttons.get(0).bounds.setLocation(panelX + 20, panelY + 20);
             for (int i = 0; i < sliders.size(); i++) {
                 sliders.get(i).bounds.setLocation(panelX + 20, panelY + 70 + (i * 40));
@@ -149,7 +151,7 @@ public class ClickGUI {
     }
 
     private void handleButtonClick(Button button) {
-        // Currently only "Debug" toggle
+        // debug toggle only right now
     }
 
     public boolean isMousePressed() {
@@ -162,6 +164,10 @@ public class ClickGUI {
 
     public Slider getRenderDistanceSlider() {
         return renderSlider;
+    }
+
+    public Slider getRenderScaleSlider() {
+        return renderScaleSlider;
     }
 
     public boolean isDebug() {

@@ -1,69 +1,127 @@
 package util;
 
 public class Matrix4 {
-    private final double[][] m;
+    // Row-major 4x4
+    private final double[] m = new double[16];
 
     public Matrix4() {
-        m = new double[4][4];
-        for (int i = 0; i < 4; i++) m[i][i] = 1.0;
+        setIdentity();
+    }
+
+    public void setIdentity() {
+        for (int i = 0; i < 16; i++) m[i] = 0.0;
+        m[0] = 1.0;
+        m[5] = 1.0;
+        m[10] = 1.0;
+        m[15] = 1.0;
     }
 
     public static Matrix4 translation(Vector3 v) {
         Matrix4 r = new Matrix4();
-        r.m[0][3] = v.x;
-        r.m[1][3] = v.y;
-        r.m[2][3] = v.z;
+        r.m[3]  = v.x;
+        r.m[7]  = v.y;
+        r.m[11] = v.z;
         return r;
     }
 
     public static Matrix4 scale(Vector3 v) {
         Matrix4 r = new Matrix4();
-        r.m[0][0] = v.x;
-        r.m[1][1] = v.y;
-        r.m[2][2] = v.z;
+        r.m[0]  = v.x;
+        r.m[5]  = v.y;
+        r.m[10] = v.z;
         return r;
     }
 
     public static Matrix4 rotation(Vector3 r) {
-        double cx = Math.cos(r.x), sx = Math.sin(r.x);
-        double cy = Math.cos(r.y), sy = Math.sin(r.y);
-        double cz = Math.cos(r.z), sz = Math.sin(r.z);
+        Matrix4 out = new Matrix4();
+        out.setRotation(r);
+        return out;
+    }
 
-        // Rotation order: Y (yaw) then X (pitch) then Z (roll)
-        Matrix4 Rx = new Matrix4();
-        Rx.m[1][1] = cx; Rx.m[1][2] = -sx;
-        Rx.m[2][1] = sx; Rx.m[2][2] = cx;
+    public void setTRS(Vector3 pos, Vector3 rot, Vector3 scl) {
+        // Build M = T * R * S directly (no intermediate matrices)
+        double cx = Math.cos(rot.x), sx = Math.sin(rot.x);
+        double cy = Math.cos(rot.y), sy = Math.sin(rot.y);
+        double cz = Math.cos(rot.z), sz = Math.sin(rot.z);
 
-        Matrix4 Ry = new Matrix4();
-        Ry.m[0][0] = cy; Ry.m[0][2] = sy;
-        Ry.m[2][0] = -sy; Ry.m[2][2] = cy;
+        // Rotation order matches old code: Ry * Rx * Rz
+        double r00 = cy * cz + sy * sx * sz;
+        double r01 = -cy * sz + sy * sx * cz;
+        double r02 = sy * cx;
 
-        Matrix4 Rz = new Matrix4();
-        Rz.m[0][0] = cz; Rz.m[0][1] = -sz;
-        Rz.m[1][0] = sz; Rz.m[1][1] = cz;
+        double r10 = cx * sz;
+        double r11 = cx * cz;
+        double r12 = -sx;
 
-        return Ry.multiply(Rx).multiply(Rz);
+        double r20 = -sy * cz + cy * sx * sz;
+        double r21 = sy * sz + cy * sx * cz;
+        double r22 = cy * cx;
+
+        // Apply scale on columns (R * S)
+        m[0]  = r00 * scl.x;  m[1]  = r01 * scl.y;  m[2]  = r02 * scl.z;  m[3]  = pos.x;
+        m[4]  = r10 * scl.x;  m[5]  = r11 * scl.y;  m[6]  = r12 * scl.z;  m[7]  = pos.y;
+        m[8]  = r20 * scl.x;  m[9]  = r21 * scl.y;  m[10] = r22 * scl.z;  m[11] = pos.z;
+
+        m[12] = 0.0;          m[13] = 0.0;          m[14] = 0.0;          m[15] = 1.0;
+    }
+
+    public void setRotation(Vector3 rot) {
+        // Rotation-only (no translation/scale)
+        double cx = Math.cos(rot.x), sx = Math.sin(rot.x);
+        double cy = Math.cos(rot.y), sy = Math.sin(rot.y);
+        double cz = Math.cos(rot.z), sz = Math.sin(rot.z);
+
+        double r00 = cy * cz + sy * sx * sz;
+        double r01 = -cy * sz + sy * sx * cz;
+        double r02 = sy * cx;
+
+        double r10 = cx * sz;
+        double r11 = cx * cz;
+        double r12 = -sx;
+
+        double r20 = -sy * cz + cy * sx * sz;
+        double r21 = sy * sz + cy * sx * cz;
+        double r22 = cy * cx;
+
+        setIdentity();
+        m[0] = r00; m[1] = r01; m[2] = r02;
+        m[4] = r10; m[5] = r11; m[6] = r12;
+        m[8] = r20; m[9] = r21; m[10] = r22;
     }
 
     public Vector3 transform(Vector3 v) {
-        // implicit w = 1
-        double x = m[0][0]*v.x + m[0][1]*v.y + m[0][2]*v.z + m[0][3];
-        double y = m[1][0]*v.x + m[1][1]*v.y + m[1][2]*v.z + m[1][3];
-        double z = m[2][0]*v.x + m[2][1]*v.y + m[2][2]*v.z + m[2][3];
+        double x = m[0] * v.x + m[1] * v.y + m[2] * v.z + m[3];
+        double y = m[4] * v.x + m[5] * v.y + m[6] * v.z + m[7];
+        double z = m[8] * v.x + m[9] * v.y + m[10] * v.z + m[11];
         return new Vector3(x, y, z);
+    }
+
+    public void transformPoint(double x, double y, double z, double[] out3) {
+        out3[0] = m[0] * x + m[1] * y + m[2] * z + m[3];
+        out3[1] = m[4] * x + m[5] * y + m[6] * z + m[7];
+        out3[2] = m[8] * x + m[9] * y + m[10] * z + m[11];
     }
 
     public Matrix4 multiply(Matrix4 o) {
         Matrix4 r = new Matrix4();
-        for (int row = 0; row < 4; row++) {
-            for (int col = 0; col < 4; col++) {
-                double s = 0;
-                for (int k = 0; k < 4; k++) {
-                    s += this.m[row][k] * o.m[k][col];
-                }
-                r.m[row][col] = s;
-            }
-        }
+        multiply(o, r);
         return r;
+    }
+
+    public void multiply(Matrix4 o, Matrix4 out) {
+        // out = this * o
+        double[] a = this.m;
+        double[] b = o.m;
+        double[] r = out.m;
+
+        for (int row = 0; row < 4; row++) {
+            int r0 = row * 4;
+            double a0 = a[r0], a1 = a[r0 + 1], a2 = a[r0 + 2], a3 = a[r0 + 3];
+
+            r[r0]     = a0 * b[0]  + a1 * b[4]  + a2 * b[8]  + a3 * b[12];
+            r[r0 + 1] = a0 * b[1]  + a1 * b[5]  + a2 * b[9]  + a3 * b[13];
+            r[r0 + 2] = a0 * b[2]  + a1 * b[6]  + a2 * b[10] + a3 * b[14];
+            r[r0 + 3] = a0 * b[3]  + a1 * b[7]  + a2 * b[11] + a3 * b[15];
+        }
     }
 }
