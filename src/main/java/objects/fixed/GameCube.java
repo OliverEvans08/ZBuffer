@@ -89,9 +89,9 @@ public class GameCube extends GameObject {
     private void respawn() {
         ThreadLocalRandom r = ThreadLocalRandom.current();
         this.transform.position = new Vector3(
-                r.nextDouble(-20.0, 20.0),
+                r.nextDouble(-40.0, 40.0),
                 r.nextDouble(8.0, 12.0),
-                r.nextDouble(6.0, 30.0)
+                r.nextDouble(12.0, 60.0)
         );
     }
 }

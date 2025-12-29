@@ -1,8 +1,10 @@
 package engine;
 
+import engine.animation.AnimationSystem;
 import engine.core.GameClock;
 import engine.event.EventBus;
-import engine.event.events.*;
+import engine.event.events.GuiToggleRequestedEvent;
+import engine.event.events.TickEvent;
 import engine.systems.PlayerController;
 import gui.ClickGUI;
 import objects.GameObject;
@@ -61,6 +63,7 @@ public class GameEngine extends JPanel implements Runnable {
 
         this.inputHandler = new InputHandler(eventBus, this);
 
+        // Humanoid rig now
         this.playerBody = new Body(Camera.WIDTH, Camera.HEIGHT);
         this.playerBody.setFull(false);
         this.playerBody.getTransform().position.x = camera.x;
@@ -92,10 +95,7 @@ public class GameEngine extends JPanel implements Runnable {
     private void setupWindow() {
         setPreferredSize(new Dimension(WIDTH, HEIGHT));
         setFocusable(true);
-
-        // Let Swing handle buffering (simpler and usually faster than the extra VolatileImage layer here)
         setDoubleBuffered(true);
-
         requestFocusInWindow();
     }
 
@@ -125,7 +125,7 @@ public class GameEngine extends JPanel implements Runnable {
         c.setFull(true);
         rootObjects.add(c);
 
-        for (int i = 0; i < 10; i++) {
+        for (int i = 0; i < 40; i++) {
             rootObjects.add(new GameCube());
         }
     }
@@ -138,7 +138,6 @@ public class GameEngine extends JPanel implements Runnable {
         if (!(g instanceof Graphics2D)) return;
         Graphics2D g2d = (Graphics2D) g;
 
-        // Speed-focused hints
         g2d.setRenderingHint(RenderingHints.KEY_RENDERING, RenderingHints.VALUE_RENDER_SPEED);
         g2d.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BILINEAR);
         g2d.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_OFF);
@@ -204,14 +203,29 @@ public class GameEngine extends JPanel implements Runnable {
         inputHandler.updatePerTick();
         playerController.updatePerTick(delta);
 
+        // Capture motion intent BEFORE camera.update() resets deltas
+        boolean movingIntent = (Math.abs(camera.dx) > 1e-9) || (Math.abs(camera.dz) > 1e-9);
+
         camera.update(delta);
         syncPlayerBodyToCamera();
 
-        soundEngine.tick();
+        // Feed humanoid animation state
+        playerBody.setMotionState(
+                movingIntent,
+                camera.onGround,
+                camera.yVelocity,
+                camera.flightMode
+        );
 
+        // Regular object updates (Body decides which clips to play)
         for (GameObject obj : rootObjects) {
             if (obj != null) obj.update(delta);
         }
+
+        // Advance animators for entire scene graph (includes Body children)
+        AnimationSystem.updateAll(rootObjects, delta);
+
+        soundEngine.tick();
     }
 
     private void syncPlayerBodyToCamera() {
@@ -219,6 +233,7 @@ public class GameEngine extends JPanel implements Runnable {
         playerBody.getTransform().position.y = camera.y;
         playerBody.getTransform().position.z = camera.z;
 
+        // Face camera yaw, ignore pitch (keep humanoid upright)
         playerBody.getTransform().rotation.y = -camera.getViewYaw();
     }
 

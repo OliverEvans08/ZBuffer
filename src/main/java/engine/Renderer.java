@@ -1,4 +1,3 @@
-// File: Renderer.java
 package engine;
 
 import engine.render.Material;
@@ -8,7 +7,9 @@ import objects.GameObject;
 import java.awt.*;
 import java.awt.image.BufferedImage;
 import java.awt.image.DataBufferInt;
+import java.util.ArrayDeque;
 import java.util.Arrays;
+import java.util.Deque;
 import java.util.List;
 
 public class Renderer {
@@ -41,16 +42,13 @@ public class Renderer {
     public boolean isFxaaEnabled() { return fxaaEnabled; }
     public void setFxaaEnabled(boolean enabled) { this.fxaaEnabled = enabled; }
 
-    // Camera-space per-vertex temps
     private double[] vx = new double[0];
     private double[] vy = new double[0];
     private double[] vz = new double[0];
 
-    // Base UV per vertex (not u/z yet)
     private double[] uu = new double[0];
     private double[] vv = new double[0];
 
-    // Reusable clip buffers (max 4 verts after near-plane clip)
     private final double[] cax = new double[4], cay = new double[4], caz = new double[4], cau = new double[4], cav = new double[4];
     private final double[] cbx = new double[4], cby = new double[4], cbz = new double[4], cbu = new double[4], cbv = new double[4];
 
@@ -87,146 +85,149 @@ public class Renderer {
         final double camY = camera.getViewY();
         final double camZ = camera.getViewZ();
 
-        GameObject playerBody = gameEngine.getPlayerBody();
+        final GameObject playerBody = gameEngine.getPlayerBody();
 
+        // Traverse roots + children (so humanoid limbs render)
+        Deque<GameObject> stack = new ArrayDeque<>();
         if (gameObjects != null) {
-            for (GameObject go : gameObjects) {
-                if (go == null || !go.isVisible()) continue;
+            for (int i = gameObjects.size() - 1; i >= 0; i--) stack.push(gameObjects.get(i));
+        }
 
-                if (camera.isFirstPerson() && go == playerBody) continue;
+        while (!stack.isEmpty()) {
+            GameObject go = stack.pop();
+            if (go == null || !go.isVisible()) continue;
 
-                final boolean isPlayerBody = (!camera.isFirstPerson() && go == playerBody);
-                final double thisNear = isPlayerBody ? Math.max(NEAR, BODY_NEAR_PAD) : NEAR;
-                final double thisBias = isPlayerBody ? BODY_Z_BIAS : 0.0;
+            boolean isPlayerFamily = (playerBody != null) && isDescendantOrSelf(go, playerBody);
 
-                final boolean doubleSided = !go.isFull(); // non-solid objects should still be visible when you are inside them
+            // Skip whole player rig in first-person (and do NOT traverse its children)
+            if (camera.isFirstPerson() && isPlayerFamily) continue;
 
-                double[][] wverts = go.getTransformedVertices();
-                int[][] facesArr = go.getFacesArray();
-                if (wverts == null || facesArr == null || facesArr.length == 0) continue;
+            // Traverse children regardless of whether this node has geometry
+            List<GameObject> kids = go.getChildren();
+            if (kids != null && !kids.isEmpty()) {
+                for (int i = kids.size() - 1; i >= 0; i--) stack.push(kids.get(i));
+            }
 
-                double[][] uvs = go.getUVs();
+            double[][] wverts = go.getTransformedVertices();
+            int[][] facesArr = go.getFacesArray();
+            if (wverts == null || facesArr == null || facesArr.length == 0) continue;
 
-                ensureTemps(wverts.length);
+            double[][] uvs = go.getUVs();
+            ensureTemps(wverts.length);
 
-                final Material mat = go.getMaterial();
-                final Texture tex = (mat != null ? mat.getAlbedo() : null);
-                final Texture.Wrap wrap = (mat != null ? mat.getWrap() : Texture.Wrap.REPEAT);
-                final Color tint = (mat != null ? mat.getTint() : go.getColor());
-                final double ambient = (mat != null ? mat.getAmbient() : 0.20);
-                final double diffuse = (mat != null ? mat.getDiffuse() : 0.85);
+            final Material mat = go.getMaterial();
+            final Texture tex = (mat != null ? mat.getAlbedo() : null);
+            final Texture.Wrap wrap = (mat != null ? mat.getWrap() : Texture.Wrap.REPEAT);
+            final Color tint = (mat != null ? mat.getTint() : go.getColor());
+            final double ambient = (mat != null ? mat.getAmbient() : 0.20);
+            final double diffuse = (mat != null ? mat.getDiffuse() : 0.85);
 
-                final int tintR = tint.getRed();
-                final int tintG = tint.getGreen();
-                final int tintB = tint.getBlue();
+            final int tintR = tint.getRed();
+            final int tintG = tint.getGreen();
+            final int tintB = tint.getBlue();
 
-                // World -> camera space for all vertices (no near discard here; we do proper near clipping per-tri)
-                for (int i = 0; i < wverts.length; i++) {
-                    double[] w = wverts[i];
-                    double wx = w[0] - camX;
-                    double wy = w[1] - camY;
-                    double wz0 = w[2] - camZ;
+            final boolean doubleSided = !go.isFull();
 
-                    // yaw
-                    double xr =  wx * cy + wz0 * sy;
-                    double zr = -wx * sy + wz0 * cy;
+            final boolean treatAsPlayer = isPlayerFamily;
+            final double thisNear = treatAsPlayer ? Math.max(NEAR, BODY_NEAR_PAD) : NEAR;
+            final double thisBias = treatAsPlayer ? BODY_Z_BIAS : 0.0;
 
-                    // pitch
-                    double yr =  wy * cp + zr * sp;
-                    double zf = -wy * sp + zr * cp;
+            for (int i = 0; i < wverts.length; i++) {
+                double[] w = wverts[i];
+                double wx = w[0] - camX;
+                double wy = w[1] - camY;
+                double wz0 = w[2] - camZ;
 
-                    if (thisBias != 0.0) zf += thisBias;
+                double xr =  wx * cy + wz0 * sy;
+                double zr = -wx * sy + wz0 * cy;
 
-                    vx[i] = xr;
-                    vy[i] = yr;
-                    vz[i] = zf;
+                double yr =  wy * cp + zr * sp;
+                double zf = -wy * sp + zr * cp;
 
-                    double u = 0.0, v = 0.0;
-                    if (uvs != null && i >= 0 && i < uvs.length && uvs[i] != null && uvs[i].length >= 2) {
-                        u = uvs[i][0];
-                        v = uvs[i][1];
-                    }
-                    uu[i] = u;
-                    vv[i] = v;
+                if (thisBias != 0.0) zf += thisBias;
+
+                vx[i] = xr;
+                vy[i] = yr;
+                vz[i] = zf;
+
+                double u = 0.0, v = 0.0;
+                if (uvs != null && i >= 0 && i < uvs.length && uvs[i] != null && uvs[i].length >= 2) {
+                    u = uvs[i][0];
+                    v = uvs[i][1];
                 }
+                uu[i] = u;
+                vv[i] = v;
+            }
 
-                // Faces
-                for (int[] face : facesArr) {
-                    if (face == null || face.length != 3) continue;
-                    int i0 = face[0], i1 = face[1], i2 = face[2];
-                    if (i0 < 0 || i1 < 0 || i2 < 0 || i0 >= wverts.length || i1 >= wverts.length || i2 >= wverts.length) continue;
+            for (int[] face : facesArr) {
+                if (face == null || face.length != 3) continue;
+                int i0 = face[0], i1 = face[1], i2 = face[2];
+                if (i0 < 0 || i1 < 0 || i2 < 0 || i0 >= wverts.length || i1 >= wverts.length || i2 >= wverts.length) continue;
 
-                    // quick far reject (keeps renderDistance behavior without far clipping complexity)
-                    if (vz[i0] >= far && vz[i1] >= far && vz[i2] >= far) continue;
+                if (vz[i0] >= far && vz[i1] >= far && vz[i2] >= far) continue;
 
-                    // lighting normal (camera space)
-                    double ax = vx[i1] - vx[i0];
-                    double ay = vy[i1] - vy[i0];
-                    double az = vz[i1] - vz[i0];
+                double ax = vx[i1] - vx[i0];
+                double ay = vy[i1] - vy[i0];
+                double az = vz[i1] - vz[i0];
 
-                    double bx = vx[i2] - vx[i0];
-                    double by = vy[i2] - vy[i0];
-                    double bz = vz[i2] - vz[i0];
+                double bx = vx[i2] - vx[i0];
+                double by = vy[i2] - vy[i0];
+                double bz = vz[i2] - vz[i0];
 
-                    double nx = ay * bz - az * by;
-                    double ny = az * bx - ax * bz;
-                    double nz = ax * by - ay * bx;
+                double nx = ay * bz - az * by;
+                double ny = az * bx - ax * bz;
+                double nz = ax * by - ay * bx;
 
-                    double len = Math.sqrt(nx * nx + ny * ny + nz * nz);
-                    if (len < 1e-12) continue;
+                double len = Math.sqrt(nx * nx + ny * ny + nz * nz);
+                if (len < 1e-12) continue;
 
-                    double invLen = 1.0 / len;
-                    double ndotl = Math.abs((nx * LIGHT_DIR.x + ny * LIGHT_DIR.y + nz * LIGHT_DIR.z) * invLen);
+                double invLen = 1.0 / len;
+                double ndotl = Math.abs((nx * LIGHT_DIR.x + ny * LIGHT_DIR.y + nz * LIGHT_DIR.z) * invLen);
 
-                    double shade = ambient + diffuse * ndotl;
-                    if (shade < 0) shade = 0;
-                    if (shade > 1) shade = 1;
+                double shade = ambient + diffuse * ndotl;
+                if (shade < 0) shade = 0;
+                if (shade > 1) shade = 1;
 
-                    int shadeI = (int) (shade * 255.0 + 0.5);
-                    if (shadeI < 0) shadeI = 0;
-                    if (shadeI > 255) shadeI = 255;
+                int shadeI = (int) (shade * 255.0 + 0.5);
+                if (shadeI < 0) shadeI = 0;
+                if (shadeI > 255) shadeI = 255;
 
-                    // Setup input tri for clipping
-                    cax[0] = vx[i0]; cay[0] = vy[i0]; caz[0] = vz[i0]; cau[0] = uu[i0]; cav[0] = vv[i0];
-                    cax[1] = vx[i1]; cay[1] = vy[i1]; caz[1] = vz[i1]; cau[1] = uu[i1]; cav[1] = vv[i1];
-                    cax[2] = vx[i2]; cay[2] = vy[i2]; caz[2] = vz[i2]; cau[2] = uu[i2]; cav[2] = vv[i2];
+                cax[0] = vx[i0]; cay[0] = vy[i0]; caz[0] = vz[i0]; cau[0] = uu[i0]; cav[0] = vv[i0];
+                cax[1] = vx[i1]; cay[1] = vy[i1]; caz[1] = vz[i1]; cau[1] = uu[i1]; cav[1] = vv[i1];
+                cax[2] = vx[i2]; cay[2] = vy[i2]; caz[2] = vz[i2]; cau[2] = uu[i2]; cav[2] = vv[i2];
 
-                    int clippedCount = clipPolyNear(thisNear + NEAR_CLIP_EPS,
-                            cax, cay, caz, cau, cav, 3,
-                            cbx, cby, cbz, cbu, cbv);
+                int clippedCount = clipPolyNear(thisNear + NEAR_CLIP_EPS,
+                        cax, cay, caz, cau, cav, 3,
+                        cbx, cby, cbz, cbu, cbv);
 
-                    if (clippedCount < 3) continue;
+                if (clippedCount < 3) continue;
 
-                    // Triangulate clipped polygon (3 or 4 verts)
-                    if (clippedCount == 3) {
-                        drawClippedTri(
-                                cbx[0], cby[0], cbz[0], cbu[0], cbv[0],
-                                cbx[1], cby[1], cbz[1], cbu[1], cbv[1],
-                                cbx[2], cby[2], cbz[2], cbu[2], cbv[2],
-                                f, width, height, far,
-                                tex, wrap, tintR, tintG, tintB, shadeI,
-                                doubleSided
-                        );
-                    } else {
-                        // 0,1,2
-                        drawClippedTri(
-                                cbx[0], cby[0], cbz[0], cbu[0], cbv[0],
-                                cbx[1], cby[1], cbz[1], cbu[1], cbv[1],
-                                cbx[2], cby[2], cbz[2], cbu[2], cbv[2],
-                                f, width, height, far,
-                                tex, wrap, tintR, tintG, tintB, shadeI,
-                                doubleSided
-                        );
-                        // 0,2,3
-                        drawClippedTri(
-                                cbx[0], cby[0], cbz[0], cbu[0], cbv[0],
-                                cbx[2], cby[2], cbz[2], cbu[2], cbv[2],
-                                cbx[3], cby[3], cbz[3], cbu[3], cbv[3],
-                                f, width, height, far,
-                                tex, wrap, tintR, tintG, tintB, shadeI,
-                                doubleSided
-                        );
-                    }
+                if (clippedCount == 3) {
+                    drawClippedTri(
+                            cbx[0], cby[0], cbz[0], cbu[0], cbv[0],
+                            cbx[1], cby[1], cbz[1], cbu[1], cbv[1],
+                            cbx[2], cby[2], cbz[2], cbu[2], cbv[2],
+                            f, width, height, far,
+                            tex, wrap, tintR, tintG, tintB, shadeI,
+                            doubleSided
+                    );
+                } else {
+                    drawClippedTri(
+                            cbx[0], cby[0], cbz[0], cbu[0], cbv[0],
+                            cbx[1], cby[1], cbz[1], cbu[1], cbv[1],
+                            cbx[2], cby[2], cbz[2], cbu[2], cbv[2],
+                            f, width, height, far,
+                            tex, wrap, tintR, tintG, tintB, shadeI,
+                            doubleSided
+                    );
+                    drawClippedTri(
+                            cbx[0], cby[0], cbz[0], cbu[0], cbv[0],
+                            cbx[2], cby[2], cbz[2], cbu[2], cbv[2],
+                            cbx[3], cby[3], cbz[3], cbu[3], cbv[3],
+                            f, width, height, far,
+                            tex, wrap, tintR, tintG, tintB, shadeI,
+                            doubleSided
+                    );
                 }
             }
         }
@@ -234,6 +235,13 @@ public class Renderer {
         g2d.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BILINEAR);
         g2d.setRenderingHint(RenderingHints.KEY_RENDERING, RenderingHints.VALUE_RENDER_SPEED);
         g2d.drawImage(frameBuffer, 0, 0, windowW, windowH, null);
+    }
+
+    private static boolean isDescendantOrSelf(GameObject node, GameObject root) {
+        for (GameObject p = node; p != null; p = p.getParent()) {
+            if (p == root) return true;
+        }
+        return false;
     }
 
     private void drawClippedTri(
@@ -245,10 +253,8 @@ public class Renderer {
             int tintR, int tintG, int tintB, int shadeI,
             boolean doubleSided
     ) {
-        // Far reject (triangle entirely beyond far)
         if (z0c >= far && z1c >= far && z2c >= far) return;
 
-        // Perspective project
         double inv0 = 1.0 / z0c;
         double inv1 = 1.0 / z1c;
         double inv2 = 1.0 / z2c;
@@ -278,13 +284,9 @@ public class Renderer {
         double area = edgeFunction(x0, y0, x1, y1, x2, y2);
         if (area == 0.0) return;
 
-        // Backface handling:
-        // - Solid objects: keep backface cull
-        // - Non-solid objects: flip winding if needed (so you can see them from inside)
         if (area < 0.0) {
             if (!doubleSided) return;
 
-            // swap 1 and 2 to make it CCW for our top-left rasterizer
             double tx = x1; x1 = x2; x2 = tx;
             double ty = y1; y1 = y2; y2 = ty;
 
@@ -303,7 +305,6 @@ public class Renderer {
         );
     }
 
-    // Sutherland–Hodgman clip against z > nearZ, max 4 verts out
     private static int clipPolyNear(
             double nearZ,
             double[] inX, double[] inY, double[] inZ, double[] inU, double[] inV, int inCount,
@@ -321,11 +322,9 @@ public class Renderer {
             boolean eIn = ez > nearZ;
 
             if (sIn && eIn) {
-                // keep end
                 outX[outCount] = ex; outY[outCount] = ey; outZ[outCount] = ez; outU[outCount] = eu; outV[outCount] = ev;
                 outCount++;
             } else if (sIn && !eIn) {
-                // leaving: add intersection
                 double t = (nearZ - sz) / (ez - sz);
                 double ix = sx + (ex - sx) * t;
                 double iy = sy + (ey - sy) * t;
@@ -335,7 +334,6 @@ public class Renderer {
                 outX[outCount] = ix; outY[outCount] = iy; outZ[outCount] = nearZ; outU[outCount] = iu; outV[outCount] = iv;
                 outCount++;
             } else if (!sIn && eIn) {
-                // entering: add intersection + end
                 double t = (nearZ - sz) / (ez - sz);
                 double ix = sx + (ex - sx) * t;
                 double iy = sy + (ey - sy) * t;
