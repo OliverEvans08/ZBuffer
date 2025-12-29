@@ -1,18 +1,17 @@
 package engine;
 
-import engine.animation.AnimationSystem;
-import engine.core.GameClock;
 import engine.event.EventBus;
-import engine.event.events.GuiToggleRequestedEvent;
-import engine.event.events.TickEvent;
+import engine.event.events.*;
+import engine.core.GameClock;
+import engine.render.Material;
 import engine.systems.PlayerController;
 import gui.ClickGUI;
 import objects.GameObject;
 import objects.dynamic.Body;
-import objects.fixed.Cube;
-import objects.fixed.GameCube;
-import objects.fixed.Ground;
+import objects.fixed.*;
+import objects.lighting.LightObject;
 import sound.SoundEngine;
+import util.Vector3;
 
 import javax.swing.*;
 import java.awt.*;
@@ -63,7 +62,6 @@ public class GameEngine extends JPanel implements Runnable {
 
         this.inputHandler = new InputHandler(eventBus, this);
 
-        // Humanoid rig now
         this.playerBody = new Body(Camera.WIDTH, Camera.HEIGHT);
         this.playerBody.setFull(false);
         this.playerBody.getTransform().position.x = camera.x;
@@ -117,18 +115,134 @@ public class GameEngine extends JPanel implements Runnable {
     }
 
     private void initializeGameObjects() {
-        Ground ground = new Ground(250.0, 25.0);
-        ground.setFull(true);
-        rootObjects.add(ground);
+        // ------------------------------------------------------------
+        // MAP: all geometry is made from Cube instances (no Ground)
+        // ------------------------------------------------------------
 
-        Cube c = new Cube(2.0, 5.0, 1.0, 8.0);
-        c.setFull(true);
-        rootObjects.add(c);
+        // Shared materials (safe to reuse as long as you don't mutate them later)
+        final Material floorMat = Material.solid(new Color(210, 210, 210))
+                .setAmbient(0.35)
+                .setDiffuse(0.65);
 
-        for (int i = 0; i < 40; i++) {
-            rootObjects.add(new GameCube());
+        final Material wallMat = Material.solid(new Color(175, 185, 205))
+                .setAmbient(0.25)
+                .setDiffuse(0.85);
+
+        final Material pillarMat = Material.solid(new Color(220, 205, 160))
+                .setAmbient(0.22)
+                .setDiffuse(0.90);
+
+        final Material propMat = Material.solid(new Color(255, 220, 120))
+                .setAmbient(0.20)
+                .setDiffuse(0.90);
+
+        // --- Floor (9x9 tiles) ---
+        final double TILE = 6.0;
+        final int HALF = 4;                 // -4..+4 -> 9 tiles across
+        final double floorY = -TILE * 0.5;  // top of floor is y=0
+
+        for (int gx = -HALF; gx <= HALF; gx++) {
+            for (int gz = -HALF; gz <= HALF; gz++) {
+                Cube t = new Cube(TILE, gx * TILE, floorY, gz * TILE);
+                t.setFull(true);
+                t.setMaterial(floorMat);
+                rootObjects.add(t);
+            }
         }
+
+        // --- A center wall with a doorway (shows shadows nicely) ---
+        // Wall runs along Z=0, leaving a 1-tile gap at X=0.
+        for (int gx = -HALF; gx <= HALF; gx++) {
+            if (gx == 0) continue; // doorway
+            for (int h = 0; h < 2; h++) {   // 2 cubes high
+                double y = (TILE * 0.5) + (h * TILE);
+                Cube w = new Cube(TILE, gx * TILE, y, 0.0);
+                w.setFull(true);
+                w.setMaterial(wallMat);
+                rootObjects.add(w);
+            }
+        }
+
+        // --- Four corner pillars (big occluders = obvious lighting) ---
+        double[][] pillarPos = new double[][]{
+                {-HALF * TILE, 0, -HALF * TILE},
+                {+HALF * TILE, 0, -HALF * TILE},
+                {-HALF * TILE, 0, +HALF * TILE},
+                {+HALF * TILE, 0, +HALF * TILE},
+        };
+
+        for (double[] p : pillarPos) {
+            double px = p[0];
+            double pz = p[2];
+            for (int h = 0; h < 3; h++) {   // 3 cubes high
+                double y = (TILE * 0.5) + (h * TILE);
+                Cube col = new Cube(TILE, px, y, pz);
+                col.setFull(true);
+                col.setMaterial(pillarMat);
+                rootObjects.add(col);
+            }
+        }
+
+        // --- Some props / cover to show point-light falloff across surfaces ---
+        // Small-ish “crate” clusters (still cubes)
+        for (int i = 0; i < 6; i++) {
+            double x = (i - 2.5) * (TILE * 0.9);
+            double z = -TILE * 2.0;
+
+            Cube a = new Cube(TILE * 0.6, x, (TILE * 0.6) * 0.5, z);
+            a.setFull(true);
+            a.setMaterial(propMat);
+            rootObjects.add(a);
+
+            Cube b = new Cube(TILE * 0.6, x + (TILE * 0.35), (TILE * 0.6) * 1.5, z + (TILE * 0.35));
+            b.setFull(true);
+            b.setMaterial(propMat);
+            rootObjects.add(b);
+        }
+
+        // ------------------------------------------------------------
+        // LIGHTING
+        // ------------------------------------------------------------
+
+        // Directional "sun"
+        // (Shadows ON here gives you the most obvious results; keep cube count reasonable.)
+        LightObject sun = LightObject.directional(
+                new Vector3(-0.35, -0.85, 0.40),
+                new Color(255, 244, 220),
+                1.0,
+                true
+        );
+        rootObjects.add(sun);
+
+        // Four warm lamps near corners (shadows OFF for performance; falloff is still very visible)
+        for (double[] p : pillarPos) {
+            double lx = p[0];
+            double lz = p[2];
+            LightObject lamp = LightObject.point(
+                    new Vector3(lx, TILE * 2.2, lz),
+                    new Color(255, 170, 120),
+                    10.0,     // strength
+                    55.0,     // range
+                    0.0,      // linear
+                    1.0,      // quadratic
+                    false     // shadows
+            );
+            rootObjects.add(lamp);
+        }
+
+        // A cool-ish lamp by the doorway to show color mixing with the warm lights + sun
+        LightObject doorLamp = LightObject.point(
+                new Vector3(0.0, TILE * 1.6, -TILE * 0.9),
+                new Color(170, 210, 255),
+                9.0,
+                45.0,
+                0.0,
+                1.0,
+                false
+        );
+        rootObjects.add(doorLamp);
     }
+
 
     @Override
     protected void paintComponent(Graphics g) {
@@ -203,13 +317,11 @@ public class GameEngine extends JPanel implements Runnable {
         inputHandler.updatePerTick();
         playerController.updatePerTick(delta);
 
-        // Capture motion intent BEFORE camera.update() resets deltas
         boolean movingIntent = (Math.abs(camera.dx) > 1e-9) || (Math.abs(camera.dz) > 1e-9);
 
         camera.update(delta);
         syncPlayerBodyToCamera();
 
-        // Feed humanoid animation state
         playerBody.setMotionState(
                 movingIntent,
                 camera.onGround,
@@ -217,13 +329,11 @@ public class GameEngine extends JPanel implements Runnable {
                 camera.flightMode
         );
 
-        // Regular object updates (Body decides which clips to play)
         for (GameObject obj : rootObjects) {
             if (obj != null) obj.update(delta);
         }
 
-        // Advance animators for entire scene graph (includes Body children)
-        AnimationSystem.updateAll(rootObjects, delta);
+        engine.animation.AnimationSystem.updateAll(rootObjects, delta);
 
         soundEngine.tick();
     }
@@ -233,7 +343,6 @@ public class GameEngine extends JPanel implements Runnable {
         playerBody.getTransform().position.y = camera.y;
         playerBody.getTransform().position.z = camera.z;
 
-        // Face camera yaw, ignore pitch (keep humanoid upright)
         playerBody.getTransform().rotation.y = -camera.getViewYaw();
     }
 

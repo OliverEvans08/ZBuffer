@@ -1,15 +1,18 @@
 package engine;
 
+import engine.lighting.LightData;
+import engine.lighting.LightType;
 import engine.render.Material;
 import engine.render.Texture;
 import objects.GameObject;
+import objects.lighting.LightObject;
+import util.AABB;
+import util.Vector3;
 
 import java.awt.*;
 import java.awt.image.BufferedImage;
 import java.awt.image.DataBufferInt;
-import java.util.ArrayDeque;
-import java.util.Arrays;
-import java.util.Deque;
+import java.util.*;
 import java.util.List;
 
 public class Renderer {
@@ -26,6 +29,10 @@ public class Renderer {
 
     private static final double NEAR_CLIP_EPS = 1e-6;
 
+    // Shadow ray settings
+    private static final double SHADOW_BIAS = 0.002;
+    private static final double RAY_EPS = 1e-9;
+
     private BufferedImage frameBuffer;
     private int[] pixels;
     private float[] zBuffer;
@@ -35,8 +42,6 @@ public class Renderer {
 
     private static final int SKY_TOP = 0xFF0A0F1A;
     private static final int SKY_BOTTOM = 0xFF020306;
-
-    private static final V3 LIGHT_DIR = normalize(new V3(-0.35, 0.85, 0.40));
 
     private boolean fxaaEnabled = false;
     public boolean isFxaaEnabled() { return fxaaEnabled; }
@@ -51,6 +56,14 @@ public class Renderer {
 
     private final double[] cax = new double[4], cay = new double[4], caz = new double[4], cau = new double[4], cav = new double[4];
     private final double[] cbx = new double[4], cby = new double[4], cbz = new double[4], cbu = new double[4], cbv = new double[4];
+
+    // Reused per-frame
+    private final ArrayList<LightData> frameLights = new ArrayList<>();
+    private final ArrayList<GameObject> solidOccluders = new ArrayList<>();
+
+    // Emissive-to-light pooling (avoid allocations each frame)
+    private final ArrayList<LightData> emissivePool = new ArrayList<>();
+    private int emissiveUsed = 0;
 
     public Renderer(Camera camera, GameEngine gameEngine) {
         this.camera = camera;
@@ -76,6 +89,9 @@ public class Renderer {
         fillSky(width, height);
         Arrays.fill(zBuffer, Float.NEGATIVE_INFINITY);
 
+        // Gather lights + shadow casters
+        gatherLightsAndOccluders(gameObjects);
+
         final double fov = gameEngine.getFovRadians();
         final double tanHalfFov = Math.tan(0.5 * fov);
         final double far = gameEngine.getRenderDistance();
@@ -87,7 +103,7 @@ public class Renderer {
 
         final GameObject playerBody = gameEngine.getPlayerBody();
 
-        // Traverse roots + children (so humanoid limbs render)
+        // Traverse scene graph for rendering
         Deque<GameObject> stack = new ArrayDeque<>();
         if (gameObjects != null) {
             for (int i = gameObjects.size() - 1; i >= 0; i--) stack.push(gameObjects.get(i));
@@ -99,10 +115,9 @@ public class Renderer {
 
             boolean isPlayerFamily = (playerBody != null) && isDescendantOrSelf(go, playerBody);
 
-            // Skip whole player rig in first-person (and do NOT traverse its children)
+            // Hide player body in first-person
             if (camera.isFirstPerson() && isPlayerFamily) continue;
 
-            // Traverse children regardless of whether this node has geometry
             List<GameObject> kids = go.getChildren();
             if (kids != null && !kids.isEmpty()) {
                 for (int i = kids.size() - 1; i >= 0; i--) stack.push(kids.get(i));
@@ -126,12 +141,25 @@ public class Renderer {
             final int tintG = tint.getGreen();
             final int tintB = tint.getBlue();
 
+            // Emissive add (visual glow)
+            int emiR = 0, emiG = 0, emiB = 0;
+            if (mat != null) {
+                double es = mat.getEmissiveStrength();
+                if (es > 0.0) {
+                    Color ec = mat.getEmissiveColor();
+                    emiR = clamp255((int) Math.round(ec.getRed()   * es));
+                    emiG = clamp255((int) Math.round(ec.getGreen() * es));
+                    emiB = clamp255((int) Math.round(ec.getBlue()  * es));
+                }
+            }
+
             final boolean doubleSided = !go.isFull();
 
             final boolean treatAsPlayer = isPlayerFamily;
             final double thisNear = treatAsPlayer ? Math.max(NEAR, BODY_NEAR_PAD) : NEAR;
             final double thisBias = treatAsPlayer ? BODY_Z_BIAS : 0.0;
 
+            // World->View for vertices
             for (int i = 0; i < wverts.length; i++) {
                 double[] w = wverts[i];
                 double wx = w[0] - camX;
@@ -159,6 +187,7 @@ public class Renderer {
                 vv[i] = v;
             }
 
+            // Faces
             for (int[] face : facesArr) {
                 if (face == null || face.length != 3) continue;
                 int i0 = face[0], i1 = face[1], i2 = face[2];
@@ -166,32 +195,148 @@ public class Renderer {
 
                 if (vz[i0] >= far && vz[i1] >= far && vz[i2] >= far) continue;
 
-                double ax = vx[i1] - vx[i0];
-                double ay = vy[i1] - vy[i0];
-                double az = vz[i1] - vz[i0];
+                // Compute world normal + centroid for lighting
+                double[] p0 = wverts[i0];
+                double[] p1 = wverts[i1];
+                double[] p2 = wverts[i2];
 
-                double bx = vx[i2] - vx[i0];
-                double by = vy[i2] - vy[i0];
-                double bz = vz[i2] - vz[i0];
+                double ux = p1[0] - p0[0], uy = p1[1] - p0[1], uz = p1[2] - p0[2];
+                double vxw = p2[0] - p0[0], vyw = p2[1] - p0[1], vzw = p2[2] - p0[2];
 
-                double nx = ay * bz - az * by;
-                double ny = az * bx - ax * bz;
-                double nz = ax * by - ay * bx;
+                double nxw = uy * vzw - uz * vyw;
+                double nyw = uz * vxw - ux * vzw;
+                double nzw = ux * vyw - uy * vxw;
 
-                double len = Math.sqrt(nx * nx + ny * ny + nz * nz);
-                if (len < 1e-12) continue;
+                double nlen = Math.sqrt(nxw*nxw + nyw*nyw + nzw*nzw);
+                if (nlen < 1e-12) continue;
 
-                double invLen = 1.0 / len;
-                double ndotl = Math.abs((nx * LIGHT_DIR.x + ny * LIGHT_DIR.y + nz * LIGHT_DIR.z) * invLen);
+                double invN = 1.0 / nlen;
+                nxw *= invN; nyw *= invN; nzw *= invN;
 
-                double shade = ambient + diffuse * ndotl;
-                if (shade < 0) shade = 0;
-                if (shade > 1) shade = 1;
+                double cxw = (p0[0] + p1[0] + p2[0]) / 3.0;
+                double cyw = (p0[1] + p1[1] + p2[1]) / 3.0;
+                double czw = (p0[2] + p1[2] + p2[2]) / 3.0;
 
-                int shadeI = (int) (shade * 255.0 + 0.5);
-                if (shadeI < 0) shadeI = 0;
-                if (shadeI > 255) shadeI = 255;
+                // Accumulate colored light
+                double lr = 0.0, lg = 0.0, lb = 0.0;
 
+                for (int li = 0; li < frameLights.size(); li++) {
+                    LightData L = frameLights.get(li);
+                    if (L == null || L.strength <= 0.0) continue;
+
+                    if (L.type == LightType.DIRECTIONAL) {
+                        // Rays direction = (dx,dy,dz). Surface->light is opposite.
+                        double lx = -L.dx, ly = -L.dy, lz = -L.dz;
+
+                        double ndotl = nxw*lx + nyw*ly + nzw*lz;
+                        if (doubleSided) ndotl = Math.abs(ndotl);
+                        if (ndotl <= 0.0) continue;
+
+                        if (L.shadows) {
+                            double ox = cxw + lx * SHADOW_BIAS;
+                            double oy = cyw + ly * SHADOW_BIAS;
+                            double oz = czw + lz * SHADOW_BIAS;
+                            if (isOccluded(ox, oy, oz, lx, ly, lz, far, go, L.owner)) continue;
+                        }
+
+                        double s = L.strength * ndotl;
+                        lr += s * L.r;
+                        lg += s * L.g;
+                        lb += s * L.b;
+
+                    } else if (L.type == LightType.POINT) {
+                        double toX = L.x - cxw;
+                        double toY = L.y - cyw;
+                        double toZ = L.z - czw;
+
+                        double dist2 = toX*toX + toY*toY + toZ*toZ;
+                        double dist = Math.sqrt(dist2);
+                        if (dist < 1e-9) continue;
+                        if (L.range > 0.0 && dist > L.range) continue;
+
+                        double invD = 1.0 / dist;
+                        double lx = toX * invD, ly = toY * invD, lz = toZ * invD;
+
+                        double ndotl = nxw*lx + nyw*ly + nzw*lz;
+                        if (doubleSided) ndotl = Math.abs(ndotl);
+                        if (ndotl <= 0.0) continue;
+
+                        if (L.shadows) {
+                            double ox = cxw + lx * SHADOW_BIAS;
+                            double oy = cyw + ly * SHADOW_BIAS;
+                            double oz = czw + lz * SHADOW_BIAS;
+                            if (isOccluded(ox, oy, oz, lx, ly, lz, dist - SHADOW_BIAS, go, L.owner)) continue;
+                        }
+
+                        double denom = 1.0 + (L.attLinear * dist) + (L.attQuadratic * dist2);
+                        double att = (denom <= 1e-12) ? 0.0 : (L.strength / denom);
+
+                        // Soft range fade to avoid harsh cutoff
+                        double rangeFade = (L.range > 0.0) ? softRangeFade(dist, L.range) : 1.0;
+
+                        double s = ndotl * att * rangeFade;
+                        lr += s * L.r;
+                        lg += s * L.g;
+                        lb += s * L.b;
+
+                    } else { // SPOT
+                        double toX = L.x - cxw;
+                        double toY = L.y - cyw;
+                        double toZ = L.z - czw;
+
+                        double dist2 = toX*toX + toY*toY + toZ*toZ;
+                        double dist = Math.sqrt(dist2);
+                        if (dist < 1e-9) continue;
+                        if (L.range > 0.0 && dist > L.range) continue;
+
+                        double invD = 1.0 / dist;
+                        double lx = toX * invD, ly = toY * invD, lz = toZ * invD;
+
+                        double ndotl = nxw*lx + nyw*ly + nzw*lz;
+                        if (doubleSided) ndotl = Math.abs(ndotl);
+                        if (ndotl <= 0.0) continue;
+
+                        // Spot cone: compare raysDirection vs (light->point)
+                        double ltpX = -lx, ltpY = -ly, ltpZ = -lz; // from light to point
+                        double cosTheta = (L.dx * ltpX) + (L.dy * ltpY) + (L.dz * ltpZ);
+                        if (cosTheta <= L.outerCos) continue;
+
+                        double spotFactor;
+                        if (cosTheta >= L.innerCos) {
+                            spotFactor = 1.0;
+                        } else {
+                            double t = (cosTheta - L.outerCos) / (L.innerCos - L.outerCos);
+                            if (t < 0) t = 0;
+                            if (t > 1) t = 1;
+                            // smoothstep
+                            spotFactor = t * t * (3.0 - 2.0 * t);
+                        }
+
+                        if (L.shadows) {
+                            double ox = cxw + lx * SHADOW_BIAS;
+                            double oy = cyw + ly * SHADOW_BIAS;
+                            double oz = czw + lz * SHADOW_BIAS;
+                            if (isOccluded(ox, oy, oz, lx, ly, lz, dist - SHADOW_BIAS, go, L.owner)) continue;
+                        }
+
+                        double denom = 1.0 + (L.attLinear * dist) + (L.attQuadratic * dist2);
+                        double att = (denom <= 1e-12) ? 0.0 : (L.strength / denom);
+
+                        double rangeFade = (L.range > 0.0) ? softRangeFade(dist, L.range) : 1.0;
+
+                        double s = ndotl * att * rangeFade * spotFactor;
+                        lr += s * L.r;
+                        lg += s * L.g;
+                        lb += s * L.b;
+                    }
+                }
+
+                // Combine with material ambient/diffuse
+                int shadeR = to255(clamp01(ambient + diffuse * lr));
+                int shadeG = to255(clamp01(ambient + diffuse * lg));
+                int shadeB = to255(clamp01(ambient + diffuse * lb));
+
+                // Clip + draw
                 cax[0] = vx[i0]; cay[0] = vy[i0]; caz[0] = vz[i0]; cau[0] = uu[i0]; cav[0] = vv[i0];
                 cax[1] = vx[i1]; cay[1] = vy[i1]; caz[1] = vz[i1]; cau[1] = uu[i1]; cav[1] = vv[i1];
                 cax[2] = vx[i2]; cay[2] = vy[i2]; caz[2] = vz[i2]; cau[2] = uu[i2]; cav[2] = vv[i2];
@@ -208,7 +353,9 @@ public class Renderer {
                             cbx[1], cby[1], cbz[1], cbu[1], cbv[1],
                             cbx[2], cby[2], cbz[2], cbu[2], cbv[2],
                             f, width, height, far,
-                            tex, wrap, tintR, tintG, tintB, shadeI,
+                            tex, wrap, tintR, tintG, tintB,
+                            shadeR, shadeG, shadeB,
+                            emiR, emiG, emiB,
                             doubleSided
                     );
                 } else {
@@ -217,7 +364,9 @@ public class Renderer {
                             cbx[1], cby[1], cbz[1], cbu[1], cbv[1],
                             cbx[2], cby[2], cbz[2], cbu[2], cbv[2],
                             f, width, height, far,
-                            tex, wrap, tintR, tintG, tintB, shadeI,
+                            tex, wrap, tintR, tintG, tintB,
+                            shadeR, shadeG, shadeB,
+                            emiR, emiG, emiB,
                             doubleSided
                     );
                     drawClippedTri(
@@ -225,7 +374,9 @@ public class Renderer {
                             cbx[2], cby[2], cbz[2], cbu[2], cbv[2],
                             cbx[3], cby[3], cbz[3], cbu[3], cbv[3],
                             f, width, height, far,
-                            tex, wrap, tintR, tintG, tintB, shadeI,
+                            tex, wrap, tintR, tintG, tintB,
+                            shadeR, shadeG, shadeB,
+                            emiR, emiG, emiB,
                             doubleSided
                     );
                 }
@@ -237,7 +388,89 @@ public class Renderer {
         g2d.drawImage(frameBuffer, 0, 0, windowW, windowH, null);
     }
 
+    private void gatherLightsAndOccluders(List<GameObject> roots) {
+        frameLights.clear();
+        solidOccluders.clear();
+        emissiveUsed = 0;
+
+        Deque<GameObject> stack = new ArrayDeque<>();
+        if (roots != null) {
+            for (int i = roots.size() - 1; i >= 0; i--) stack.push(roots.get(i));
+        }
+
+        while (!stack.isEmpty()) {
+            GameObject g = stack.pop();
+            if (g == null || !g.isActive()) continue;
+
+            // Shadow blockers
+            if (g.isFull()) solidOccluders.add(g);
+
+            // Explicit lights
+            if (g instanceof LightObject lo) {
+                LightData ld = lo.getLight();
+                if (ld != null && ld.strength > 0.0) frameLights.add(ld);
+            }
+
+            // Emissive materials become point lights if emissiveRange > 0
+            Material m = g.getMaterial();
+            if (m != null && m.getEmissiveStrength() > 0.0 && m.getEmissiveRange() > 0.0) {
+                LightData ld = acquireEmissiveLight();
+                Vector3 wp = g.getWorldPosition();
+
+                ld.type = LightType.POINT;
+                ld.x = wp.x; ld.y = wp.y; ld.z = wp.z;
+                ld.setColor(m.getEmissiveColor());
+                ld.strength = m.getEmissiveStrength();
+                ld.range = m.getEmissiveRange();
+                // Default inverse-square-ish:
+                ld.attLinear = 0.0;
+                ld.attQuadratic = 1.0;
+                ld.shadows = true;
+                ld.owner = g;
+
+                frameLights.add(ld);
+            }
+
+            List<GameObject> kids = g.getChildren();
+            if (kids != null && !kids.isEmpty()) {
+                for (int i = kids.size() - 1; i >= 0; i--) stack.push(kids.get(i));
+            }
+        }
+
+        // Safety: if no lights exist, add a tiny dim directional so nothing becomes pitch-black
+        if (frameLights.isEmpty()) {
+            LightData fallback = acquireEmissiveLight();
+            fallback.type = LightType.DIRECTIONAL;
+            fallback.setDirection(new Vector3(-0.35, -0.85, 0.40));
+            fallback.setColor(Color.WHITE);
+            fallback.strength = 0.6;
+            fallback.shadows = false;
+            fallback.owner = null;
+            frameLights.add(fallback);
+        }
+    }
+
+    private LightData acquireEmissiveLight() {
+        if (emissiveUsed < emissivePool.size()) {
+            return emissivePool.get(emissiveUsed++);
+        }
+        LightData l = new LightData();
+        emissivePool.add(l);
+        emissiveUsed++;
+        return l;
+    }
+
+    private static double softRangeFade(double dist, double range) {
+        if (range <= 1e-9) return 0.0;
+        double t = dist / range;
+        if (t >= 1.0) return 0.0;
+        if (t <= 0.0) return 1.0;
+        double k = 1.0 - t;
+        return k * k; // quadratic fade
+    }
+
     private static boolean isDescendantOrSelf(GameObject node, GameObject root) {
+        if (node == null || root == null) return false;
         for (GameObject p = node; p != null; p = p.getParent()) {
             if (p == root) return true;
         }
@@ -250,7 +483,9 @@ public class Renderer {
             double x2c, double y2c, double z2c, double u2, double v2,
             double f, int width, int height, double far,
             Texture tex, Texture.Wrap wrap,
-            int tintR, int tintG, int tintB, int shadeI,
+            int tintR, int tintG, int tintB,
+            int shadeR, int shadeG, int shadeB,
+            int emiR, int emiG, int emiB,
             boolean doubleSided
     ) {
         if (z0c >= far && z1c >= far && z2c >= far) return;
@@ -300,7 +535,9 @@ public class Renderer {
                 x1, y1, iz1, uoz1, voz1,
                 x2, y2, iz2, uoz2, voz2,
                 tex, wrap,
-                tintR, tintG, tintB, shadeI,
+                tintR, tintG, tintB,
+                shadeR, shadeG, shadeB,
+                emiR, emiG, emiB,
                 width, height
         );
     }
@@ -414,7 +651,9 @@ public class Renderer {
             double x1, double y1, float iz1, float uoz1, float voz1,
             double x2, double y2, float iz2, float uoz2, float voz2,
             Texture tex, Texture.Wrap wrap,
-            int tintR, int tintG, int tintB, int shadeI,
+            int tintR, int tintG, int tintB,
+            int shadeR, int shadeG, int shadeB,
+            int emiR, int emiG, int emiB,
             int width, int height
     ) {
         double areaSigned = edgeFunction(x0, y0, x1, y1, x2, y2);
@@ -476,9 +715,9 @@ public class Renderer {
                             double v = voz * z;
 
                             int texel = tex.sampleNearest(u, v, wrap);
-                            outARGB = shadeAndTintFast(texel, tintR, tintG, tintB, shadeI);
+                            outARGB = shadeAndTintFast(texel, tintR, tintG, tintB, shadeR, shadeG, shadeB, emiR, emiG, emiB);
                         } else {
-                            outARGB = shadeSolidFast(tintR, tintG, tintB, shadeI);
+                            outARGB = shadeSolidFast(tintR, tintG, tintB, shadeR, shadeG, shadeB, emiR, emiG, emiB);
                         }
 
                         pixels[idx] = outARGB;
@@ -491,25 +730,42 @@ public class Renderer {
         }
     }
 
-    private static int shadeSolidFast(int r, int g, int b, int shadeI) {
-        int rr = div255(r * shadeI);
-        int gg = div255(g * shadeI);
-        int bb = div255(b * shadeI);
+    private static int shadeSolidFast(int baseR, int baseG, int baseB,
+                                      int shadeR, int shadeG, int shadeB,
+                                      int emiR, int emiG, int emiB) {
+        int rr = div255(baseR * shadeR);
+        int gg = div255(baseG * shadeG);
+        int bb = div255(baseB * shadeB);
+
+        rr = clamp255(rr + emiR);
+        gg = clamp255(gg + emiG);
+        bb = clamp255(bb + emiB);
+
         return (0xFF << 24) | (rr << 16) | (gg << 8) | bb;
     }
 
-    private static int shadeAndTintFast(int argb, int tintR, int tintG, int tintB, int shadeI) {
+    private static int shadeAndTintFast(int argb,
+                                        int tintR, int tintG, int tintB,
+                                        int shadeR, int shadeG, int shadeB,
+                                        int emiR, int emiG, int emiB) {
         int r = (argb >>> 16) & 255;
         int g = (argb >>> 8) & 255;
         int b = (argb) & 255;
 
+        // Tint
         r = div255(r * tintR);
         g = div255(g * tintG);
         b = div255(b * tintB);
 
-        r = div255(r * shadeI);
-        g = div255(g * shadeI);
-        b = div255(b * shadeI);
+        // Per-channel lighting
+        r = div255(r * shadeR);
+        g = div255(g * shadeG);
+        b = div255(b * shadeB);
+
+        // Emissive add
+        r = clamp255(r + emiR);
+        g = clamp255(g + emiG);
+        b = clamp255(b + emiB);
 
         return (0xFF << 24) | (r << 16) | (g << 8) | b;
     }
@@ -528,14 +784,111 @@ public class Renderer {
         return (py - ay) * (bx - ax) - (px - ax) * (by - ay);
     }
 
-    private static final class V3 {
-        final double x, y, z;
-        V3(double x, double y, double z) { this.x = x; this.y = y; this.z = z; }
+    private static int clamp255(int v) {
+        if (v < 0) return 0;
+        if (v > 255) return 255;
+        return v;
     }
 
-    private static V3 normalize(V3 v) {
-        double L = Math.sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
-        if (L < 1e-12) return new V3(0, 1, 0);
-        return new V3(v.x / L, v.y / L, v.z / L);
+    private static double clamp01(double v) {
+        if (v < 0) return 0;
+        if (v > 1) return 1;
+        return v;
+    }
+
+    private static int to255(double v01) {
+        int i = (int) (v01 * 255.0 + 0.5);
+        if (i < 0) return 0;
+        if (i > 255) return 255;
+        return i;
+    }
+
+    // -----------------------------
+    // Shadows: ray vs AABB occlusion
+    // -----------------------------
+    private boolean isOccluded(double ox, double oy, double oz,
+                               double dx, double dy, double dz,
+                               double maxDist,
+                               GameObject receiver,
+                               GameObject lightOwner) {
+        if (maxDist <= 1e-6) return false;
+        if (solidOccluders.isEmpty()) return false;
+
+        for (int i = 0; i < solidOccluders.size(); i++) {
+            GameObject obj = solidOccluders.get(i);
+            if (obj == null) continue;
+
+            if (obj == receiver) continue;
+            if (lightOwner != null && obj == lightOwner) continue;
+
+            // Also ignore family to reduce self-shadow artifacts in hierarchies
+            if (receiver != null && isDescendantOrSelf(obj, receiver)) continue;
+            if (lightOwner != null && isDescendantOrSelf(obj, lightOwner)) continue;
+
+            AABB b = obj.getWorldAABB();
+            if (aabbContainsPoint(b, ox, oy, oz)) continue;
+
+            double hit = rayAabbHitDistance(ox, oy, oz, dx, dy, dz, maxDist, b);
+            if (hit != Double.POSITIVE_INFINITY) return true;
+        }
+        return false;
+    }
+
+    private static boolean aabbContainsPoint(AABB b, double px, double py, double pz) {
+        return px >= b.minX && px <= b.maxX &&
+                py >= b.minY && py <= b.maxY &&
+                pz >= b.minZ && pz <= b.maxZ;
+    }
+
+    private static double rayAabbHitDistance(
+            double ox, double oy, double oz,
+            double dx, double dy, double dz,
+            double maxDist,
+            AABB b
+    ) {
+        double tmin = 0.0;
+        double tmax = maxDist;
+
+        // X slab
+        if (Math.abs(dx) < RAY_EPS) {
+            if (ox < b.minX || ox > b.maxX) return Double.POSITIVE_INFINITY;
+        } else {
+            double inv = 1.0 / dx;
+            double t1 = (b.minX - ox) * inv;
+            double t2 = (b.maxX - ox) * inv;
+            if (t1 > t2) { double tmp = t1; t1 = t2; t2 = tmp; }
+            tmin = Math.max(tmin, t1);
+            tmax = Math.min(tmax, t2);
+            if (tmin > tmax) return Double.POSITIVE_INFINITY;
+        }
+
+        // Y slab
+        if (Math.abs(dy) < RAY_EPS) {
+            if (oy < b.minY || oy > b.maxY) return Double.POSITIVE_INFINITY;
+        } else {
+            double inv = 1.0 / dy;
+            double t1 = (b.minY - oy) * inv;
+            double t2 = (b.maxY - oy) * inv;
+            if (t1 > t2) { double tmp = t1; t1 = t2; t2 = tmp; }
+            tmin = Math.max(tmin, t1);
+            tmax = Math.min(tmax, t2);
+            if (tmin > tmax) return Double.POSITIVE_INFINITY;
+        }
+
+        // Z slab
+        if (Math.abs(dz) < RAY_EPS) {
+            if (oz < b.minZ || oz > b.maxZ) return Double.POSITIVE_INFINITY;
+        } else {
+            double inv = 1.0 / dz;
+            double t1 = (b.minZ - oz) * inv;
+            double t2 = (b.maxZ - oz) * inv;
+            if (t1 > t2) { double tmp = t1; t1 = t2; t2 = tmp; }
+            tmin = Math.max(tmin, t1);
+            tmax = Math.min(tmax, t2);
+            if (tmin > tmax) return Double.POSITIVE_INFINITY;
+        }
+
+        if (tmin <= 1e-6) return Double.POSITIVE_INFINITY;
+        return tmin;
     }
 }

@@ -8,7 +8,10 @@ import util.Transform;
 import util.Vector3;
 
 import java.awt.Color;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.UUID;
 
 public abstract class GameObject {
 
@@ -32,10 +35,10 @@ public abstract class GameObject {
 
     private Animator animator;
 
-    // Cache world transform without allocating new matrices every call
+    // Cached world transform
     private final Matrix4 cachedWorld = new Matrix4();
 
-    // Cache transformed vertices array to avoid allocations/GC every frame
+    // Cached transformed vertices
     private double[][] cachedTransformed = null;
     private int cachedVertCount = -1;
 
@@ -67,7 +70,7 @@ public abstract class GameObject {
         Matrix4 local = transform.getTransformationMatrix();
         if (parent != null) {
             Matrix4 pw = parent.getWorldTransform();
-            pw.multiply(local, cachedWorld); // cachedWorld = parentWorld * local
+            pw.multiply(local, cachedWorld);
             return cachedWorld;
         }
         return local;
@@ -137,7 +140,12 @@ public abstract class GameObject {
     public void setFull(boolean full) { this.full = full; }
 
     public Color getColor() { return color; }
-    public void setColor(Color color) { this.color = (color == null ? Color.WHITE : color); }
+
+    // ✅ CHANGED: return GameObject instead of void (enables covariant override in LightObject)
+    public GameObject setColor(Color color) {
+        this.color = (color == null ? Color.WHITE : color);
+        return this;
+    }
 
     public Material getMaterial() { return material; }
     public void setMaterial(Material material) { this.material = material; }
