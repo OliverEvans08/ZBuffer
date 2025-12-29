@@ -8,8 +8,10 @@ import util.Transform;
 import util.Vector3;
 
 import java.awt.Color;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Deque;
 import java.util.List;
 import java.util.UUID;
 
@@ -35,12 +37,18 @@ public abstract class GameObject {
 
     private Animator animator;
 
-    // Cached world transform
+    // Cached world matrix (used when parent exists)
     private final Matrix4 cachedWorld = new Matrix4();
 
-    // Cached transformed vertices
+    // Cached transformed vertices storage
     private double[][] cachedTransformed = null;
     private int cachedVertCount = -1;
+
+    // --- World AABB cache + dirty flag ---
+    private AABB cachedWorldAABB = new AABB(0, 0, 0, 0, 0, 0);
+    private boolean worldAabbDirty = true;
+    private long cachedWorldAabbStamp = Long.MIN_VALUE;
+    private int cachedAabbVertCount = -1;
 
     public GameObject() {
         this.transform = new Transform();
@@ -54,11 +62,18 @@ public abstract class GameObject {
         if (child.parent != null) child.parent.removeChild(child);
         child.parent = this;
         children.add(child);
+
+        // Parent/child structure change can affect world stamp propagation usage patterns,
+        // so mark dirty defensively.
+        child.markWorldAABBDirty();
     }
 
     public void removeChild(GameObject child) {
         if (child == null) return;
-        if (children.remove(child)) child.parent = null;
+        if (children.remove(child)) {
+            child.parent = null;
+            child.markWorldAABBDirty();
+        }
     }
 
     public GameObject getParent() { return parent; }
@@ -105,15 +120,80 @@ public abstract class GameObject {
         return cachedTransformed;
     }
 
+    /**
+     * Cached world AABB + dirty flag.
+     * Dirty becomes true when this transform OR any parent transform changes.
+     */
     public AABB getWorldAABB() {
-        double[][] w = getTransformedVertices();
+        // Track vertex-count changes too (rare, but safe)
+        double[][] local = getVertices();
+        int n = (local != null ? local.length : 0);
+        if (n != cachedAabbVertCount) {
+            cachedAabbVertCount = n;
+            worldAabbDirty = true;
+        }
+
+        long stamp = computeWorldStamp();
+
+        // If the stamp changed since last cached AABB, mark dirty.
+        if (stamp != cachedWorldAabbStamp) {
+            worldAabbDirty = true;
+        }
+
+        if (!worldAabbDirty) {
+            return cachedWorldAABB;
+        }
+
+        cachedWorldAABB = computeWorldAABBNow(local);
+        cachedWorldAabbStamp = stamp;
+        worldAabbDirty = false;
+        return cachedWorldAABB;
+    }
+
+    /**
+     * Marks this object's cached world AABB as dirty.
+     * Useful if you ever add setters later that mutate transform.
+     */
+    protected void markWorldAABBDirty() {
+        worldAabbDirty = true;
+    }
+
+    // Private helper: stamp changes when local OR parent chain changes.
+    private long computeWorldStamp() {
+        long localVer = transform.getVersion(); // syncs & updates on TRS changes
+        if (parent == null) return mix64(localVer);
+
+        long parentStamp = parent.computeWorldStamp();
+        return mix64(localVer * 31L + parentStamp);
+    }
+
+    private static long mix64(long x) {
+        // Simple 64-bit mix (deterministic; good enough for change detection)
+        x ^= (x >>> 33);
+        x *= 0xff51afd7ed558ccdL;
+        x ^= (x >>> 33);
+        x *= 0xc4ceb9fe1a85ec53L;
+        x ^= (x >>> 33);
+        return x;
+    }
+
+    private AABB computeWorldAABBNow(double[][] localVerts) {
+        if (localVerts == null || localVerts.length == 0) {
+            return new AABB(0, 0, 0, 0, 0, 0);
+        }
+
+        Matrix4 M = getWorldTransform();
         double minX = Double.POSITIVE_INFINITY, maxX = Double.NEGATIVE_INFINITY;
         double minY = Double.POSITIVE_INFINITY, maxY = Double.NEGATIVE_INFINITY;
         double minZ = Double.POSITIVE_INFINITY, maxZ = Double.NEGATIVE_INFINITY;
 
-        for (double[] v : w) {
+        double[] tmp = new double[3];
+        for (double[] v : localVerts) {
             if (v == null || v.length < 3) continue;
-            double x = v[0], y = v[1], z = v[2];
+
+            M.transformPoint(v[0], v[1], v[2], tmp);
+            double x = tmp[0], y = tmp[1], z = tmp[2];
+
             if (x < minX) minX = x;
             if (x > maxX) maxX = x;
             if (y < minY) minY = y;
@@ -123,7 +203,7 @@ public abstract class GameObject {
         }
 
         if (minX == Double.POSITIVE_INFINITY) {
-            return new AABB(0,0,0,0,0,0);
+            return new AABB(0, 0, 0, 0, 0, 0);
         }
         return new AABB(minX, maxX, minY, maxY, minZ, maxZ);
     }
@@ -141,7 +221,6 @@ public abstract class GameObject {
 
     public Color getColor() { return color; }
 
-    // ✅ CHANGED: return GameObject instead of void (enables covariant override in LightObject)
     public GameObject setColor(Color color) {
         this.color = (color == null ? Color.WHITE : color);
         return this;

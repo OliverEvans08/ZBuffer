@@ -1,24 +1,25 @@
 package engine;
 
-import engine.event.EventBus;
-import engine.event.events.*;
 import engine.core.GameClock;
-import engine.render.Material;
+import engine.event.EventBus;
+import engine.event.events.GuiToggleRequestedEvent;
+import engine.event.events.TickEvent;
 import engine.systems.PlayerController;
 import gui.ClickGUI;
 import objects.GameObject;
 import objects.dynamic.Body;
-import objects.fixed.*;
+import objects.fixed.Cube;
 import objects.lighting.LightObject;
 import sound.SoundEngine;
+import engine.render.Material;
 import util.Vector3;
 
 import javax.swing.*;
 import java.awt.*;
+import java.util.Deque;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.locks.LockSupport;
 
 public class GameEngine extends JPanel implements Runnable {
 
@@ -46,8 +47,10 @@ public class GameEngine extends JPanel implements Runnable {
 
     private final Body playerBody;
 
-    private static final int TARGET_FPS = 60;
-    private static final long FRAME_NANOS = 1_000_000_000L / TARGET_FPS;
+    /**
+     * Prevents spamming the Swing event queue with repaint requests.
+     * paintComponent() clears this flag.
+     */
     private final AtomicBoolean repaintPending = new AtomicBoolean(false);
 
     public GameEngine() {
@@ -114,12 +117,10 @@ public class GameEngine extends JPanel implements Runnable {
         });
     }
 
-    private void initializeGameObjects() {
-        // ------------------------------------------------------------
-        // MAP: all geometry is made from Cube instances (no Ground)
-        // ------------------------------------------------------------
 
-        // Shared materials (safe to reuse as long as you don't mutate them later)
+    private void initializeGameObjects() {
+
+        // --- Materials ---
         final Material floorMat = Material.solid(new Color(210, 210, 210))
                 .setAmbient(0.35)
                 .setDiffuse(0.65);
@@ -136,111 +137,184 @@ public class GameEngine extends JPanel implements Runnable {
                 .setAmbient(0.20)
                 .setDiffuse(0.90);
 
-        // --- Floor (9x9 tiles) ---
+        // --- Grid / building dimensions (in tiles) ---
         final double TILE = 6.0;
-        final int HALF = 4;                 // -4..+4 -> 9 tiles across
-        final double floorY = -TILE * 0.5;  // top of floor is y=0
+        final double floorY = -TILE * 0.5; // so top of floor cubes sits at y=0
 
-        for (int gx = -HALF; gx <= HALF; gx++) {
-            for (int gz = -HALF; gz <= HALF; gz++) {
-                Cube t = new Cube(TILE, gx * TILE, floorY, gz * TILE);
-                t.setFull(true);
-                t.setMaterial(floorMat);
-                rootObjects.add(t);
-            }
-        }
+        final int minX = -8, maxX = 8;     // width 17 tiles
+        final int minZ = -14, maxZ = 14;   // depth 29 tiles
 
-        // --- A center wall with a doorway (shows shadows nicely) ---
-        // Wall runs along Z=0, leaving a 1-tile gap at X=0.
-        for (int gx = -HALF; gx <= HALF; gx++) {
-            if (gx == 0) continue; // doorway
-            for (int h = 0; h < 2; h++) {   // 2 cubes high
+        final int wallLevels = 3;          // 3 stacked cubes -> ~18 units high walls
+
+        // Corridor / divider positions
+        final int dividerLeftX  = -2;
+        final int dividerRightX =  2;
+
+        // Door openings along the main corridor divider walls (tile Z positions)
+        final int[] doorZ = new int[]{ -9, -5, -1, 3, 7, 11 };
+
+        // Room partition lines (tile Z positions) across the left/right wings
+        final int[] wingPartitionsZ = new int[]{ -11, -7, -3, 1, 5, 9 };
+
+        // Lobby zone near entrance (open, fewer divider walls)
+        final int lobbyZ0 = -13; // inclusive
+        final int lobbyZ1 = -11; // inclusive
+
+        // Small cross-opening (lets you step into wings around the center)
+        final int crossZ = 0;
+
+        // Helper: add one floor tile at grid cell
+        java.util.function.BiConsumer<Integer, Integer> addFloor = (gx, gz) -> {
+            Cube t = new Cube(TILE, gx * TILE, floorY, gz * TILE);
+            t.setFull(true);
+            t.setMaterial(floorMat);
+            rootObjects.add(t);
+        };
+
+        // Helper: add a wall column (stacked cubes) at grid cell
+        java.util.function.BiConsumer<Integer, Integer> addWallColumn = (gx, gz) -> {
+            for (int h = 0; h < wallLevels; h++) {
                 double y = (TILE * 0.5) + (h * TILE);
-                Cube w = new Cube(TILE, gx * TILE, y, 0.0);
+                Cube w = new Cube(TILE, gx * TILE, y, gz * TILE);
                 w.setFull(true);
                 w.setMaterial(wallMat);
                 rootObjects.add(w);
             }
-        }
-
-        // --- Four corner pillars (big occluders = obvious lighting) ---
-        double[][] pillarPos = new double[][]{
-                {-HALF * TILE, 0, -HALF * TILE},
-                {+HALF * TILE, 0, -HALF * TILE},
-                {-HALF * TILE, 0, +HALF * TILE},
-                {+HALF * TILE, 0, +HALF * TILE},
         };
 
-        for (double[] p : pillarPos) {
-            double px = p[0];
-            double pz = p[2];
-            for (int h = 0; h < 3; h++) {   // 3 cubes high
+        // Helper: check if a Z is one of the door openings
+        java.util.function.IntPredicate isDoorZ = (z) -> {
+            for (int dz : doorZ) if (dz == z) return true;
+            return false;
+        };
+
+        // ------------------------------------------------------------
+        // 1) Floors: whole school footprint
+        // ------------------------------------------------------------
+        for (int gx = minX; gx <= maxX; gx++) {
+            for (int gz = minZ; gz <= maxZ; gz++) {
+                addFloor.accept(gx, gz);
+            }
+        }
+
+        // Entrance steps / path outside the front door
+        for (int gz = minZ - 3; gz <= minZ - 1; gz++) {
+            for (int gx = -2; gx <= 2; gx++) {
+                addFloor.accept(gx, gz);
+            }
+        }
+
+        // ------------------------------------------------------------
+        // 2) Outer walls (with entrance + back exit gaps)
+        // ------------------------------------------------------------
+        for (int gx = minX; gx <= maxX; gx++) {
+            // Front wall at minZ (leave a 3-tile entrance gap)
+            if (!(gx >= -1 && gx <= 1)) addWallColumn.accept(gx, minZ);
+
+            // Back wall at maxZ (leave a 3-tile back exit gap)
+            if (!(gx >= -1 && gx <= 1)) addWallColumn.accept(gx, maxZ);
+        }
+
+        for (int gz = minZ; gz <= maxZ; gz++) {
+            // Left + right outer walls
+            addWallColumn.accept(minX, gz);
+            addWallColumn.accept(maxX, gz);
+        }
+
+        // ------------------------------------------------------------
+        // 3) Main corridor divider walls (with doors)
+        //    Corridor is x = -1..1. Divider walls at x = -2 and x = 2.
+        // ------------------------------------------------------------
+        for (int gz = minZ + 1; gz <= maxZ - 1; gz++) {
+
+            // Keep the entrance lobby more open
+            boolean inLobby = (gz >= lobbyZ0 && gz <= lobbyZ1);
+
+            // Small cross opening around center
+            boolean inCross = (gz == crossZ);
+
+            // Doors into rooms
+            boolean doorHere = isDoorZ.test(gz);
+
+            if (inLobby || inCross || doorHere) continue;
+
+            addWallColumn.accept(dividerLeftX, gz);
+            addWallColumn.accept(dividerRightX, gz);
+        }
+
+        // ------------------------------------------------------------
+        // 4) Wing room partitions (classrooms/rooms)
+        //    Left wing:  x = (minX+1) .. -3
+        //    Right wing: x = 3 .. (maxX-1)
+        // ------------------------------------------------------------
+        for (int pz : wingPartitionsZ) {
+
+            // Don’t cut the lobby area up
+            if (pz >= lobbyZ0 && pz <= lobbyZ1) continue;
+
+            // Left wing partitions
+            for (int gx = minX + 1; gx <= -3; gx++) {
+                addWallColumn.accept(gx, pz);
+            }
+
+            // Right wing partitions
+            for (int gx = 3; gx <= maxX - 1; gx++) {
+                addWallColumn.accept(gx, pz);
+            }
+        }
+
+        // ------------------------------------------------------------
+        // 5) Lobby details (pillars + reception desk)
+        // ------------------------------------------------------------
+
+        // Pillars at lobby corners
+        int[][] lobbyPillars = new int[][]{
+                {-3, -12}, {3, -12},
+                {-3, -11}, {3, -11}
+        };
+        for (int[] p : lobbyPillars) {
+            int gx = p[0], gz = p[1];
+            for (int h = 0; h < wallLevels; h++) {
                 double y = (TILE * 0.5) + (h * TILE);
-                Cube col = new Cube(TILE, px, y, pz);
+                Cube col = new Cube(TILE * 0.55, gx * TILE, y, gz * TILE);
                 col.setFull(true);
                 col.setMaterial(pillarMat);
                 rootObjects.add(col);
             }
         }
 
-        // --- Some props / cover to show point-light falloff across surfaces ---
-        // Small-ish “crate” clusters (still cubes)
-        for (int i = 0; i < 6; i++) {
-            double x = (i - 2.5) * (TILE * 0.9);
-            double z = -TILE * 2.0;
+        // Reception desk (low props) in lobby
+        final double deskSize = TILE * 0.55;
+        final double deskY = deskSize * 0.5; // sits on floor (top of floor is y=0)
+        for (int gx = -1; gx <= 1; gx++) {
+            Cube desk = new Cube(deskSize, gx * TILE, deskY, (-12) * TILE);
+            desk.setFull(true);
+            desk.setMaterial(propMat);
+            rootObjects.add(desk);
+        }
 
-            Cube a = new Cube(TILE * 0.6, x, (TILE * 0.6) * 0.5, z);
-            a.setFull(true);
-            a.setMaterial(propMat);
-            rootObjects.add(a);
-
-            Cube b = new Cube(TILE * 0.6, x + (TILE * 0.35), (TILE * 0.6) * 1.5, z + (TILE * 0.35));
-            b.setFull(true);
-            b.setMaterial(propMat);
-            rootObjects.add(b);
+        // A couple benches near entrance
+        for (int gx = -2; gx <= 2; gx += 4) {
+            Cube bench = new Cube(TILE * 0.45, gx * TILE, (TILE * 0.45) * 0.5, (-13) * TILE);
+            bench.setFull(true);
+            bench.setMaterial(propMat);
+            rootObjects.add(bench);
         }
 
         // ------------------------------------------------------------
-        // LIGHTING
+        // 6) Directional sun light (slow 360° cycle)
         // ------------------------------------------------------------
-
-        // Directional "sun"
-        // (Shadows ON here gives you the most obvious results; keep cube count reasonable.)
         LightObject sun = LightObject.directional(
                 new Vector3(-0.35, -0.85, 0.40),
                 new Color(255, 244, 220),
                 1.0,
                 true
         );
+
+        // Slow 360° cycle: 6 degrees/sec => 60 seconds per full rotation
+        sun.setAutoRotateY(Math.toRadians(6.0));
+
         rootObjects.add(sun);
-
-        // Four warm lamps near corners (shadows OFF for performance; falloff is still very visible)
-        for (double[] p : pillarPos) {
-            double lx = p[0];
-            double lz = p[2];
-            LightObject lamp = LightObject.point(
-                    new Vector3(lx, TILE * 2.2, lz),
-                    new Color(255, 170, 120),
-                    10.0,     // strength
-                    55.0,     // range
-                    0.0,      // linear
-                    1.0,      // quadratic
-                    false     // shadows
-            );
-            rootObjects.add(lamp);
-        }
-
-        // A cool-ish lamp by the doorway to show color mixing with the warm lights + sun
-        LightObject doorLamp = LightObject.point(
-                new Vector3(0.0, TILE * 1.6, -TILE * 0.9),
-                new Color(170, 210, 255),
-                9.0,
-                45.0,
-                0.0,
-                1.0,
-                false
-        );
-        rootObjects.add(doorLamp);
     }
 
 
@@ -277,10 +351,15 @@ public class GameEngine extends JPanel implements Runnable {
         }
     }
 
+    /**
+     * Uncapped loop:
+     * - No TARGET_FPS
+     * - No sleeping / parkNanos
+     * - Repaint requested as fast as Swing can process it (coalesced by repaintPending)
+     */
     @Override
     public void run() {
         long lastNanos = System.nanoTime();
-        long nextRender = System.nanoTime();
 
         while (true) {
             long now = System.nanoTime();
@@ -296,20 +375,12 @@ public class GameEngine extends JPanel implements Runnable {
                 clock.consumeStep();
             }
 
-            if (now >= nextRender) {
-                nextRender += FRAME_NANOS;
-
-                if (repaintPending.compareAndSet(false, true)) {
-                    SwingUtilities.invokeLater(this::repaint);
-                }
-
-                if (now - nextRender > FRAME_NANOS * 4) {
-                    nextRender = now;
-                }
-            } else {
-                long wait = nextRender - now;
-                LockSupport.parkNanos(Math.min(wait, 2_000_000L));
+            // Request a repaint as fast as possible without flooding the EDT queue.
+            if (repaintPending.compareAndSet(false, true)) {
+                repaint(); // thread-safe: posts a paint request to the EDT
             }
+
+            // Intentionally NO sleep/yield: this will use as much CPU as it can.
         }
     }
 

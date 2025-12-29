@@ -1,7 +1,7 @@
 package util;
 
 public class Matrix4 {
-    // Row-major 4x4
+
     private final double[] m = new double[16];
 
     public Matrix4() {
@@ -39,12 +39,11 @@ public class Matrix4 {
     }
 
     public void setTRS(Vector3 pos, Vector3 rot, Vector3 scl) {
-        // Build M = T * R * S directly (no intermediate matrices)
+
         double cx = Math.cos(rot.x), sx = Math.sin(rot.x);
         double cy = Math.cos(rot.y), sy = Math.sin(rot.y);
         double cz = Math.cos(rot.z), sz = Math.sin(rot.z);
 
-        // Rotation order matches old code: Ry * Rx * Rz
         double r00 = cy * cz + sy * sx * sz;
         double r01 = -cy * sz + sy * sx * cz;
         double r02 = sy * cx;
@@ -57,7 +56,6 @@ public class Matrix4 {
         double r21 = sy * sz + cy * sx * cz;
         double r22 = cy * cx;
 
-        // Apply scale on columns (R * S)
         m[0]  = r00 * scl.x;  m[1]  = r01 * scl.y;  m[2]  = r02 * scl.z;  m[3]  = pos.x;
         m[4]  = r10 * scl.x;  m[5]  = r11 * scl.y;  m[6]  = r12 * scl.z;  m[7]  = pos.y;
         m[8]  = r20 * scl.x;  m[9]  = r21 * scl.y;  m[10] = r22 * scl.z;  m[11] = pos.z;
@@ -66,7 +64,7 @@ public class Matrix4 {
     }
 
     public void setRotation(Vector3 rot) {
-        // Rotation-only (no translation/scale)
+
         double cx = Math.cos(rot.x), sx = Math.sin(rot.x);
         double cy = Math.cos(rot.y), sy = Math.sin(rot.y);
         double cz = Math.cos(rot.z), sz = Math.sin(rot.z);
@@ -102,6 +100,16 @@ public class Matrix4 {
         out3[2] = m[8] * x + m[9] * y + m[10] * z + m[11];
     }
 
+    /**
+     * Transforms a direction vector (ignores translation).
+     * Useful for rotating light directions, normals, etc.
+     */
+    public void transformDirection(double x, double y, double z, double[] out3) {
+        out3[0] = m[0] * x + m[1] * y + m[2] * z;
+        out3[1] = m[4] * x + m[5] * y + m[6] * z;
+        out3[2] = m[8] * x + m[9] * y + m[10] * z;
+    }
+
     public Matrix4 multiply(Matrix4 o) {
         Matrix4 r = new Matrix4();
         multiply(o, r);
@@ -109,7 +117,7 @@ public class Matrix4 {
     }
 
     public void multiply(Matrix4 o, Matrix4 out) {
-        // out = this * o
+
         double[] a = this.m;
         double[] b = o.m;
         double[] r = out.m;
