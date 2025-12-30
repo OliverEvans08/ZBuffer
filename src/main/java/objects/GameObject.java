@@ -7,13 +7,9 @@ import util.Matrix4;
 import util.Transform;
 import util.Vector3;
 
-import java.awt.Color;
-import java.util.ArrayDeque;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.Deque;
+import java.awt.*;
+import java.util.*;
 import java.util.List;
-import java.util.UUID;
 
 public abstract class GameObject {
 
@@ -37,18 +33,22 @@ public abstract class GameObject {
 
     private Animator animator;
 
-    // Cached world matrix (used when parent exists)
+    // --- caches ---
     private final Matrix4 cachedWorld = new Matrix4();
+    private long cachedWorldStamp = Long.MIN_VALUE;
 
-    // Cached transformed vertices storage
+    private static final double[][] EMPTY_VERTS = new double[0][0];
+
     private double[][] cachedTransformed = null;
     private int cachedVertCount = -1;
+    private long cachedTransformedStamp = Long.MIN_VALUE;
 
-    // --- World AABB cache + dirty flag ---
     private AABB cachedWorldAABB = new AABB(0, 0, 0, 0, 0, 0);
     private boolean worldAabbDirty = true;
     private long cachedWorldAabbStamp = Long.MIN_VALUE;
     private int cachedAabbVertCount = -1;
+
+    private final double[] tmpAabbPoint = new double[3];
 
     public GameObject() {
         this.transform = new Transform();
@@ -63,9 +63,8 @@ public abstract class GameObject {
         child.parent = this;
         children.add(child);
 
-        // Parent/child structure change can affect world stamp propagation usage patterns,
-        // so mark dirty defensively.
         child.markWorldAABBDirty();
+        // world stamp will change automatically due to parent chain
     }
 
     public void removeChild(GameObject child) {
@@ -83,12 +82,15 @@ public abstract class GameObject {
 
     public Matrix4 getWorldTransform() {
         Matrix4 local = transform.getTransformationMatrix();
-        if (parent != null) {
-            Matrix4 pw = parent.getWorldTransform();
-            pw.multiply(local, cachedWorld);
-            return cachedWorld;
-        }
-        return local;
+        if (parent == null) return local;
+
+        long stamp = computeWorldStamp();
+        if (stamp == cachedWorldStamp) return cachedWorld;
+
+        Matrix4 pw = parent.getWorldTransform();
+        pw.multiply(local, cachedWorld);
+        cachedWorldStamp = stamp;
+        return cachedWorld;
     }
 
     public Vector3 getWorldPosition() {
@@ -104,11 +106,17 @@ public abstract class GameObject {
     public double[][] getTransformedVertices() {
         double[][] local = getVertices();
         int n = (local != null ? local.length : 0);
-        if (n <= 0) return new double[0][0];
+        if (n <= 0) return EMPTY_VERTS;
 
         if (cachedTransformed == null || cachedVertCount != n) {
             cachedTransformed = new double[n][3];
             cachedVertCount = n;
+            cachedTransformedStamp = Long.MIN_VALUE;
+        }
+
+        long stamp = computeWorldStamp();
+        if (stamp == cachedTransformedStamp) {
+            return cachedTransformed; // huge win for static objects
         }
 
         Matrix4 M = getWorldTransform();
@@ -117,15 +125,12 @@ public abstract class GameObject {
             if (v == null || v.length < 3) continue;
             M.transformPoint(v[0], v[1], v[2], cachedTransformed[i]);
         }
+
+        cachedTransformedStamp = stamp;
         return cachedTransformed;
     }
 
-    /**
-     * Cached world AABB + dirty flag.
-     * Dirty becomes true when this transform OR any parent transform changes.
-     */
     public AABB getWorldAABB() {
-        // Track vertex-count changes too (rare, but safe)
         double[][] local = getVertices();
         int n = (local != null ? local.length : 0);
         if (n != cachedAabbVertCount) {
@@ -134,15 +139,9 @@ public abstract class GameObject {
         }
 
         long stamp = computeWorldStamp();
+        if (stamp != cachedWorldAabbStamp) worldAabbDirty = true;
 
-        // If the stamp changed since last cached AABB, mark dirty.
-        if (stamp != cachedWorldAabbStamp) {
-            worldAabbDirty = true;
-        }
-
-        if (!worldAabbDirty) {
-            return cachedWorldAABB;
-        }
+        if (!worldAabbDirty) return cachedWorldAABB;
 
         cachedWorldAABB = computeWorldAABBNow(local);
         cachedWorldAabbStamp = stamp;
@@ -150,25 +149,22 @@ public abstract class GameObject {
         return cachedWorldAABB;
     }
 
-    /**
-     * Marks this object's cached world AABB as dirty.
-     * Useful if you ever add setters later that mutate transform.
-     */
     protected void markWorldAABBDirty() {
         worldAabbDirty = true;
+        cachedWorldStamp = Long.MIN_VALUE;
+        cachedTransformedStamp = Long.MIN_VALUE;
+        cachedWorldAabbStamp = Long.MIN_VALUE;
     }
 
-    // Private helper: stamp changes when local OR parent chain changes.
-    private long computeWorldStamp() {
-        long localVer = transform.getVersion(); // syncs & updates on TRS changes
+    // Made protected so LightObject can reuse it for cheap "sync only if changed"
+    protected long computeWorldStamp() {
+        long localVer = transform.getVersion();
         if (parent == null) return mix64(localVer);
-
         long parentStamp = parent.computeWorldStamp();
         return mix64(localVer * 31L + parentStamp);
     }
 
     private static long mix64(long x) {
-        // Simple 64-bit mix (deterministic; good enough for change detection)
         x ^= (x >>> 33);
         x *= 0xff51afd7ed558ccdL;
         x ^= (x >>> 33);
@@ -187,12 +183,11 @@ public abstract class GameObject {
         double minY = Double.POSITIVE_INFINITY, maxY = Double.NEGATIVE_INFINITY;
         double minZ = Double.POSITIVE_INFINITY, maxZ = Double.NEGATIVE_INFINITY;
 
-        double[] tmp = new double[3];
         for (double[] v : localVerts) {
             if (v == null || v.length < 3) continue;
 
-            M.transformPoint(v[0], v[1], v[2], tmp);
-            double x = tmp[0], y = tmp[1], z = tmp[2];
+            M.transformPoint(v[0], v[1], v[2], tmpAabbPoint);
+            double x = tmpAabbPoint[0], y = tmpAabbPoint[1], z = tmpAabbPoint[2];
 
             if (x < minX) minX = x;
             if (x > maxX) maxX = x;

@@ -1,4 +1,3 @@
-// File: Camera.java
 package engine;
 
 import objects.GameObject;
@@ -33,12 +32,22 @@ public class Camera {
     private double eyeX, eyeY, eyeZ;
     private double viewYaw, viewPitch;
 
-    // Camera obstruction handling (3rd person)
-    private static final double CAM_WALL_PAD = 0.12;   // keep camera slightly off the wall
-    private static final double CAM_MIN_DIST = 0.20;   // never collapse to 0 in 3rd person
+    private static final double CAM_WALL_PAD = 0.12;
+    private static final double CAM_MIN_DIST = 0.20;
     private static final double RAY_EPS      = 1e-9;
 
     final GameEngine gameEngine;
+
+    private final double[] tmpCam = new double[3];
+
+    // ===== Cached trig + basis (recomputed only when yaw/pitch changes) =====
+    private double cachedYaw = Double.NaN;
+    private double cachedPitch = Double.NaN;
+    private boolean basisCached = false;
+
+    private double cy, sy, cp, sp;
+    private double fwdX, fwdY, fwdZ;
+    private double rightX, rightY, rightZ;
 
     public Camera(double x, double y, double z, double pitch, double yaw, GameEngine gameEngine) {
         this.x = x;
@@ -68,6 +77,14 @@ public class Camera {
     public double getViewYaw()   { return viewYaw; }
     public double getViewPitch() { return viewPitch; }
 
+    // Optional: expose cached basis for any ray/pick/etc. code elsewhere
+    public double getForwardX() { updateBasisIfNeeded(); return fwdX; }
+    public double getForwardY() { updateBasisIfNeeded(); return fwdY; }
+    public double getForwardZ() { updateBasisIfNeeded(); return fwdZ; }
+    public double getRightX()   { updateBasisIfNeeded(); return rightX; }
+    public double getRightY()   { updateBasisIfNeeded(); return rightY; }
+    public double getRightZ()   { updateBasisIfNeeded(); return rightZ; }
+
     public void setFlightMode(boolean enabled) {
         this.flightMode = enabled;
         if (enabled) {
@@ -88,19 +105,16 @@ public class Camera {
 
     public void update(double delta) {
         normalizeAngles();
+        updateBasisIfNeeded(); // <= one trig/basis update per tick (only if yaw/pitch changed)
 
-        final double cy = Math.cos(yaw);
-        final double sy = Math.sin(yaw);
-
+        // Movement transform uses cached yaw trig (cy/sy)
         double moveX = (dx * cy - dz * sy) * delta;
         double moveZ = (dz * cy + dx * sy) * delta;
 
         x += moveX;
         z += moveZ;
 
-        if (!flightMode) {
-            resolveHorizontalCollisions();
-        }
+        if (!flightMode) resolveHorizontalCollisions();
 
         double prevY = y;
 
@@ -113,9 +127,7 @@ public class Camera {
             y += yVelocity * delta;
         }
 
-        if (!flightMode) {
-            resolveVerticalCollisions(prevY);
-        }
+        if (!flightMode) resolveVerticalCollisions(prevY);
 
         if (!flightMode && y < 0) {
             y = 0;
@@ -125,6 +137,30 @@ public class Camera {
 
         recomputeViewOrigin();
         resetMovementDeltas();
+    }
+
+    private void updateBasisIfNeeded() {
+        if (!basisCached || yaw != cachedYaw || pitch != cachedPitch) {
+            cachedYaw = yaw;
+            cachedPitch = pitch;
+
+            cy = Math.cos(cachedYaw);
+            sy = Math.sin(cachedYaw);
+            cp = Math.cos(cachedPitch);
+            sp = Math.sin(cachedPitch);
+
+            // Forward from yaw/pitch (same convention you had)
+            fwdX = -cp * sy;
+            fwdY = -sp;
+            fwdZ =  cp * cy;
+
+            // Right in XZ plane (same convention you had)
+            rightX = cy;
+            rightY = 0.0;
+            rightZ = sy;
+
+            basisCached = true;
+        }
     }
 
     private void normalizeAngles() {
@@ -216,30 +252,17 @@ public class Camera {
             return;
         }
 
+        // Third-person uses the same cached basis as movement
+        updateBasisIfNeeded();
+
         final double pivotX = x;
         final double pivotY = y + EYE_HEIGHT;
         final double pivotZ = z;
 
-        final double cy = Math.cos(yaw);
-        final double sy = Math.sin(yaw);
-        final double cp = Math.cos(pitch);
-        final double sp = Math.sin(pitch);
-
-        // forward points where the camera is looking (from camera to scene)
-        final double fwdX = -cp * sy;
-        final double fwdY = -sp;
-        final double fwdZ =  cp * cy;
-
-        final double rightX = cy;
-        final double rightY = 0.0;
-        final double rightZ = sy;
-
-        // desired third-person camera point
         double desiredX = pivotX - fwdX * thirdPersonDistance + rightX * shoulderOffset;
         double desiredY = pivotY - fwdY * thirdPersonDistance + rightY * shoulderOffset;
         double desiredZ = pivotZ - fwdZ * thirdPersonDistance + rightZ * shoulderOffset;
 
-        // If a SOLID object blocks the camera, slide the camera forward to the wall (no clipping/vanishing).
         double[] adjusted = resolveThirdPersonCameraCollision(pivotX, pivotY, pivotZ, desiredX, desiredY, desiredZ);
         eyeX = adjusted[0];
         eyeY = adjusted[1];
@@ -254,7 +277,8 @@ public class Camera {
             double desiredX, double desiredY, double desiredZ
     ) {
         if (gameEngine == null || gameEngine.rootObjects == null) {
-            return new double[]{desiredX, desiredY, desiredZ};
+            tmpCam[0] = desiredX; tmpCam[1] = desiredY; tmpCam[2] = desiredZ;
+            return tmpCam;
         }
 
         double dirX = desiredX - pivotX;
@@ -263,28 +287,39 @@ public class Camera {
 
         double dist = Math.sqrt(dirX * dirX + dirY * dirY + dirZ * dirZ);
         if (dist < 1e-12) {
-            return new double[]{desiredX, desiredY, desiredZ};
+            tmpCam[0] = desiredX; tmpCam[1] = desiredY; tmpCam[2] = desiredZ;
+            return tmpCam;
         }
 
-        // normalize direction
         double invDist = 1.0 / dist;
         dirX *= invDist;
         dirY *= invDist;
         dirZ *= invDist;
 
-        Body playerBody = null;
-        try { playerBody = gameEngine.getPlayerBody(); } catch (Throwable ignored) {}
+        Body playerBody = gameEngine.getPlayerBody();
+
+        double segMinX = Math.min(pivotX, desiredX) - CAM_WALL_PAD;
+        double segMaxX = Math.max(pivotX, desiredX) + CAM_WALL_PAD;
+        double segMinY = Math.min(pivotY, desiredY) - CAM_WALL_PAD;
+        double segMaxY = Math.max(pivotY, desiredY) + CAM_WALL_PAD;
+        double segMinZ = Math.min(pivotZ, desiredZ) - CAM_WALL_PAD;
+        double segMaxZ = Math.max(pivotZ, desiredZ) + CAM_WALL_PAD;
 
         double bestHit = Double.POSITIVE_INFINITY;
 
         for (GameObject obj : gameEngine.rootObjects) {
             if (obj == null) continue;
-            if (!obj.isFull()) continue; // only SOLID blocks the camera
+            if (!obj.isFull()) continue;
             if (playerBody != null && obj == playerBody) continue;
 
             AABB b = obj.getWorldAABB();
 
-            // If the pivot starts inside an AABB (rare), ignore it for camera obstruction.
+            if (b.maxX < segMinX || b.minX > segMaxX ||
+                    b.maxY < segMinY || b.minY > segMaxY ||
+                    b.maxZ < segMinZ || b.minZ > segMaxZ) {
+                continue;
+            }
+
             if (aabbContainsPoint(b, pivotX, pivotY, pivotZ)) continue;
 
             double hit = rayAabbHitDistance(pivotX, pivotY, pivotZ, dirX, dirY, dirZ, dist, b);
@@ -292,18 +327,18 @@ public class Camera {
         }
 
         if (bestHit == Double.POSITIVE_INFINITY) {
-            return new double[]{desiredX, desiredY, desiredZ};
+            tmpCam[0] = desiredX; tmpCam[1] = desiredY; tmpCam[2] = desiredZ;
+            return tmpCam;
         }
 
         double newDist = bestHit - CAM_WALL_PAD;
         if (newDist < CAM_MIN_DIST) newDist = CAM_MIN_DIST;
         if (newDist > dist) newDist = dist;
 
-        return new double[]{
-                pivotX + dirX * newDist,
-                pivotY + dirY * newDist,
-                pivotZ + dirZ * newDist
-        };
+        tmpCam[0] = pivotX + dirX * newDist;
+        tmpCam[1] = pivotY + dirY * newDist;
+        tmpCam[2] = pivotZ + dirZ * newDist;
+        return tmpCam;
     }
 
     private static boolean aabbContainsPoint(AABB b, double px, double py, double pz) {
@@ -312,7 +347,6 @@ public class Camera {
                 pz >= b.minZ && pz <= b.maxZ;
     }
 
-    // Returns distance along ray to entry point, or +INF if no hit within maxDist.
     private static double rayAabbHitDistance(
             double ox, double oy, double oz,
             double dx, double dy, double dz,
@@ -322,7 +356,6 @@ public class Camera {
         double tmin = 0.0;
         double tmax = maxDist;
 
-        // X slab
         if (Math.abs(dx) < RAY_EPS) {
             if (ox < b.minX || ox > b.maxX) return Double.POSITIVE_INFINITY;
         } else {
@@ -335,7 +368,6 @@ public class Camera {
             if (tmin > tmax) return Double.POSITIVE_INFINITY;
         }
 
-        // Y slab
         if (Math.abs(dy) < RAY_EPS) {
             if (oy < b.minY || oy > b.maxY) return Double.POSITIVE_INFINITY;
         } else {
@@ -348,7 +380,6 @@ public class Camera {
             if (tmin > tmax) return Double.POSITIVE_INFINITY;
         }
 
-        // Z slab
         if (Math.abs(dz) < RAY_EPS) {
             if (oz < b.minZ || oz > b.maxZ) return Double.POSITIVE_INFINITY;
         } else {
@@ -361,9 +392,7 @@ public class Camera {
             if (tmin > tmax) return Double.POSITIVE_INFINITY;
         }
 
-        // If entry is behind start or too close, treat as no useful hit for obstruction.
         if (tmin <= 1e-6) return Double.POSITIVE_INFINITY;
-
         return tmin;
     }
 }

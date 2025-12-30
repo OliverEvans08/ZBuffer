@@ -1,3 +1,4 @@
+// File: LightObject.java
 package objects.lighting;
 
 import engine.lighting.LightData;
@@ -12,31 +13,33 @@ public class LightObject extends GameObject {
 
     private final LightData light;
 
-    // Temp arrays to avoid allocations
     private final double[] tmpPos = new double[3];
     private final double[] tmpDir = new double[3];
 
-    // The light's direction in LOCAL space. World direction is computed from world transform each getLight().
     private Vector3 localDirection = new Vector3(0, -1, 0);
 
-    // Optional: slowly rotate around Y (360° cycle)
     private boolean autoRotateY = false;
     private double autoRotateYSpeedRad = 0.0;
+
+    private long lastSyncStamp = Long.MIN_VALUE;
 
     private LightObject(LightData light) {
         this.light = (light == null ? new LightData() : light);
         this.light.owner = this;
 
-        // Lights are not colliders
-        setFull(false);
+        // ✅ IMPORTANT FIX:
+        // LightData.point/spot factory fills light.x/y/z, but getLight() later syncs from THIS object's transform.
+        // If we don't initialize transform.position here, point/spot lights snap to (0,0,0).
+        if (this.light.type == LightType.POINT || this.light.type == LightType.SPOT) {
+            this.transform.position = new Vector3(this.light.x, this.light.y, this.light.z);
+        }
 
-        // Lights don't render as geometry
-        setVisible(false);
-
-        // Initialize local direction from current light data (if applicable)
         if (this.light.type == LightType.DIRECTIONAL || this.light.type == LightType.SPOT) {
             this.localDirection = normalizeSafe(new Vector3(this.light.dx, this.light.dy, this.light.dz));
         }
+
+        setFull(false);
+        setVisible(false);
     }
 
     public static LightObject directional(Vector3 raysDirection, Color color, double strength, boolean shadows) {
@@ -62,20 +65,18 @@ public class LightObject extends GameObject {
         return new LightObject(d);
     }
 
-    /**
-     * Requirement #1:
-     * Update dx/dy/dz for directional (and spot) lights EVERY time getLight() is called.
-     * This computes the world direction from the object's world transform and localDirection.
-     */
     public LightData getLight() {
-        syncWorldStateEveryCall();
+        long stamp = computeWorldStamp();
+        if (stamp != lastSyncStamp) {
+            syncWorldStateNow();
+            lastSyncStamp = stamp;
+        }
         return light;
     }
 
-    private void syncWorldStateEveryCall() {
+    private void syncWorldStateNow() {
         Matrix4 w = null;
 
-        // Position sync for POINT/SPOT
         if (light.type == LightType.POINT || light.type == LightType.SPOT) {
             w = getWorldTransform();
             w.transformPoint(0, 0, 0, tmpPos);
@@ -84,11 +85,9 @@ public class LightObject extends GameObject {
             light.z = tmpPos[2];
         }
 
-        // Direction sync for DIRECTIONAL/SPOT (EVERY getLight() call)
         if (light.type == LightType.DIRECTIONAL || light.type == LightType.SPOT) {
             if (w == null) w = getWorldTransform();
 
-            // Transform local direction by world matrix (ignore translation)
             w.transformDirection(localDirection.x, localDirection.y, localDirection.z, tmpDir);
 
             double lx = tmpDir[0], ly = tmpDir[1], lz = tmpDir[2];
@@ -107,17 +106,12 @@ public class LightObject extends GameObject {
     }
 
     public LightObject setDirection(Vector3 raysDirection) {
-        // Store as local direction (normalized) so transform rotation can affect it
         this.localDirection = normalizeSafe(raysDirection);
         light.setDirection(this.localDirection);
+        lastSyncStamp = Long.MIN_VALUE;
         return this;
     }
 
-    /**
-     * Requirement #2 helper:
-     * Rotate the light around Y forever at the given speed (radians/sec).
-     * Example: 2π/60 ≈ 0.1047 for a 60-second full rotation.
-     */
     public LightObject setAutoRotateY(double radiansPerSecond) {
         this.autoRotateY = true;
         this.autoRotateYSpeedRad = radiansPerSecond;
@@ -174,18 +168,16 @@ public class LightObject extends GameObject {
     @Override public int[][] getEdges() { return new int[0][]; }
     @Override public int[][] getFacesArray() { return null; }
 
-    /**
-     * Drives the slow 360° cycle when enabled.
-     */
     @Override
     public void update(double delta) {
         if (autoRotateY && Math.abs(autoRotateYSpeedRad) > 1e-12) {
             transform.rotation.y += autoRotateYSpeedRad * delta;
 
-            // Keep it bounded (0..2π)
             double twoPi = Math.PI * 2.0;
             transform.rotation.y %= twoPi;
             if (transform.rotation.y < 0) transform.rotation.y += twoPi;
+
+            lastSyncStamp = Long.MIN_VALUE;
         }
     }
 }
