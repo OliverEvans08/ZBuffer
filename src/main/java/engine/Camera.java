@@ -36,11 +36,23 @@ public class Camera {
     private static final double CAM_MIN_DIST = 0.20;
     private static final double RAY_EPS      = 1e-9;
 
+    // --- NEW: camera bob + third-person smoothing ---
+    private double bobT = 0.0;
+    private double bobX = 0.0;
+    private double bobY = 0.0;
+
+    private static final double BOB_FREQ_BASE = 4.5;
+    private static final double BOB_FREQ_ADD  = 4.0;
+    private static final double BOB_Y_MAX     = 0.050;
+    private static final double BOB_X_MAX     = 0.030;
+
+    private static final double TPS_SMOOTH_OUT = 10.0; // when camera moves away (more smoothing)
+    private static final double TPS_SMOOTH_IN  = 40.0; // when camera is forced closer (snap faster)
+
     final GameEngine gameEngine;
 
     private final double[] tmpCam = new double[3];
 
-    // ===== Cached trig + basis (recomputed only when yaw/pitch changes) =====
     private double cachedYaw = Double.NaN;
     private double cachedPitch = Double.NaN;
     private boolean basisCached = false;
@@ -56,7 +68,7 @@ public class Camera {
         this.pitch = pitch;
         this.yaw = yaw;
         this.gameEngine = gameEngine;
-        recomputeViewOrigin();
+        recomputeViewOrigin(0.0);
     }
 
     public Mode getMode() { return mode; }
@@ -65,7 +77,7 @@ public class Camera {
 
     public void toggleMode() {
         mode = (mode == Mode.FIRST_PERSON) ? Mode.THIRD_PERSON : Mode.FIRST_PERSON;
-        recomputeViewOrigin();
+        recomputeViewOrigin(0.0);
     }
 
     public void setThirdPersonDistance(double d) { this.thirdPersonDistance = Math.max(0.2, d); }
@@ -77,7 +89,6 @@ public class Camera {
     public double getViewYaw()   { return viewYaw; }
     public double getViewPitch() { return viewPitch; }
 
-    // Optional: expose cached basis for any ray/pick/etc. code elsewhere
     public double getForwardX() { updateBasisIfNeeded(); return fwdX; }
     public double getForwardY() { updateBasisIfNeeded(); return fwdY; }
     public double getForwardZ() { updateBasisIfNeeded(); return fwdZ; }
@@ -105,9 +116,22 @@ public class Camera {
 
     public void update(double delta) {
         normalizeAngles();
-        updateBasisIfNeeded(); // <= one trig/basis update per tick (only if yaw/pitch changed)
+        updateBasisIfNeeded();
 
-        // Movement transform uses cached yaw trig (cy/sy)
+        // --- NEW: compute bob (based on movement intent, only on ground, not flying) ---
+        double speedIntent = Math.sqrt(dx * dx + dz * dz);
+        double move01 = clamp01(speedIntent / 7.8); // diag intent can be ~7.8 with WASD
+        if (!flightMode && onGround && move01 > 1e-6) {
+            bobT += delta * (BOB_FREQ_BASE + BOB_FREQ_ADD * move01);
+            bobY = Math.sin(bobT) * (BOB_Y_MAX * move01);
+            bobX = Math.cos(bobT * 0.5) * (BOB_X_MAX * move01);
+        } else {
+            // ease bob back to zero
+            double a = 1.0 - Math.exp(-delta * 10.0);
+            bobY += (0.0 - bobY) * a;
+            bobX += (0.0 - bobX) * a;
+        }
+
         double moveX = (dx * cy - dz * sy) * delta;
         double moveZ = (dz * cy + dx * sy) * delta;
 
@@ -135,7 +159,7 @@ public class Camera {
             onGround = true;
         }
 
-        recomputeViewOrigin();
+        recomputeViewOrigin(delta);
         resetMovementDeltas();
     }
 
@@ -149,12 +173,10 @@ public class Camera {
             cp = Math.cos(cachedPitch);
             sp = Math.sin(cachedPitch);
 
-            // Forward from yaw/pitch (same convention you had)
             fwdX = -cp * sy;
             fwdY = -sp;
             fwdZ =  cp * cy;
 
-            // Right in XZ plane (same convention you had)
             rightX = cy;
             rightY = 0.0;
             rightZ = sy;
@@ -242,34 +264,51 @@ public class Camera {
 
     private void resetMovementDeltas() { dx = dy = dz = 0; }
 
-    private void recomputeViewOrigin() {
+    private void recomputeViewOrigin(double dt) {
+        // pivot at player's eyes, plus subtle bob
+        final double pivotX = x + bobX;
+        final double pivotY = y + EYE_HEIGHT + bobY;
+        final double pivotZ = z;
+
         if (mode == Mode.FIRST_PERSON) {
-            eyeX = x;
-            eyeY = y + EYE_HEIGHT;
-            eyeZ = z;
+            eyeX = pivotX;
+            eyeY = pivotY;
+            eyeZ = pivotZ;
             viewYaw = yaw;
             viewPitch = pitch;
             return;
         }
 
-        // Third-person uses the same cached basis as movement
         updateBasisIfNeeded();
-
-        final double pivotX = x;
-        final double pivotY = y + EYE_HEIGHT;
-        final double pivotZ = z;
 
         double desiredX = pivotX - fwdX * thirdPersonDistance + rightX * shoulderOffset;
         double desiredY = pivotY - fwdY * thirdPersonDistance + rightY * shoulderOffset;
         double desiredZ = pivotZ - fwdZ * thirdPersonDistance + rightZ * shoulderOffset;
 
         double[] adjusted = resolveThirdPersonCameraCollision(pivotX, pivotY, pivotZ, desiredX, desiredY, desiredZ);
-        eyeX = adjusted[0];
-        eyeY = adjusted[1];
-        eyeZ = adjusted[2];
+        double tx = adjusted[0], ty = adjusted[1], tz = adjusted[2];
+
+        if (dt <= 0.0) {
+            eyeX = tx; eyeY = ty; eyeZ = tz;
+        } else {
+            // Smooth: snap in quickly (avoid wall clipping), ease out slowly.
+            double currDist = dist3(eyeX, eyeY, eyeZ, pivotX, pivotY, pivotZ);
+            double targDist = dist3(tx, ty, tz, pivotX, pivotY, pivotZ);
+            double k = (targDist < currDist) ? TPS_SMOOTH_IN : TPS_SMOOTH_OUT;
+            double a = 1.0 - Math.exp(-dt * k);
+
+            eyeX += (tx - eyeX) * a;
+            eyeY += (ty - eyeY) * a;
+            eyeZ += (tz - eyeZ) * a;
+        }
 
         viewYaw = yaw;
         viewPitch = pitch;
+    }
+
+    private static double dist3(double ax, double ay, double az, double bx, double by, double bz) {
+        double dx = ax - bx, dy = ay - by, dz = az - bz;
+        return Math.sqrt(dx*dx + dy*dy + dz*dz);
     }
 
     private double[] resolveThirdPersonCameraCollision(
@@ -394,5 +433,11 @@ public class Camera {
 
         if (tmin <= 1e-6) return Double.POSITIVE_INFINITY;
         return tmin;
+    }
+
+    private static double clamp01(double v) {
+        if (v < 0) return 0;
+        if (v > 1) return 1;
+        return v;
     }
 }
