@@ -5,14 +5,14 @@ import engine.core.GameClock;
 import engine.event.EventBus;
 import engine.event.events.GuiToggleRequestedEvent;
 import engine.event.events.TickEvent;
+import engine.systems.PlayerController;
 import gui.ClickGUI;
 import objects.GameObject;
 import objects.dynamic.Body;
 import objects.fixed.Cube;
 import objects.lighting.LightObject;
+
 import engine.render.Material;
-import sound.SoundEngine;
-import util.Vector3;
 
 import javax.swing.*;
 import java.awt.*;
@@ -21,9 +21,8 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.LockSupport;
 
-import engine.event.events.ToggleFlightRequestedEvent;
-import engine.event.events.ToggleViewRequestedEvent;
-import engine.systems.PlayerController;
+import sound.SoundEngine;
+import util.Vector3;
 
 public class GameEngine extends JPanel implements Runnable {
 
@@ -41,6 +40,12 @@ public class GameEngine extends JPanel implements Runnable {
     private final PlayerController playerController;
 
     public List<GameObject> rootObjects;
+
+    private static final double COLLIDER_CELL_SIZE = 6.0;
+    private final ColliderIndex colliderIndex = new ColliderIndex(COLLIDER_CELL_SIZE);
+
+    // Render-space partition (same partition concept as collisions).
+    private final SpatialIndex renderIndex = new SpatialIndex(COLLIDER_CELL_SIZE);
 
     private long fpsLastTime = System.nanoTime();
     private int fpsFrames = 0;
@@ -60,21 +65,21 @@ public class GameEngine extends JPanel implements Runnable {
         this.eventBus = new EventBus();
         this.clock = new GameClock(1.0 / 60.0);
 
-        this.camera = new Camera(0, 0.0, 0, 0, 0, this);
         this.rootObjects = new CopyOnWriteArrayList<>();
+
+        this.camera = new Camera(0, 0.0, 0, 0, 0, this);
         this.renderer = new Renderer(camera, this);
         this.soundEngine = new SoundEngine("./src/main/java/sound/wavs");
         this.clickGUI = new ClickGUI(this);
 
         this.inputHandler = new InputHandler(eventBus, this);
 
-        // Player body (now multi-part, rounded)
         this.playerBody = new Body(Camera.WIDTH, Camera.HEIGHT);
         this.playerBody.setFull(false);
         this.playerBody.getTransform().position.x = camera.x;
         this.playerBody.getTransform().position.y = camera.y;
         this.playerBody.getTransform().position.z = camera.z;
-        rootObjects.add(playerBody);
+        addRootObject(playerBody);
 
         this.playerController = new PlayerController(camera, eventBus, playerBody);
 
@@ -96,6 +101,34 @@ public class GameEngine extends JPanel implements Runnable {
     public void setFovDegrees(double fovDegrees) { this.fovDegrees = Math.max(30.0, Math.min(120.0, fovDegrees)); }
     public double getRenderDistance() { return Math.max(5.0, renderDistance); }
     public void setRenderDistance(double renderDistance) { this.renderDistance = Math.max(5.0, renderDistance); }
+
+    public void addRootObject(GameObject obj) {
+        if (obj == null) return;
+        rootObjects.add(obj);
+        colliderIndex.sync(obj);
+        renderIndex.sync(obj);
+    }
+
+    public void removeRootObject(GameObject obj) {
+        if (obj == null) return;
+        rootObjects.remove(obj);
+        colliderIndex.remove(obj);
+        renderIndex.remove(obj);
+    }
+
+    public void queryNearbyCollidersXZ(double minX, double maxX, double minZ, double maxZ,
+                                       java.util.ArrayList<GameObject> out) {
+        colliderIndex.queryXZ(minX, maxX, minZ, maxZ, out);
+    }
+
+    public void queryNearbyRenderablesXZ(double minX, double maxX, double minZ, double maxZ,
+                                         java.util.ArrayList<GameObject> out) {
+        renderIndex.queryXZ(minX, maxX, minZ, maxZ, out);
+    }
+
+    public java.util.List<GameObject> getColliders() {
+        return colliderIndex.getColliders();
+    }
 
     private void setupWindow() {
         setPreferredSize(new Dimension(WIDTH, HEIGHT));
@@ -123,16 +156,9 @@ public class GameEngine extends JPanel implements Runnable {
 
     private void initializeGameObjects() {
 
-        // =========================================================
-        // Minimal-lighting setup:
-        // - Make materials mostly AMBIENT (nearly unlit / flat)
-        // - Keep a tiny DIFFUSE so the rotating sun still does *something*
-        // - Disable shadow casting on the sun (biggest lighting cost)
-        // =========================================================
         final double AMB_BASE  = 0.92;
         final double DIFF_BASE = 0.08;
 
-        // --- materials (ambient-dominant) ---
         final Material asphalt = Material.solid(new Color(55, 55, 60))
                 .setAmbient(AMB_BASE)
                 .setDiffuse(DIFF_BASE);
@@ -161,17 +187,16 @@ public class GameEngine extends JPanel implements Runnable {
                 .setAmbient(AMB_BASE)
                 .setDiffuse(DIFF_BASE);
 
-        // glass kept slightly “brighter” but still mostly ambient
         final Material glass = Material.solid(new Color(110, 180, 220))
                 .setAmbient(0.95)
                 .setDiffuse(0.05);
 
         final Material[] buildingMats = new Material[]{
-                Material.solid(new Color(185, 190, 205)).setAmbient(AMB_BASE).setDiffuse(DIFF_BASE), // concrete
-                Material.solid(new Color(210, 190, 160)).setAmbient(AMB_BASE).setDiffuse(DIFF_BASE), // sandstone
-                Material.solid(new Color(140, 150, 165)).setAmbient(AMB_BASE).setDiffuse(DIFF_BASE), // grey
-                Material.solid(new Color(170, 120, 110)).setAmbient(AMB_BASE).setDiffuse(DIFF_BASE), // brick-ish
-                Material.solid(new Color(95, 105, 115)).setAmbient(AMB_BASE).setDiffuse(DIFF_BASE),  // dark
+                Material.solid(new Color(185, 190, 205)).setAmbient(AMB_BASE).setDiffuse(DIFF_BASE),
+                Material.solid(new Color(210, 190, 160)).setAmbient(AMB_BASE).setDiffuse(DIFF_BASE),
+                Material.solid(new Color(140, 150, 165)).setAmbient(AMB_BASE).setDiffuse(DIFF_BASE),
+                Material.solid(new Color(170, 120, 110)).setAmbient(AMB_BASE).setDiffuse(DIFF_BASE),
+                Material.solid(new Color(95, 105, 115)).setAmbient(AMB_BASE).setDiffuse(DIFF_BASE),
         };
 
         final Material roofMat = Material.solid(new Color(60, 60, 65))
@@ -190,26 +215,20 @@ public class GameEngine extends JPanel implements Runnable {
                 .setAmbient(AMB_BASE)
                 .setDiffuse(DIFF_BASE);
 
-        // lamp: basically emissive-looking via ambient only (no “real lighting” needed)
         final Material streetLightLamp = Material.solid(new Color(255, 245, 210))
                 .setAmbient(1.00)
                 .setDiffuse(0.00);
 
-        // --- city layout ---
         final double TILE = 6.0;
         final double floorY = -TILE * 0.5;
 
-        // Bigger grid => "big city"
-        final int HALF_TILES = 28; // 57 x 57 tiles
+        final int HALF_TILES = 28;
 
-        // Road grid pattern in tiles
-        final int ROAD_W = 2;       // road width (tiles)
-        final int SIDE_W = 1;       // sidewalk width (tiles)
-        final int BLOCK_INNER = 6;  // buildable interior (tiles)
+        final int ROAD_W = 2;
+        final int SIDE_W = 1;
+        final int BLOCK_INNER = 6;
         final int PERIOD = ROAD_W + (SIDE_W * 2) + BLOCK_INNER;
 
-        // Small helpers for deterministic randomness per tile (no allocations)
-        // (hash -> [0..1) doubles)
         final java.util.function.LongUnaryOperator mix64 = (v) -> {
             long x = v;
             x ^= (x >>> 33);
@@ -220,11 +239,9 @@ public class GameEngine extends JPanel implements Runnable {
             return x;
         };
 
-        // --- ground + roads + sidewalks + parks + buildings ---
         for (int tx = -HALF_TILES; tx <= HALF_TILES; tx++) {
             for (int tz = -HALF_TILES; tz <= HALF_TILES; tz++) {
 
-                // Periodic position within a "super-block" (handles negatives)
                 int mx = tx % PERIOD; if (mx < 0) mx += PERIOD;
                 int mz = tz % PERIOD; if (mz < 0) mz += PERIOD;
 
@@ -238,24 +255,19 @@ public class GameEngine extends JPanel implements Runnable {
                 boolean sideZ2 = (mz >= ROAD_W + SIDE_W + BLOCK_INNER && mz < ROAD_W + (SIDE_W * 2) + BLOCK_INNER);
                 boolean isSidewalk = !isRoad && (sideX1 || sideX2 || sideZ1 || sideZ2);
 
-                // World position
                 double x = tx * TILE;
                 double z = tz * TILE;
 
-                // Central plaza area
                 boolean inPlaza = (Math.abs(tx) <= 3 && Math.abs(tz) <= 3);
 
-                // "Park blocks" sprinkled around (block-level hash)
                 int bx = Math.floorDiv(tx, PERIOD);
                 int bz = Math.floorDiv(tz, PERIOD);
                 long blockSeed = mix64.applyAsLong(((long) bx * 92837111L) ^ ((long) bz * 689287499L) ^ 0x9e3779b97f4a7c15L);
-                boolean isParkBlock = ((blockSeed & 7L) == 0L); // ~12.5% of blocks
+                boolean isParkBlock = ((blockSeed & 7L) == 0L);
                 boolean inBlockInterior = (!isRoad && !isSidewalk);
 
-                // River band (adds variety) — runs roughly east/west through the city
                 boolean inRiver = (Math.abs(tz - 10) <= 1) && !inPlaza;
 
-                // Choose ground material
                 Material groundMat;
                 if (inPlaza) {
                     groundMat = plaza;
@@ -268,19 +280,16 @@ public class GameEngine extends JPanel implements Runnable {
                 } else if (isParkBlock) {
                     groundMat = grass;
                 } else {
-                    // lots/courtyards blend
                     long seed = mix64.applyAsLong(((long) tx * 341873128712L) ^ ((long) tz * 132897987541L) ^ 0xD1B54A32D192ED03L);
                     double u = ((seed >>> 11) & 0xFFFFFFFFL) / (double) 0x1_0000_0000L;
                     groundMat = (u < 0.18) ? grass : plaza;
                 }
 
-                // Place ground tile
                 Cube ground = new Cube(TILE, x, floorY, z);
                 ground.setFull(true);
                 ground.setMaterial(groundMat);
-                rootObjects.add(ground);
+                addRootObject(ground);
 
-                // Road markings
                 if (isRoad && !inPlaza) {
                     final double markSize = TILE * 0.16;
                     final double markY = (markSize * 0.5) + 0.02;
@@ -293,25 +302,24 @@ public class GameEngine extends JPanel implements Runnable {
                                 Cube dash = new Cube(markSize, x, markY, z);
                                 dash.setFull(true);
                                 dash.setMaterial(laneWhite);
-                                rootObjects.add(dash);
+                                addRootObject(dash);
                             }
                         } else if (roadZ && !roadX) {
                             if (mz == (ROAD_W / 2)) {
                                 Cube dash = new Cube(markSize, x, markY, z);
                                 dash.setFull(true);
                                 dash.setMaterial(laneWhite);
-                                rootObjects.add(dash);
+                                addRootObject(dash);
                             }
                         } else if (roadX && roadZ) {
                             Cube box = new Cube(markSize * 1.25, x, markY, z);
                             box.setFull(true);
                             box.setMaterial(laneYellow);
-                            rootObjects.add(box);
+                            addRootObject(box);
                         }
                     }
                 }
 
-                // Sidewalk props: sparse street lights
                 if (isSidewalk && !inPlaza) {
                     long s = mix64.applyAsLong(((long) tx * 2246822519L) ^ ((long) tz * 3266489917L) ^ 0x165667B19E3779F9L);
                     double u = ((s >>> 11) & 0xFFFFFFFFL) / (double) 0x1_0000_0000L;
@@ -324,29 +332,28 @@ public class GameEngine extends JPanel implements Runnable {
                         Cube p0 = new Cube(pole, x, py0, z);
                         p0.setFull(true);
                         p0.setMaterial(streetLightPole);
-                        rootObjects.add(p0);
+                        addRootObject(p0);
 
                         double py1 = py0 + (pole * 0.5) + (pole * 0.5);
                         Cube p1 = new Cube(pole, x, py1, z);
                         p1.setFull(true);
                         p1.setMaterial(streetLightPole);
-                        rootObjects.add(p1);
+                        addRootObject(p1);
 
                         double py2 = py1 + (pole * 0.5) + (pole * 0.5);
                         Cube p2 = new Cube(pole, x, py2, z);
                         p2.setFull(true);
                         p2.setMaterial(streetLightPole);
-                        rootObjects.add(p2);
+                        addRootObject(p2);
 
                         double ly = py2 + (pole * 0.5) + (lamp * 0.5);
                         Cube l = new Cube(lamp, x, ly, z);
                         l.setFull(true);
                         l.setMaterial(streetLightLamp);
-                        rootObjects.add(l);
+                        addRootObject(l);
                     }
                 }
 
-                // Parks: add some trees (no buildings)
                 if (inBlockInterior && isParkBlock && !inPlaza && !inRiver) {
                     long s = mix64.applyAsLong(((long) tx * 1181783497276652981L) ^ ((long) tz * 8425020879299227303L) ^ 0x27D4EB2F165667C5L);
                     double u = ((s >>> 11) & 0xFFFFFFFFL) / (double) 0x1_0000_0000L;
@@ -359,24 +366,23 @@ public class GameEngine extends JPanel implements Runnable {
                         Cube t0 = new Cube(trunk, x, ty0, z);
                         t0.setFull(true);
                         t0.setMaterial(treeTrunk);
-                        rootObjects.add(t0);
+                        addRootObject(t0);
 
                         double ty1 = ty0 + trunk;
                         Cube t1 = new Cube(trunk, x, ty1, z);
                         t1.setFull(true);
                         t1.setMaterial(treeTrunk);
-                        rootObjects.add(t1);
+                        addRootObject(t1);
 
                         double cy = ty1 + (trunk * 0.5) + (crown * 0.5);
                         Cube c0 = new Cube(crown, x, cy, z);
                         c0.setFull(true);
                         c0.setMaterial(treeLeaves);
-                        rootObjects.add(c0);
+                        addRootObject(c0);
                     }
                     continue;
                 }
 
-                // Buildings only on interior lots (not roads/sidewalks/plaza/river)
                 if (!inBlockInterior || inPlaza || inRiver) continue;
 
                 long seed = mix64.applyAsLong(((long) tx * 341873128712L) ^ ((long) tz * 132897987541L) ^ 0x9E3779B97F4A7C15L);
@@ -419,7 +425,7 @@ public class GameEngine extends JPanel implements Runnable {
                 Material altMat  = (type == 2 || type == 1) ? glass : coreMat;
 
                 double curSize = baseSize;
-                double y = curSize * 0.5;
+                double yy = curSize * 0.5;
 
                 for (int i = 0; i < seg; i++) {
 
@@ -435,7 +441,7 @@ public class GameEngine extends JPanel implements Runnable {
 
                     if (curSize < TILE * 0.26) curSize = TILE * 0.26;
 
-                    Cube part = new Cube(curSize, x, y, z);
+                    Cube part = new Cube(curSize, x, yy, z);
                     part.setFull(true);
 
                     if (type == 2 || type == 1) {
@@ -444,29 +450,29 @@ public class GameEngine extends JPanel implements Runnable {
                         part.setMaterial(coreMat);
                     }
 
-                    rootObjects.add(part);
+                    addRootObject(part);
 
                     double nextSize;
                     if (type == 3 && i == 0) nextSize = baseSize * 0.55;
                     else nextSize = curSize * 0.86;
                     if (nextSize < TILE * 0.22) nextSize = TILE * 0.22;
 
-                    y += (curSize * 0.5) + (nextSize * 0.5);
+                    yy += (curSize * 0.5) + (nextSize * 0.5);
                 }
 
                 if (type == 2 && density > 0.55) {
                     double aSize = TILE * 0.12;
-                    double ay = y + (aSize * 0.5);
+                    double ay = yy + (aSize * 0.5);
                     Cube antenna = new Cube(aSize, x, ay, z);
                     antenna.setFull(true);
                     antenna.setMaterial(roofMat);
-                    rootObjects.add(antenna);
+                    addRootObject(antenna);
 
                     double ay2 = ay + aSize;
                     Cube antenna2 = new Cube(aSize, x, ay2, z);
                     antenna2.setFull(true);
                     antenna2.setMaterial(roofMat);
-                    rootObjects.add(antenna2);
+                    addRootObject(antenna2);
                 } else if (type == 3) {
                     double sSize = TILE * 0.16;
                     double sx = x + TILE * 0.22;
@@ -476,42 +482,39 @@ public class GameEngine extends JPanel implements Runnable {
                     Cube st0 = new Cube(sSize, sx, sy, sz);
                     st0.setFull(true);
                     st0.setMaterial(roofMat);
-                    rootObjects.add(st0);
+                    addRootObject(st0);
 
                     double sy1 = sy + sSize;
                     Cube st1 = new Cube(sSize, sx, sy1, sz);
                     st1.setFull(true);
                     st1.setMaterial(roofMat);
-                    rootObjects.add(st1);
+                    addRootObject(st1);
 
                     double sy2 = sy1 + sSize;
                     Cube st2 = new Cube(sSize, sx, sy2, sz);
                     st2.setFull(true);
                     st2.setMaterial(roofMat);
-                    rootObjects.add(st2);
+                    addRootObject(st2);
                 } else if (type == 0) {
                     double rSize = Math.max(TILE * 0.26, baseSize * 0.55);
-                    double ry = y + (rSize * 0.5);
+                    double ry = yy + (rSize * 0.5);
                     Cube roof = new Cube(rSize, x, ry, z);
                     roof.setFull(true);
                     roof.setMaterial(roofMat);
-                    rootObjects.add(roof);
+                    addRootObject(roof);
                 }
             }
         }
 
-        // Sun: keep rotating, but disable shadow casting to minimize lighting cost
         LightObject sun = LightObject.directional(
                 new Vector3(-0.35, -0.85, 0.40),
                 new Color(255, 244, 220),
-                0.65,   // slightly lower strength since we’re mostly ambient now
-                false   // <-- was true: shadows off = much cheaper lighting
+                0.65,
+                false
         );
         sun.setAutoRotateY(Math.toRadians(6.0));
-        rootObjects.add(sun);
+        addRootObject(sun);
     }
-
-
 
     @Override
     protected void paintComponent(Graphics g) {
@@ -580,7 +583,6 @@ public class GameEngine extends JPanel implements Runnable {
     private void fixedUpdate(double delta) {
         inputHandler.updatePerTick();
 
-        // Capture movement intent BEFORE camera.update() clears dx/dy/dz
         double intentStrafe  = camera.dx;
         double intentForward = camera.dz;
         double intentSpeed = Math.sqrt(intentStrafe * intentStrafe + intentForward * intentForward);
@@ -591,7 +593,6 @@ public class GameEngine extends JPanel implements Runnable {
         camera.update(delta);
         syncPlayerBodyToCamera();
 
-        // NEW: richer motion feed for realistic procedural animation
         playerBody.setMotionState(
                 movingIntent,
                 camera.onGround,
@@ -604,11 +605,15 @@ public class GameEngine extends JPanel implements Runnable {
         );
 
         for (GameObject obj : rootObjects) {
-            if (obj != null) obj.update(delta);
+            if (obj == null) continue;
+            obj.update(delta);
+
+            // keep both indices in sync
+            colliderIndex.sync(obj);
+            renderIndex.sync(obj);
         }
 
         AnimationSystem.updateAll(rootObjects, delta);
-
         soundEngine.tick();
     }
 
@@ -617,6 +622,12 @@ public class GameEngine extends JPanel implements Runnable {
         playerBody.getTransform().position.y = camera.y;
         playerBody.getTransform().position.z = camera.z;
         playerBody.getTransform().rotation.y = -camera.getViewYaw();
+
+        // Body has no verts, so colliderIndex doesn't keep it; renderIndex would index as point at world pos,
+        // but we still rely on explicitly rendering it in Renderer (safer).
+        // Still sync to keep transforms correct if you later add verts to Body.
+        renderIndex.sync(playerBody);
+        colliderIndex.sync(playerBody);
     }
 
     public void hideCursor() {
@@ -651,12 +662,13 @@ public class GameEngine extends JPanel implements Runnable {
         g.drawString("Yaw: " + String.format("%.1f°", Math.toDegrees(camera.yaw)), 10, 120);
         g.drawString("Pitch: " + String.format("%.1f°", Math.toDegrees(camera.pitch)), 10, 140);
         g.drawString("Loaded Objects: " + rootObjects.size(), 10, 160);
-        g.drawString("GUI Open: " + clickGUI.isOpen(), 10, 180);
-        g.drawString("FOV: " + String.format("%.1f°", fovDegrees), 10, 200);
-        g.drawString("RenderDist: " + String.format("%.0f", getRenderDistance()), 10, 220);
-        g.drawString("Cam Mode: " + (camera.isFirstPerson() ? "First" : "Third"), 10, 240);
-        g.drawString("RenderScale: " + String.format("%.2f", renderer.getRenderScale()), 10, 260);
-        g.drawString("FXAA: " + renderer.isFxaaEnabled(), 10, 280);
+        g.drawString("Solid Colliders: " + getColliders().size(), 10, 180);
+        g.drawString("GUI Open: " + clickGUI.isOpen(), 10, 200);
+        g.drawString("FOV: " + String.format("%.1f°", fovDegrees), 10, 220);
+        g.drawString("RenderDist: " + String.format("%.0f", getRenderDistance()), 10, 240);
+        g.drawString("Cam Mode: " + (camera.isFirstPerson() ? "First" : "Third"), 10, 260);
+        g.drawString("RenderScale: " + String.format("%.2f", renderer.getRenderScale()), 10, 280);
+        g.drawString("FXAA: " + renderer.isFxaaEnabled(), 10, 300);
     }
 
     public static void main(String[] args) {

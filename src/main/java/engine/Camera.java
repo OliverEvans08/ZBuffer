@@ -4,6 +4,8 @@ import objects.GameObject;
 import objects.dynamic.Body;
 import util.AABB;
 
+import java.util.ArrayList;
+
 public class Camera {
 
     public enum Mode { FIRST_PERSON, THIRD_PERSON }
@@ -36,7 +38,6 @@ public class Camera {
     private static final double CAM_MIN_DIST = 0.20;
     private static final double RAY_EPS      = 1e-9;
 
-    // --- NEW: camera bob + third-person smoothing ---
     private double bobT = 0.0;
     private double bobX = 0.0;
     private double bobY = 0.0;
@@ -46,8 +47,8 @@ public class Camera {
     private static final double BOB_Y_MAX     = 0.050;
     private static final double BOB_X_MAX     = 0.030;
 
-    private static final double TPS_SMOOTH_OUT = 10.0; // when camera moves away (more smoothing)
-    private static final double TPS_SMOOTH_IN  = 40.0; // when camera is forced closer (snap faster)
+    private static final double TPS_SMOOTH_OUT = 10.0;
+    private static final double TPS_SMOOTH_IN  = 40.0;
 
     final GameEngine gameEngine;
 
@@ -60,6 +61,9 @@ public class Camera {
     private double cy, sy, cp, sp;
     private double fwdX, fwdY, fwdZ;
     private double rightX, rightY, rightZ;
+
+    // Reused nearby-collider buffer (no rootObjects scan).
+    private final ArrayList<GameObject> nearby = new ArrayList<>(256);
 
     public Camera(double x, double y, double z, double pitch, double yaw, GameEngine gameEngine) {
         this.x = x;
@@ -118,15 +122,13 @@ public class Camera {
         normalizeAngles();
         updateBasisIfNeeded();
 
-        // --- NEW: compute bob (based on movement intent, only on ground, not flying) ---
         double speedIntent = Math.sqrt(dx * dx + dz * dz);
-        double move01 = clamp01(speedIntent / 7.8); // diag intent can be ~7.8 with WASD
+        double move01 = clamp01(speedIntent / 7.8);
         if (!flightMode && onGround && move01 > 1e-6) {
             bobT += delta * (BOB_FREQ_BASE + BOB_FREQ_ADD * move01);
             bobY = Math.sin(bobT) * (BOB_Y_MAX * move01);
             bobX = Math.cos(bobT * 0.5) * (BOB_X_MAX * move01);
         } else {
-            // ease bob back to zero
             double a = 1.0 - Math.exp(-delta * 10.0);
             bobY += (0.0 - bobY) * a;
             bobX += (0.0 - bobX) * a;
@@ -197,12 +199,19 @@ public class Camera {
     }
 
     private void resolveHorizontalCollisions() {
-        if (gameEngine == null || gameEngine.rootObjects == null) return;
+        if (gameEngine == null) return;
 
         final double halfW = WIDTH * 0.5;
 
-        for (GameObject obj : gameEngine.rootObjects) {
-            if (obj == null || !obj.isFull()) continue;
+        // Query only nearby colliders (grid cells overlapped by player footprint).
+        gameEngine.queryNearbyCollidersXZ(
+                x - halfW, x + halfW,
+                z - halfW, z + halfW,
+                nearby
+        );
+
+        for (GameObject obj : nearby) {
+            if (obj == null) continue; // already solid-only from index, but be safe
 
             AABB b = obj.getWorldAABB();
             if (!intersectsAABB(b, halfW)) continue;
@@ -223,15 +232,22 @@ public class Camera {
     }
 
     private void resolveVerticalCollisions(double prevY) {
-        if (gameEngine == null || gameEngine.rootObjects == null) return;
+        if (gameEngine == null) return;
 
         final double halfW = WIDTH * 0.5;
         boolean movingDown = (y < prevY);
 
         onGround = false;
 
-        for (GameObject obj : gameEngine.rootObjects) {
-            if (obj == null || !obj.isFull()) continue;
+        // Same nearby query (XZ footprint); exact Y is filtered by intersectsAABB.
+        gameEngine.queryNearbyCollidersXZ(
+                x - halfW, x + halfW,
+                z - halfW, z + halfW,
+                nearby
+        );
+
+        for (GameObject obj : nearby) {
+            if (obj == null) continue;
 
             AABB b = obj.getWorldAABB();
             if (!intersectsAABB(b, halfW)) continue;
@@ -265,7 +281,6 @@ public class Camera {
     private void resetMovementDeltas() { dx = dy = dz = 0; }
 
     private void recomputeViewOrigin(double dt) {
-        // pivot at player's eyes, plus subtle bob
         final double pivotX = x + bobX;
         final double pivotY = y + EYE_HEIGHT + bobY;
         final double pivotZ = z;
@@ -291,7 +306,6 @@ public class Camera {
         if (dt <= 0.0) {
             eyeX = tx; eyeY = ty; eyeZ = tz;
         } else {
-            // Smooth: snap in quickly (avoid wall clipping), ease out slowly.
             double currDist = dist3(eyeX, eyeY, eyeZ, pivotX, pivotY, pivotZ);
             double targDist = dist3(tx, ty, tz, pivotX, pivotY, pivotZ);
             double k = (targDist < currDist) ? TPS_SMOOTH_IN : TPS_SMOOTH_OUT;
@@ -315,7 +329,7 @@ public class Camera {
             double pivotX, double pivotY, double pivotZ,
             double desiredX, double desiredY, double desiredZ
     ) {
-        if (gameEngine == null || gameEngine.rootObjects == null) {
+        if (gameEngine == null) {
             tmpCam[0] = desiredX; tmpCam[1] = desiredY; tmpCam[2] = desiredZ;
             return tmpCam;
         }
@@ -346,18 +360,17 @@ public class Camera {
 
         double bestHit = Double.POSITIVE_INFINITY;
 
-        for (GameObject obj : gameEngine.rootObjects) {
+        // Query only nearby colliders (XZ span of the segment box).
+        gameEngine.queryNearbyCollidersXZ(segMinX, segMaxX, segMinZ, segMaxZ, nearby);
+
+        for (GameObject obj : nearby) {
             if (obj == null) continue;
-            if (!obj.isFull()) continue;
             if (playerBody != null && obj == playerBody) continue;
 
             AABB b = obj.getWorldAABB();
 
-            if (b.maxX < segMinX || b.minX > segMaxX ||
-                    b.maxY < segMinY || b.minY > segMaxY ||
-                    b.maxZ < segMinZ || b.minZ > segMaxZ) {
-                continue;
-            }
+            // Keep existing Y cull (even though grid is XZ).
+            if (b.maxY < segMinY || b.minY > segMaxY) continue;
 
             if (aabbContainsPoint(b, pivotX, pivotY, pivotZ)) continue;
 

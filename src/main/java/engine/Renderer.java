@@ -8,14 +8,13 @@ import objects.GameObject;
 import util.AABB;
 import util.Vector3;
 
-import java.awt.Graphics2D;
-import java.awt.RenderingHints;
-import java.awt.Color;
+import java.awt.*;
 import java.awt.image.BufferedImage;
 import java.awt.image.DataBufferInt;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Deque;
 import java.util.List;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -57,14 +56,12 @@ public class Renderer {
     public boolean isFxaaEnabled() { return fxaaEnabled; }
     public void setFxaaEnabled(boolean enabled) { this.fxaaEnabled = enabled; }
 
-    // Per-object temporary vertex buffers (camera-space)
     private double[] vx = new double[0];
     private double[] vy = new double[0];
     private double[] vz = new double[0];
     private double[] uu = new double[0];
     private double[] vv = new double[0];
 
-    // Clipping temporaries (single-thread, used only during triangle build)
     private final double[] cax = new double[4], cay = new double[4], caz = new double[4], cau = new double[4], cav = new double[4];
     private final double[] cbx = new double[4], cby = new double[4], cbz = new double[4], cbu = new double[4], cbv = new double[4];
 
@@ -83,13 +80,9 @@ public class Renderer {
 
     private boolean[] shadowedPerLight = new boolean[0];
 
-    // -----------------------------
-    // Parallel render infrastructure
-    // -----------------------------
     private final ExecutorService renderPool;
     private final int maxWorkers;
 
-    // Triangle batch buffers (screen-space)
     private int triCount = 0;
     private double[] tX0 = new double[0], tY0 = new double[0], tX1 = new double[0], tY1 = new double[0], tX2 = new double[0], tY2 = new double[0];
     private float[]  tIZ0 = new float[0],  tIZ1 = new float[0],  tIZ2 = new float[0];
@@ -98,22 +91,24 @@ public class Renderer {
     private Texture[]      tTex = new Texture[0];
     private Texture.Wrap[] tWrap = new Texture.Wrap[0];
 
-    // packed RGB (0x00RRGGBB)
     private int[] tTint = new int[0];
     private int[] tShade = new int[0];
     private int[] tEmi = new int[0];
 
-    private byte[] tDoubleSided = new byte[0]; // 1 = true
+    private byte[] tDoubleSided = new byte[0];
 
-    // Precomputed bounding boxes for quick slice rejection
     private int[] tMinX = new int[0], tMaxX = new int[0], tMinY = new int[0], tMaxY = new int[0];
+
+
+    private final ArrayList<GameObject> nearbyRenderables = new ArrayList<>(4096);
+    private final ArrayList<GameObject> nearbyOccludersQ  = new ArrayList<>(4096);
+    private final ArrayList<GameObject> renderRoots       = new ArrayList<>(4096);
 
     public Renderer(Camera camera, GameEngine gameEngine) {
         this.camera = camera;
         this.gameEngine = gameEngine;
 
-        int cores = Runtime.getRuntime().availableProcessors();
-        int threads = Integer.getInteger("engine.render.threads", cores);
+        int threads = Runtime.getRuntime().availableProcessors();
         threads = Math.max(1, Math.min(threads, 64));
         this.maxWorkers = threads;
 
@@ -123,7 +118,7 @@ public class Renderer {
             @Override public Thread newThread(Runnable r) {
                 Thread t = base.newThread(r);
                 t.setName("RenderWorker-" + idx.getAndIncrement());
-                t.setDaemon(true); // do not block JVM shutdown
+                t.setDaemon(true);
                 t.setPriority(Thread.NORM_PRIORITY);
                 return t;
             }
@@ -139,12 +134,11 @@ public class Renderer {
         this.renderScale = renderScale;
     }
 
-    /** Optional (not required). */
     public void shutdown() {
         renderPool.shutdownNow();
     }
 
-    public void render(Graphics2D g2d, List<GameObject> gameObjects, int windowW, int windowH) {
+    public void render(Graphics2D g2d, List<GameObject> roots, int windowW, int windowH) {
         updateTrigIfNeeded();
 
         final int width  = Math.max(1, (int) Math.round(windowW * renderScale));
@@ -152,8 +146,6 @@ public class Renderer {
 
         ensureBuffers(width, height);
         ensureSkyCache(height);
-
-        gatherLightsAndOccluders(gameObjects);
 
         final double fov = gameEngine.getFovRadians();
         final double tanHalfFov = Math.tan(0.5 * fov);
@@ -164,10 +156,15 @@ public class Renderer {
         final double camY = camera.getViewY();
         final double camZ = camera.getViewZ();
 
-        // Build triangle batch (single-thread)
-        buildTriangleBatch(gameObjects, width, height, f, far, camX, camY, camZ);
 
-        // Parallel background fill + z-clear + raster per disjoint Y slices
+        buildNearbyRootLists(roots, camX, camZ, far);
+
+
+        gatherLightsAndOccluders(roots, nearbyOccludersQ, camX, camY, camZ, far);
+
+
+        buildTriangleBatch(renderRoots, width, height, f, far, tanHalfFov, camX, camY, camZ);
+
         final int workers = Math.max(1, Math.min(maxWorkers, height));
         if (workers == 1) {
             renderSlice(0, height, width, height);
@@ -208,26 +205,54 @@ public class Renderer {
         g2d.drawImage(frameBuffer, 0, 0, windowW, windowH, null);
     }
 
-    // Each worker owns [yStart, yEnd) rows => NO races on pixels/zBuffer.
+    private void buildNearbyRootLists(List<GameObject> roots, double camX, double camZ, double far) {
+        nearbyRenderables.clear();
+        nearbyOccludersQ.clear();
+        renderRoots.clear();
+
+
+        final double pad = 8.0;
+
+        double minX = camX - far - pad;
+        double maxX = camX + far + pad;
+        double minZ = camZ - far - pad;
+        double maxZ = camZ + far + pad;
+
+
+        gameEngine.queryNearbyRenderablesXZ(minX, maxX, minZ, maxZ, nearbyRenderables);
+
+
+        gameEngine.queryNearbyCollidersXZ(minX, maxX, minZ, maxZ, nearbyOccludersQ);
+
+
+        GameObject pb = gameEngine.getPlayerBody();
+        if (pb != null) renderRoots.add(pb);
+
+
+        for (int i = 0; i < nearbyRenderables.size(); i++) {
+            GameObject g = nearbyRenderables.get(i);
+            if (g == null || !g.isActive() || !g.isVisible()) continue;
+            if (g == pb) continue;
+            renderRoots.add(g);
+        }
+    }
+
     private void renderSlice(int yStart, int yEnd, int width, int height) {
-        // z clear for entire slice (contiguous)
         int startIdx = yStart * width;
         int endIdx = yEnd * width;
         Arrays.fill(zBuffer, startIdx, endIdx, Float.NEGATIVE_INFINITY);
 
-        // sky fill for slice rows
         for (int y = yStart; y < yEnd; y++) {
             int c = skyRowColors[y];
             int row = y * width;
             Arrays.fill(pixels, row, row + width, c);
         }
 
-        // rasterize all triangles that overlap this slice
         final int n = triCount;
         for (int i = 0; i < n; i++) {
             int minY = tMinY[i];
             int maxY = tMaxY[i];
-            if (maxY < yStart || minY >= yEnd) continue; // no overlap
+            if (maxY < yStart || minY >= yEnd) continue;
 
             rasterizeTriangleTopLeftSlice(
                     tX0[i], tY0[i], tIZ0[i], tUOZ0[i], tVOZ0[i],
@@ -258,10 +283,24 @@ public class Renderer {
         }
     }
 
-    private void gatherLightsAndOccluders(List<GameObject> roots) {
+    private void gatherLightsAndOccluders(List<GameObject> roots,
+                                          List<GameObject> nearbyOccluders,
+                                          double camX, double camY, double camZ,
+                                          double far) {
         frameLights.clear();
         solidOccluders.clear();
         emissiveUsed = 0;
+
+
+        if (nearbyOccluders != null) {
+            for (int i = 0; i < nearbyOccluders.size(); i++) {
+                GameObject g = nearbyOccluders.get(i);
+                if (g == null || !g.isActive() || !g.isVisible()) continue;
+                if (!g.isFull()) continue;
+                solidOccluders.add(g);
+            }
+        }
+
 
         gatherStack.clear();
         if (roots != null) {
@@ -272,29 +311,43 @@ public class Renderer {
             GameObject g = gatherStack.pop();
             if (g == null || !g.isActive()) continue;
 
-            if (g.isFull()) solidOccluders.add(g);
 
             if (g instanceof objects.lighting.LightObject lo) {
                 LightData ld = lo.getLight();
-                if (ld != null && ld.strength > 0.0) frameLights.add(ld);
+                if (ld != null && ld.strength > 0.0) {
+                    if (ld.type == LightType.DIRECTIONAL) {
+                        frameLights.add(ld);
+                    } else {
+                        double dx = ld.x - camX, dy = ld.y - camY, dz = ld.z - camZ;
+                        double max = far + Math.max(0.0, ld.range);
+                        if ((dx*dx + dy*dy + dz*dz) <= (max * max)) {
+                            frameLights.add(ld);
+                        }
+                    }
+                }
             }
+
 
             Material m = g.getMaterial();
             if (m != null && m.getEmissiveStrength() > 0.0 && m.getEmissiveRange() > 0.0) {
-                LightData ld = acquireEmissiveLight();
                 Vector3 wp = g.getWorldPosition();
+                double dx = wp.x - camX, dy = wp.y - camY, dz = wp.z - camZ;
+                double max = far + m.getEmissiveRange();
+                if ((dx*dx + dy*dy + dz*dz) <= (max * max)) {
+                    LightData ld = acquireEmissiveLight();
 
-                ld.type = LightType.POINT;
-                ld.x = wp.x; ld.y = wp.y; ld.z = wp.z;
-                ld.setColor(m.getEmissiveColor());
-                ld.strength = m.getEmissiveStrength();
-                ld.range = m.getEmissiveRange();
-                ld.attLinear = 0.0;
-                ld.attQuadratic = 1.0;
-                ld.shadows = true;
-                ld.owner = g;
+                    ld.type = LightType.POINT;
+                    ld.x = wp.x; ld.y = wp.y; ld.z = wp.z;
+                    ld.setColor(m.getEmissiveColor());
+                    ld.strength = m.getEmissiveStrength();
+                    ld.range = m.getEmissiveRange();
+                    ld.attLinear = 0.0;
+                    ld.attQuadratic = 1.0;
+                    ld.shadows = true;
+                    ld.owner = g;
 
-                frameLights.add(ld);
+                    frameLights.add(ld);
+                }
             }
 
             List<GameObject> kids = g.getChildren();
@@ -399,14 +452,63 @@ public class Renderer {
         return (oA << 24) | (oR << 16) | (oG << 8) | oB;
     }
 
-    // -----------------------------
-    // Triangle batch build (single thread)
-    // -----------------------------
+
+    private boolean passesObjectCull(GameObject go,
+                                     double camX, double camY, double camZ,
+                                     double far,
+                                     double tanHalfFovX, double tanHalfFovY) {
+
+        if (go == null) return false;
+
+        AABB aabb = go.getWorldAABB();
+        double cxw = 0.5 * (aabb.minX + aabb.maxX);
+        double cyw = 0.5 * (aabb.minY + aabb.maxY);
+        double czw = 0.5 * (aabb.minZ + aabb.maxZ);
+
+        double hx = 0.5 * (aabb.maxX - aabb.minX);
+        double hy = 0.5 * (aabb.maxY - aabb.minY);
+        double hz = 0.5 * (aabb.maxZ - aabb.minZ);
+        double r = Math.sqrt(hx*hx + hy*hy + hz*hz);
+
+
+        double wx = cxw - camX;
+        double wy = cyw - camY;
+        double wz0 = czw - camZ;
+
+
+        double xr =  wx * cy + wz0 * sy;
+        double zr = -wx * sy + wz0 * cy;
+
+
+        double yr =  wy * cp + zr * sp;
+        double zf = -wy * sp + zr * cp;
+
+
+        if (zf + r <= 0.0) return false;
+
+
+        if (zf - r >= far) return false;
+
+
+        double maxX = zf * tanHalfFovX + r;
+        if (xr < -maxX || xr > maxX) return false;
+
+        double maxY = zf * tanHalfFovY + r;
+        if (yr < -maxY || yr > maxY) return false;
+
+        return true;
+    }
+
     private void buildTriangleBatch(List<GameObject> gameObjects,
                                     int width, int height,
                                     double f, double far,
+                                    double tanHalfFovX,
                                     double camX, double camY, double camZ) {
+
         triCount = 0;
+
+
+        final double tanHalfFovY = tanHalfFovX * (height / (double) width);
 
         final GameObject playerBody = gameEngine.getPlayerBody();
 
@@ -422,9 +524,15 @@ public class Renderer {
             boolean isPlayerFamily = (playerBody != null) && isDescendantOrSelf(go, playerBody);
             if (camera.isFirstPerson() && isPlayerFamily) continue;
 
+
             List<GameObject> kids = go.getChildren();
             if (kids != null && !kids.isEmpty()) {
                 for (int i = kids.size() - 1; i >= 0; i--) stack.push(kids.get(i));
+            }
+
+
+            if (!passesObjectCull(go, camX, camY, camZ, far, tanHalfFovX, tanHalfFovY)) {
+                continue;
             }
 
             double[][] wverts = go.getTransformedVertices();
@@ -461,7 +569,6 @@ public class Renderer {
             final double thisNear = treatAsPlayer ? Math.max(NEAR, BODY_NEAR_PAD) : NEAR;
             final double thisBias = treatAsPlayer ? BODY_Z_BIAS : 0.0;
 
-            // Transform vertices to camera-space
             for (int i = 0; i < wverts.length; i++) {
                 double[] w = wverts[i];
                 double wx = w[0] - camX;
@@ -489,7 +596,6 @@ public class Renderer {
                 vv[i] = v;
             }
 
-            // Shadows per object
             int lightCount = frameLights.size();
             ensureShadowFlags(lightCount);
 
@@ -557,7 +663,6 @@ public class Renderer {
                 }
             }
 
-            // Faces -> triangles
             for (int[] face : facesArr) {
                 if (face == null || face.length != 3) continue;
                 int i0 = face[0], i1 = face[1], i2 = face[2];
@@ -834,9 +939,6 @@ public class Renderer {
         tMinY[idx] = minY; tMaxY[idx] = maxY;
     }
 
-    // -----------------------------
-    // Parallel-safe rasterization (slice clamped)
-    // -----------------------------
     private void rasterizeTriangleTopLeftSlice(
             double x0, double y0, float iz0, float uoz0, float voz0,
             double x1, double y1, float iz1, float uoz1, float voz1,
@@ -854,7 +956,6 @@ public class Renderer {
         if (areaSigned < 0.0) {
             if (!doubleSided) return;
 
-            // flip winding (swap 1 and 2)
             double tx = x1; x1 = x2; x2 = tx;
             double ty = y1; y1 = y2; y2 = ty;
 
