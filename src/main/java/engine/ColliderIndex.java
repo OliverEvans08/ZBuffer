@@ -8,6 +8,8 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.IdentityHashMap;
 import java.util.List;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 public final class ColliderIndex {
 
@@ -21,7 +23,14 @@ public final class ColliderIndex {
 
     private final ArrayList<GameObject> colliders = new ArrayList<>();
 
-    private final IdentityHashMap<GameObject, Boolean> visited = new IdentityHashMap<>();
+    // Thread-safe read/write between update thread (sync/remove) and render thread (query)
+    private final ReentrantReadWriteLock rw = new ReentrantReadWriteLock();
+    private final Lock r = rw.readLock();
+    private final Lock w = rw.writeLock();
+
+    // Per-thread "visited" so concurrent queries don't fight over a shared IdentityHashMap
+    private final ThreadLocal<IdentityHashMap<GameObject, Boolean>> visitedTL =
+            ThreadLocal.withInitial(() -> new IdentityHashMap<>(512));
 
     private static final class Entry {
         int minCX, maxCX;
@@ -34,91 +43,116 @@ public final class ColliderIndex {
     }
 
     public List<GameObject> getColliders() {
-        return Collections.unmodifiableList(colliders);
+        // snapshot to avoid exposing internal mutable list across threads
+        r.lock();
+        try {
+            return Collections.unmodifiableList(new ArrayList<>(colliders));
+        } finally {
+            r.unlock();
+        }
     }
 
     public void clear() {
-        cells.clear();
-        entries.clear();
-        colliders.clear();
-        visited.clear();
+        w.lock();
+        try {
+            cells.clear();
+            entries.clear();
+            colliders.clear();
+        } finally {
+            w.unlock();
+        }
     }
 
-    /**
-     * Explicit removal (needed when an object is removed from the world but remains 'full').
-     */
     public void remove(GameObject obj) {
         if (obj == null) return;
-        Entry e = entries.remove(obj);
-        if (e != null) {
-            removeFromCells(obj, e);
+        w.lock();
+        try {
+            Entry e = entries.remove(obj);
+            if (e != null) {
+                removeFromCells(obj, e);
+            }
+            colliders.remove(obj);
+        } finally {
+            w.unlock();
         }
-        colliders.remove(obj);
     }
 
     public void sync(GameObject obj) {
         if (obj == null) return;
 
-        if (!obj.isFull()) {
-            remove(obj);
-            return;
-        }
+        w.lock();
+        try {
+            if (!obj.isFull()) {
+                remove(obj);
+                return;
+            }
 
-        AABB b = obj.getWorldAABB();
-        int nMinCX = cellMin(b.minX);
-        int nMaxCX = cellMax(b.maxX);
-        int nMinCZ = cellMin(b.minZ);
-        int nMaxCZ = cellMax(b.maxZ);
+            AABB b = obj.getWorldAABB();
+            int nMinCX = cellMin(b.minX);
+            int nMaxCX = cellMax(b.maxX);
+            int nMinCZ = cellMin(b.minZ);
+            int nMaxCZ = cellMax(b.maxZ);
 
-        if (nMaxCX < nMinCX) nMaxCX = nMinCX;
-        if (nMaxCZ < nMinCZ) nMaxCZ = nMinCZ;
+            if (nMaxCX < nMinCX) nMaxCX = nMinCX;
+            if (nMaxCZ < nMinCZ) nMaxCZ = nMinCZ;
 
-        Entry e = entries.get(obj);
-        if (e == null) {
-            e = new Entry();
+            Entry e = entries.get(obj);
+            if (e == null) {
+                e = new Entry();
+                e.minCX = nMinCX; e.maxCX = nMaxCX;
+                e.minCZ = nMinCZ; e.maxCZ = nMaxCZ;
+                entries.put(obj, e);
+                addToCells(obj, e);
+                colliders.add(obj);
+                return;
+            }
+
+            if (e.minCX == nMinCX && e.maxCX == nMaxCX && e.minCZ == nMinCZ && e.maxCZ == nMaxCZ) {
+                return;
+            }
+
+            removeFromCells(obj, e);
             e.minCX = nMinCX; e.maxCX = nMaxCX;
             e.minCZ = nMinCZ; e.maxCZ = nMaxCZ;
-            entries.put(obj, e);
             addToCells(obj, e);
-            colliders.add(obj);
-            return;
-        }
 
-        if (e.minCX == nMinCX && e.maxCX == nMaxCX && e.minCZ == nMinCZ && e.maxCZ == nMaxCZ) {
-            return;
+        } finally {
+            w.unlock();
         }
-
-        removeFromCells(obj, e);
-        e.minCX = nMinCX; e.maxCX = nMaxCX;
-        e.minCZ = nMinCZ; e.maxCZ = nMaxCZ;
-        addToCells(obj, e);
     }
 
     public void queryXZ(double minX, double maxX, double minZ, double maxZ, ArrayList<GameObject> out) {
         out.clear();
+
+        final IdentityHashMap<GameObject, Boolean> visited = visitedTL.get();
         visited.clear();
 
-        int qMinCX = cellMin(Math.min(minX, maxX));
-        int qMaxCX = cellMax(Math.max(minX, maxX));
-        int qMinCZ = cellMin(Math.min(minZ, maxZ));
-        int qMaxCZ = cellMax(Math.max(minZ, maxZ));
+        r.lock();
+        try {
+            int qMinCX = cellMin(Math.min(minX, maxX));
+            int qMaxCX = cellMax(Math.max(minX, maxX));
+            int qMinCZ = cellMin(Math.min(minZ, maxZ));
+            int qMaxCZ = cellMax(Math.max(minZ, maxZ));
 
-        if (qMaxCX < qMinCX) qMaxCX = qMinCX;
-        if (qMaxCZ < qMinCZ) qMaxCZ = qMinCZ;
+            if (qMaxCX < qMinCX) qMaxCX = qMinCX;
+            if (qMaxCZ < qMinCZ) qMaxCZ = qMinCZ;
 
-        for (int cx = qMinCX; cx <= qMaxCX; cx++) {
-            for (int cz = qMinCZ; cz <= qMaxCZ; cz++) {
-                ArrayList<GameObject> bucket = cells.get(key(cx, cz));
-                if (bucket == null) continue;
+            for (int cx = qMinCX; cx <= qMaxCX; cx++) {
+                for (int cz = qMinCZ; cz <= qMaxCZ; cz++) {
+                    ArrayList<GameObject> bucket = cells.get(key(cx, cz));
+                    if (bucket == null) continue;
 
-                for (int i = 0; i < bucket.size(); i++) {
-                    GameObject g = bucket.get(i);
-                    if (g == null) continue;
-                    if (visited.put(g, Boolean.TRUE) == null) {
-                        out.add(g);
+                    for (int i = 0; i < bucket.size(); i++) {
+                        GameObject g = bucket.get(i);
+                        if (g == null) continue;
+                        if (visited.put(g, Boolean.TRUE) == null) {
+                            out.add(g);
+                        }
                     }
                 }
             }
+        } finally {
+            r.unlock();
         }
     }
 

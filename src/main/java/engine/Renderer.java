@@ -56,33 +56,22 @@ public class Renderer {
     public boolean isFxaaEnabled() { return fxaaEnabled; }
     public void setFxaaEnabled(boolean enabled) { this.fxaaEnabled = enabled; }
 
-    private double[] vx = new double[0];
-    private double[] vy = new double[0];
-    private double[] vz = new double[0];
-    private double[] uu = new double[0];
-    private double[] vv = new double[0];
-
-    private final double[] cax = new double[4], cay = new double[4], caz = new double[4], cau = new double[4], cav = new double[4];
-    private final double[] cbx = new double[4], cby = new double[4], cbz = new double[4], cbu = new double[4], cbv = new double[4];
-
+    // Per-frame lists
     private final ArrayList<LightData> frameLights = new ArrayList<>();
     private final ArrayList<GameObject> solidOccluders = new ArrayList<>();
-
-    private final ArrayList<LightData> emissivePool = new ArrayList<>();
-    private int emissiveUsed = 0;
-
-    private final ArrayDeque<GameObject> stack = new ArrayDeque<>();
-    private final ArrayDeque<GameObject> gatherStack = new ArrayDeque<>();
 
     private GameObject[] occluderObjs = new GameObject[0];
     private AABB[] occluderAabbs = new AABB[0];
     private int occluderCount = 0;
 
-    private boolean[] shadowedPerLight = new boolean[0];
+    // Snapshot arrays used by worker threads during geometry/lighting build
+    private LightData[] frameLightArr = new LightData[0];
+    private int frameLightCount = 0;
 
     private final ExecutorService renderPool;
     private final int maxWorkers;
 
+    // Final triangle batch arrays (consumed by rasterization slices)
     private int triCount = 0;
     private double[] tX0 = new double[0], tY0 = new double[0], tX1 = new double[0], tY1 = new double[0], tX2 = new double[0], tY2 = new double[0];
     private float[]  tIZ0 = new float[0],  tIZ1 = new float[0],  tIZ2 = new float[0];
@@ -99,18 +88,20 @@ public class Renderer {
 
     private int[] tMinX = new int[0], tMaxX = new int[0], tMinY = new int[0], tMaxY = new int[0];
 
-
+    // Reused query buffers
     private final ArrayList<GameObject> nearbyRenderables = new ArrayList<>(4096);
     private final ArrayList<GameObject> nearbyOccludersQ  = new ArrayList<>(4096);
     private final ArrayList<GameObject> renderRoots       = new ArrayList<>(4096);
+
+    // Worker contexts (allocated once, reused)
+    private WorkerContext[] workerCtx = new WorkerContext[0];
 
     public Renderer(Camera camera, GameEngine gameEngine) {
         this.camera = camera;
         this.gameEngine = gameEngine;
 
-        int threads = Runtime.getRuntime().availableProcessors();
-        threads = Math.max(1, Math.min(threads, 64));
-        this.maxWorkers = threads;
+        int threads = Runtime.getRuntime().availableProcessors(); // max cores/max threads
+        this.maxWorkers = Math.max(1, threads);
 
         ThreadFactory tf = new ThreadFactory() {
             private final ThreadFactory base = Executors.defaultThreadFactory();
@@ -156,15 +147,21 @@ public class Renderer {
         final double camY = camera.getViewY();
         final double camZ = camera.getViewZ();
 
+        // (1) Scene query/object collection (multi-core)
+        buildNearbyRootListsParallel(camX, camZ, far);
 
-        buildNearbyRootLists(roots, camX, camZ, far);
+        // (2) Light + solid occluder collection (multi-core)
+        gatherLightsAndOccludersParallel(roots, nearbyOccludersQ, camX, camY, camZ, far);
 
+        // Snapshot lights for worker threads
+        frameLightCount = frameLights.size();
+        if (frameLightArr.length < frameLightCount) frameLightArr = new LightData[frameLightCount];
+        for (int i = 0; i < frameLightCount; i++) frameLightArr[i] = frameLights.get(i);
 
-        gatherLightsAndOccluders(roots, nearbyOccludersQ, camX, camY, camZ, far);
+        // (3) Geometry setup + per-triangle lighting + per-object shadow checks (multi-core)
+        buildTriangleBatchParallel(renderRoots, width, height, f, far, tanHalfFov, camX, camY, camZ);
 
-
-        buildTriangleBatch(renderRoots, width, height, f, far, tanHalfFov, camX, camY, camZ);
-
+        // (4) Rasterization (already multi-core)
         final int workers = Math.max(1, Math.min(maxWorkers, height));
         if (workers == 1) {
             renderSlice(0, height, width, height);
@@ -205,29 +202,58 @@ public class Renderer {
         g2d.drawImage(frameBuffer, 0, 0, windowW, windowH, null);
     }
 
-    private void buildNearbyRootLists(List<GameObject> roots, double camX, double camZ, double far) {
+    // ----------------------------
+    // Stage 1: scene query / object collection (parallel)
+    // ----------------------------
+    private void buildNearbyRootListsParallel(double camX, double camZ, double far) {
         nearbyRenderables.clear();
         nearbyOccludersQ.clear();
         renderRoots.clear();
 
-
         final double pad = 8.0;
+        final double minX = camX - far - pad;
+        final double maxX = camX + far + pad;
+        final double minZ = camZ - far - pad;
+        final double maxZ = camZ + far + pad;
 
-        double minX = camX - far - pad;
-        double maxX = camX + far + pad;
-        double minZ = camZ - far - pad;
-        double maxZ = camZ + far + pad;
+        if (maxWorkers <= 1) {
+            gameEngine.queryNearbyRenderablesXZ(minX, maxX, minZ, maxZ, nearbyRenderables);
+            gameEngine.queryNearbyCollidersXZ(minX, maxX, minZ, maxZ, nearbyOccludersQ);
+        } else {
+            CountDownLatch latch = new CountDownLatch(2);
+            AtomicReference<Throwable> err = new AtomicReference<>(null);
 
+            renderPool.execute(() -> {
+                try {
+                    gameEngine.queryNearbyRenderablesXZ(minX, maxX, minZ, maxZ, nearbyRenderables);
+                } catch (Throwable t) {
+                    err.compareAndSet(null, t);
+                } finally {
+                    latch.countDown();
+                }
+            });
 
-        gameEngine.queryNearbyRenderablesXZ(minX, maxX, minZ, maxZ, nearbyRenderables);
+            renderPool.execute(() -> {
+                try {
+                    gameEngine.queryNearbyCollidersXZ(minX, maxX, minZ, maxZ, nearbyOccludersQ);
+                } catch (Throwable t) {
+                    err.compareAndSet(null, t);
+                } finally {
+                    latch.countDown();
+                }
+            });
 
+            try { latch.await(); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
 
-        gameEngine.queryNearbyCollidersXZ(minX, maxX, minZ, maxZ, nearbyOccludersQ);
-
+            Throwable t = err.get();
+            if (t != null) {
+                if (t instanceof RuntimeException re) throw re;
+                throw new RuntimeException(t);
+            }
+        }
 
         GameObject pb = gameEngine.getPlayerBody();
         if (pb != null) renderRoots.add(pb);
-
 
         for (int i = 0; i < nearbyRenderables.size(); i++) {
             GameObject g = nearbyRenderables.get(i);
@@ -237,136 +263,125 @@ public class Renderer {
         }
     }
 
-    private void renderSlice(int yStart, int yEnd, int width, int height) {
-        int startIdx = yStart * width;
-        int endIdx = yEnd * width;
-        Arrays.fill(zBuffer, startIdx, endIdx, Float.NEGATIVE_INFINITY);
-
-        for (int y = yStart; y < yEnd; y++) {
-            int c = skyRowColors[y];
-            int row = y * width;
-            Arrays.fill(pixels, row, row + width, c);
-        }
-
-        final int n = triCount;
-        for (int i = 0; i < n; i++) {
-            int minY = tMinY[i];
-            int maxY = tMaxY[i];
-            if (maxY < yStart || minY >= yEnd) continue;
-
-            rasterizeTriangleTopLeftSlice(
-                    tX0[i], tY0[i], tIZ0[i], tUOZ0[i], tVOZ0[i],
-                    tX1[i], tY1[i], tIZ1[i], tUOZ1[i], tVOZ1[i],
-                    tX2[i], tY2[i], tIZ2[i], tUOZ2[i], tVOZ2[i],
-                    tTex[i], tWrap[i],
-                    tTint[i], tShade[i], tEmi[i],
-                    tDoubleSided[i] != 0,
-                    tMinX[i], tMaxX[i], minY, maxY,
-                    yStart, yEnd,
-                    width, height
-            );
-        }
-    }
-
-    private void ensureShadowFlags(int n) {
-        if (shadowedPerLight.length < n) shadowedPerLight = new boolean[n];
-        for (int i = 0; i < n; i++) shadowedPerLight[i] = false;
-    }
-
-    private void ensureSkyCache(int height) {
-        if (skyRowColors.length != height) {
-            skyRowColors = new int[height];
-            for (int y = 0; y < height; y++) {
-                double t = (height <= 1) ? 0.0 : (y / (double) (height - 1));
-                skyRowColors[y] = lerpARGB(SKY_TOP, SKY_BOTTOM, t);
-            }
-        }
-    }
-
-    private void gatherLightsAndOccluders(List<GameObject> roots,
-                                          List<GameObject> nearbyOccluders,
-                                          double camX, double camY, double camZ,
-                                          double far) {
+    // ----------------------------
+    // Stage 2: light + occluder gathering (parallel)
+    // ----------------------------
+    private void gatherLightsAndOccludersParallel(List<GameObject> roots,
+                                                  List<GameObject> nearbyOccluders,
+                                                  double camX, double camY, double camZ,
+                                                  double far) {
         frameLights.clear();
         solidOccluders.clear();
-        emissiveUsed = 0;
 
+        // ---- 2a) Solid occluders filtering in parallel
+        if (nearbyOccluders != null && !nearbyOccluders.isEmpty()) {
+            final int n = nearbyOccluders.size();
+            final int workers = Math.max(1, Math.min(maxWorkers, n));
 
-        if (nearbyOccluders != null) {
-            for (int i = 0; i < nearbyOccluders.size(); i++) {
-                GameObject g = nearbyOccluders.get(i);
-                if (g == null || !g.isActive() || !g.isVisible()) continue;
-                if (!g.isFull()) continue;
-                solidOccluders.add(g);
-            }
-        }
+            if (workers == 1) {
+                for (int i = 0; i < n; i++) {
+                    GameObject g = nearbyOccluders.get(i);
+                    if (g == null || !g.isActive() || !g.isVisible()) continue;
+                    if (!g.isFull()) continue;
+                    solidOccluders.add(g);
+                }
+            } else {
+                @SuppressWarnings("unchecked")
+                ArrayList<GameObject>[] parts = new ArrayList[workers];
+                for (int i = 0; i < workers; i++) parts[i] = new ArrayList<>(512);
 
+                CountDownLatch latch = new CountDownLatch(workers);
+                AtomicReference<Throwable> err = new AtomicReference<>(null);
 
-        gatherStack.clear();
-        if (roots != null) {
-            for (int i = roots.size() - 1; i >= 0; i--) gatherStack.push(roots.get(i));
-        }
+                for (int wi = 0; wi < workers; wi++) {
+                    final int idx = wi;
+                    final int a = (wi * n) / workers;
+                    final int b = ((wi + 1) * n) / workers;
 
-        while (!gatherStack.isEmpty()) {
-            GameObject g = gatherStack.pop();
-            if (g == null || !g.isActive()) continue;
-
-
-            if (g instanceof objects.lighting.LightObject lo) {
-                LightData ld = lo.getLight();
-                if (ld != null && ld.strength > 0.0) {
-                    if (ld.type == LightType.DIRECTIONAL) {
-                        frameLights.add(ld);
-                    } else {
-                        double dx = ld.x - camX, dy = ld.y - camY, dz = ld.z - camZ;
-                        double max = far + Math.max(0.0, ld.range);
-                        if ((dx*dx + dy*dy + dz*dz) <= (max * max)) {
-                            frameLights.add(ld);
+                    renderPool.execute(() -> {
+                        try {
+                            ArrayList<GameObject> out = parts[idx];
+                            for (int i = a; i < b; i++) {
+                                GameObject g = nearbyOccluders.get(i);
+                                if (g == null || !g.isActive() || !g.isVisible()) continue;
+                                if (!g.isFull()) continue;
+                                out.add(g);
+                            }
+                        } catch (Throwable t) {
+                            err.compareAndSet(null, t);
+                        } finally {
+                            latch.countDown();
                         }
-                    }
+                    });
                 }
-            }
 
+                try { latch.await(); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
 
-            Material m = g.getMaterial();
-            if (m != null && m.getEmissiveStrength() > 0.0 && m.getEmissiveRange() > 0.0) {
-                Vector3 wp = g.getWorldPosition();
-                double dx = wp.x - camX, dy = wp.y - camY, dz = wp.z - camZ;
-                double max = far + m.getEmissiveRange();
-                if ((dx*dx + dy*dy + dz*dz) <= (max * max)) {
-                    LightData ld = acquireEmissiveLight();
-
-                    ld.type = LightType.POINT;
-                    ld.x = wp.x; ld.y = wp.y; ld.z = wp.z;
-                    ld.setColor(m.getEmissiveColor());
-                    ld.strength = m.getEmissiveStrength();
-                    ld.range = m.getEmissiveRange();
-                    ld.attLinear = 0.0;
-                    ld.attQuadratic = 1.0;
-                    ld.shadows = true;
-                    ld.owner = g;
-
-                    frameLights.add(ld);
+                Throwable t = err.get();
+                if (t != null) {
+                    if (t instanceof RuntimeException re) throw re;
+                    throw new RuntimeException(t);
                 }
-            }
 
-            List<GameObject> kids = g.getChildren();
-            if (kids != null && !kids.isEmpty()) {
-                for (int i = kids.size() - 1; i >= 0; i--) gatherStack.push(kids.get(i));
+                for (int i = 0; i < workers; i++) solidOccluders.addAll(parts[i]);
+            }
+        }
+
+        // ---- 2b) Light + emissive gathering in parallel over root partitions
+        if (roots != null && !roots.isEmpty()) {
+            final int nRoots = roots.size();
+            final int workers = Math.max(1, Math.min(maxWorkers, nRoots));
+
+            if (workers == 1) {
+                gatherLightsRange(roots, 0, nRoots, camX, camY, camZ, far, frameLights);
+            } else {
+                @SuppressWarnings("unchecked")
+                ArrayList<LightData>[] parts = new ArrayList[workers];
+                for (int i = 0; i < workers; i++) parts[i] = new ArrayList<>(64);
+
+                CountDownLatch latch = new CountDownLatch(workers);
+                AtomicReference<Throwable> err = new AtomicReference<>(null);
+
+                for (int wi = 0; wi < workers; wi++) {
+                    final int idx = wi;
+                    final int a = (wi * nRoots) / workers;
+                    final int b = ((wi + 1) * nRoots) / workers;
+
+                    renderPool.execute(() -> {
+                        try {
+                            gatherLightsRange(roots, a, b, camX, camY, camZ, far, parts[idx]);
+                        } catch (Throwable t) {
+                            err.compareAndSet(null, t);
+                        } finally {
+                            latch.countDown();
+                        }
+                    });
+                }
+
+                try { latch.await(); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
+
+                Throwable t = err.get();
+                if (t != null) {
+                    if (t instanceof RuntimeException re) throw re;
+                    throw new RuntimeException(t);
+                }
+
+                for (int i = 0; i < workers; i++) frameLights.addAll(parts[i]);
             }
         }
 
         if (frameLights.isEmpty()) {
-            LightData fallback = acquireEmissiveLight();
+            LightData fallback = new LightData();
             fallback.type = LightType.DIRECTIONAL;
             fallback.setDirection(new Vector3(-0.35, -0.85, 0.40));
-            fallback.setColor(Color.WHITE);
+            fallback.setColor(java.awt.Color.WHITE);
             fallback.strength = 0.6;
             fallback.shadows = false;
             fallback.owner = null;
             frameLights.add(fallback);
         }
 
+        // Snapshot occluder arrays
         occluderCount = solidOccluders.size();
         if (occluderObjs.length < occluderCount) occluderObjs = new GameObject[occluderCount];
         if (occluderAabbs.length < occluderCount) occluderAabbs = new AABB[occluderCount];
@@ -378,14 +393,63 @@ public class Renderer {
         }
     }
 
-    private LightData acquireEmissiveLight() {
-        if (emissiveUsed < emissivePool.size()) {
-            return emissivePool.get(emissiveUsed++);
+    private void gatherLightsRange(List<GameObject> roots, int start, int end,
+                                   double camX, double camY, double camZ,
+                                   double far,
+                                   ArrayList<LightData> outLights) {
+        final ArrayDeque<GameObject> stack = new ArrayDeque<>(256);
+
+        for (int i = end - 1; i >= start; i--) {
+            GameObject r = roots.get(i);
+            if (r != null) stack.push(r);
         }
-        LightData l = new LightData();
-        emissivePool.add(l);
-        emissiveUsed++;
-        return l;
+
+        while (!stack.isEmpty()) {
+            GameObject g = stack.pop();
+            if (g == null || !g.isActive()) continue;
+
+            // LightObjects
+            if (g instanceof objects.lighting.LightObject lo) {
+                LightData ld = lo.getLight();
+                if (ld != null && ld.strength > 0.0) {
+                    if (ld.type == LightType.DIRECTIONAL) {
+                        outLights.add(ld);
+                    } else {
+                        double dx = ld.x - camX, dy = ld.y - camY, dz = ld.z - camZ;
+                        double max = far + Math.max(0.0, ld.range);
+                        if ((dx*dx + dy*dy + dz*dz) <= (max * max)) {
+                            outLights.add(ld);
+                        }
+                    }
+                }
+            }
+
+            // Emissive -> create a LightData (no shared pool contention)
+            Material m = g.getMaterial();
+            if (m != null && m.getEmissiveStrength() > 0.0 && m.getEmissiveRange() > 0.0) {
+                Vector3 wp = g.getWorldPosition();
+                double dx = wp.x - camX, dy = wp.y - camY, dz = wp.z - camZ;
+                double max = far + m.getEmissiveRange();
+                if ((dx*dx + dy*dy + dz*dz) <= (max * max)) {
+                    LightData ld = new LightData();
+                    ld.type = LightType.POINT;
+                    ld.x = wp.x; ld.y = wp.y; ld.z = wp.z;
+                    ld.setColor(m.getEmissiveColor());
+                    ld.strength = m.getEmissiveStrength();
+                    ld.range = m.getEmissiveRange();
+                    ld.attLinear = 0.0;
+                    ld.attQuadratic = 1.0;
+                    ld.shadows = true;
+                    ld.owner = g;
+                    outLights.add(ld);
+                }
+            }
+
+            List<GameObject> kids = g.getChildren();
+            if (kids != null && !kids.isEmpty()) {
+                for (int i = kids.size() - 1; i >= 0; i--) stack.push(kids.get(i));
+            }
+        }
     }
 
     private static double softRangeFade(double dist, double range) {
@@ -405,116 +469,140 @@ public class Renderer {
         return false;
     }
 
-    private void updateTrigIfNeeded() {
-        double vyaw = camera.getViewYaw();
-        double vpitch = camera.getViewPitch();
-
-        if (!valuesCached || vyaw != cachedYaw || vpitch != cachedPitch) {
-            cachedYaw = vyaw;
-            cachedPitch = vpitch;
-            cy = Math.cos(cachedYaw);
-            sy = Math.sin(cachedYaw);
-            cp = Math.cos(cachedPitch);
-            sp = Math.sin(cachedPitch);
-            valuesCached = true;
-        }
-    }
-
-    private void ensureBuffers(int width, int height) {
-        if (frameBuffer == null || width != fbW || height != fbH) {
-            frameBuffer = new BufferedImage(width, height, BufferedImage.TYPE_INT_ARGB);
-            pixels = ((DataBufferInt) frameBuffer.getRaster().getDataBuffer()).getData();
-            zBuffer = new float[width * height];
-            fbW = width;
-            fbH = height;
-        }
-    }
-
-    private void ensureTemps(int n) {
-        if (vx.length < n) {
-            vx = new double[n];
-            vy = new double[n];
-            vz = new double[n];
-            uu = new double[n];
-            vv = new double[n];
-        }
-    }
-
-    private static int lerpARGB(int a, int b, double t) {
-        if (t < 0) t = 0;
-        if (t > 1) t = 1;
-        int aA = (a >>> 24) & 255, aR = (a >>> 16) & 255, aG = (a >>> 8) & 255, aB = a & 255;
-        int bA = (b >>> 24) & 255, bR = (b >>> 16) & 255, bG = (b >>> 8) & 255, bB = b & 255;
-        int oA = (int) (aA + (bA - aA) * t + 0.5);
-        int oR = (int) (aR + (bR - aR) * t + 0.5);
-        int oG = (int) (aG + (bG - aG) * t + 0.5);
-        int oB = (int) (aB + (bB - aB) * t + 0.5);
-        return (oA << 24) | (oR << 16) | (oG << 8) | oB;
-    }
-
-
-    private boolean passesObjectCull(GameObject go,
-                                     double camX, double camY, double camZ,
-                                     double far,
-                                     double tanHalfFovX, double tanHalfFovY) {
-
-        if (go == null) return false;
-
-        AABB aabb = go.getWorldAABB();
-        double cxw = 0.5 * (aabb.minX + aabb.maxX);
-        double cyw = 0.5 * (aabb.minY + aabb.maxY);
-        double czw = 0.5 * (aabb.minZ + aabb.maxZ);
-
-        double hx = 0.5 * (aabb.maxX - aabb.minX);
-        double hy = 0.5 * (aabb.maxY - aabb.minY);
-        double hz = 0.5 * (aabb.maxZ - aabb.minZ);
-        double r = Math.sqrt(hx*hx + hy*hy + hz*hz);
-
-
-        double wx = cxw - camX;
-        double wy = cyw - camY;
-        double wz0 = czw - camZ;
-
-
-        double xr =  wx * cy + wz0 * sy;
-        double zr = -wx * sy + wz0 * cy;
-
-
-        double yr =  wy * cp + zr * sp;
-        double zf = -wy * sp + zr * cp;
-
-
-        if (zf + r <= 0.0) return false;
-
-
-        if (zf - r >= far) return false;
-
-
-        double maxX = zf * tanHalfFovX + r;
-        if (xr < -maxX || xr > maxX) return false;
-
-        double maxY = zf * tanHalfFovY + r;
-        if (yr < -maxY || yr > maxY) return false;
-
-        return true;
-    }
-
-    private void buildTriangleBatch(List<GameObject> gameObjects,
-                                    int width, int height,
-                                    double f, double far,
-                                    double tanHalfFovX,
-                                    double camX, double camY, double camZ) {
-
+    // ----------------------------
+    // Stage 3: geometry + per-triangle lighting + shadows (parallel)
+    // ----------------------------
+    private void buildTriangleBatchParallel(List<GameObject> topLevel,
+                                            int width, int height,
+                                            double f, double far,
+                                            double tanHalfFovX,
+                                            double camX, double camY, double camZ) {
         triCount = 0;
-
+        if (topLevel == null || topLevel.isEmpty()) return;
 
         final double tanHalfFovY = tanHalfFovX * (height / (double) width);
-
         final GameObject playerBody = gameEngine.getPlayerBody();
 
+        // Worker count based on number of top-level roots to process
+        final int n = topLevel.size();
+        final int workers = Math.max(1, Math.min(maxWorkers, n));
+
+        ensureWorkerContexts(workers);
+
+        if (workers == 1) {
+            workerCtx[0].batch.reset();
+            buildTrianglesRange(workerCtx[0], topLevel, 0, n,
+                    width, height, f, far, tanHalfFovX, tanHalfFovY, camX, camY, camZ, playerBody);
+            mergeWorkerBatches(1);
+            return;
+        }
+
+        CountDownLatch latch = new CountDownLatch(workers);
+        AtomicReference<Throwable> err = new AtomicReference<>(null);
+
+        for (int wi = 0; wi < workers; wi++) {
+            final int idx = wi;
+            final int a = (wi * n) / workers;
+            final int b = ((wi + 1) * n) / workers;
+
+            workerCtx[idx].batch.reset();
+
+            renderPool.execute(() -> {
+                try {
+                    buildTrianglesRange(workerCtx[idx], topLevel, a, b,
+                            width, height, f, far, tanHalfFovX, tanHalfFovY, camX, camY, camZ, playerBody);
+                } catch (Throwable t) {
+                    err.compareAndSet(null, t);
+                } finally {
+                    latch.countDown();
+                }
+            });
+        }
+
+        try { latch.await(); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
+
+        Throwable t = err.get();
+        if (t != null) {
+            if (t instanceof RuntimeException re) throw re;
+            throw new RuntimeException(t);
+        }
+
+        mergeWorkerBatches(workers);
+    }
+
+    private void ensureWorkerContexts(int workers) {
+        if (workerCtx.length < workers) {
+            WorkerContext[] nc = new WorkerContext[workers];
+            System.arraycopy(workerCtx, 0, nc, 0, workerCtx.length);
+            for (int i = workerCtx.length; i < workers; i++) nc[i] = new WorkerContext();
+            workerCtx = nc;
+        }
+    }
+
+    private void mergeWorkerBatches(int workers) {
+        int total = 0;
+        for (int i = 0; i < workers; i++) total += workerCtx[i].batch.count;
+
+        ensureTriCapacity(total);
+        int off = 0;
+
+        for (int i = 0; i < workers; i++) {
+            TriBatch b = workerCtx[i].batch;
+            int c = b.count;
+            if (c <= 0) continue;
+
+            System.arraycopy(b.tX0, 0, tX0, off, c);
+            System.arraycopy(b.tY0, 0, tY0, off, c);
+            System.arraycopy(b.tX1, 0, tX1, off, c);
+            System.arraycopy(b.tY1, 0, tY1, off, c);
+            System.arraycopy(b.tX2, 0, tX2, off, c);
+            System.arraycopy(b.tY2, 0, tY2, off, c);
+
+            System.arraycopy(b.tIZ0, 0, tIZ0, off, c);
+            System.arraycopy(b.tIZ1, 0, tIZ1, off, c);
+            System.arraycopy(b.tIZ2, 0, tIZ2, off, c);
+
+            System.arraycopy(b.tUOZ0, 0, tUOZ0, off, c);
+            System.arraycopy(b.tVOZ0, 0, tVOZ0, off, c);
+            System.arraycopy(b.tUOZ1, 0, tUOZ1, off, c);
+            System.arraycopy(b.tVOZ1, 0, tVOZ1, off, c);
+            System.arraycopy(b.tUOZ2, 0, tUOZ2, off, c);
+            System.arraycopy(b.tVOZ2, 0, tVOZ2, off, c);
+
+            System.arraycopy(b.tTex, 0, tTex, off, c);
+            System.arraycopy(b.tWrap, 0, tWrap, off, c);
+
+            System.arraycopy(b.tTint, 0, tTint, off, c);
+            System.arraycopy(b.tShade, 0, tShade, off, c);
+            System.arraycopy(b.tEmi, 0, tEmi, off, c);
+
+            System.arraycopy(b.tDoubleSided, 0, tDoubleSided, off, c);
+
+            System.arraycopy(b.tMinX, 0, tMinX, off, c);
+            System.arraycopy(b.tMaxX, 0, tMaxX, off, c);
+            System.arraycopy(b.tMinY, 0, tMinY, off, c);
+            System.arraycopy(b.tMaxY, 0, tMaxY, off, c);
+
+            off += c;
+        }
+
+        triCount = total;
+    }
+
+    private void buildTrianglesRange(WorkerContext ctx,
+                                     List<GameObject> topLevel, int start, int end,
+                                     int width, int height,
+                                     double f, double far,
+                                     double tanHalfFovX, double tanHalfFovY,
+                                     double camX, double camY, double camZ,
+                                     GameObject playerBody) {
+
+        final Deque<GameObject> stack = ctx.stack;
         stack.clear();
-        if (gameObjects != null) {
-            for (int i = gameObjects.size() - 1; i >= 0; i--) stack.push(gameObjects.get(i));
+
+        for (int i = end - 1; i >= start; i--) {
+            GameObject r = topLevel.get(i);
+            if (r != null) stack.push(r);
         }
 
         while (!stack.isEmpty()) {
@@ -524,28 +612,26 @@ public class Renderer {
             boolean isPlayerFamily = (playerBody != null) && isDescendantOrSelf(go, playerBody);
             if (camera.isFirstPerson() && isPlayerFamily) continue;
 
-
+            // push children
             List<GameObject> kids = go.getChildren();
             if (kids != null && !kids.isEmpty()) {
                 for (int i = kids.size() - 1; i >= 0; i--) stack.push(kids.get(i));
             }
 
-
-            if (!passesObjectCull(go, camX, camY, camZ, far, tanHalfFovX, tanHalfFovY)) {
-                continue;
-            }
+            // object cull
+            if (!passesObjectCull(go, camX, camY, camZ, far, tanHalfFovX, tanHalfFovY)) continue;
 
             double[][] wverts = go.getTransformedVertices();
             int[][] facesArr = go.getFacesArray();
             if (wverts == null || facesArr == null || facesArr.length == 0) continue;
 
             double[][] uvs = go.getUVs();
-            ensureTemps(wverts.length);
+            ctx.ensureTemps(wverts.length);
 
             final Material mat = go.getMaterial();
             final Texture tex = (mat != null ? mat.getAlbedo() : null);
             final Texture.Wrap wrap = (mat != null ? mat.getWrap() : Texture.Wrap.REPEAT);
-            final Color tint = (mat != null ? mat.getTint() : go.getColor());
+            final java.awt.Color tint = (mat != null ? mat.getTint() : go.getColor());
             final double ambient = (mat != null ? mat.getAmbient() : 0.20);
             final double diffuse = (mat != null ? mat.getDiffuse() : 0.85);
 
@@ -557,7 +643,7 @@ public class Renderer {
             if (mat != null) {
                 double es = mat.getEmissiveStrength();
                 if (es > 0.0) {
-                    Color ec = mat.getEmissiveColor();
+                    java.awt.Color ec = mat.getEmissiveColor();
                     emiR = clamp255((int) Math.round(ec.getRed()   * es));
                     emiG = clamp255((int) Math.round(ec.getGreen() * es));
                     emiB = clamp255((int) Math.round(ec.getBlue()  * es));
@@ -569,6 +655,7 @@ public class Renderer {
             final double thisNear = treatAsPlayer ? Math.max(NEAR, BODY_NEAR_PAD) : NEAR;
             final double thisBias = treatAsPlayer ? BODY_Z_BIAS : 0.0;
 
+            // camera-space verts
             for (int i = 0; i < wverts.length; i++) {
                 double[] w = wverts[i];
                 double wx = w[0] - camX;
@@ -583,25 +670,25 @@ public class Renderer {
 
                 if (thisBias != 0.0) zf += thisBias;
 
-                vx[i] = xr;
-                vy[i] = yr;
-                vz[i] = zf;
+                ctx.vx[i] = xr;
+                ctx.vy[i] = yr;
+                ctx.vz[i] = zf;
 
                 double u = 0.0, v = 0.0;
                 if (uvs != null && i < uvs.length && uvs[i] != null && uvs[i].length >= 2) {
                     u = uvs[i][0];
                     v = uvs[i][1];
                 }
-                uu[i] = u;
-                vv[i] = v;
+                ctx.uu[i] = u;
+                ctx.vv[i] = v;
             }
 
-            int lightCount = frameLights.size();
-            ensureShadowFlags(lightCount);
-
-            double objCx = 0, objCy = 0, objCz = 0;
+            // object-level shadow flags (per light)
+            final int lightCount = frameLightCount;
+            ctx.ensureShadowFlags(lightCount);
             boolean doShadows = lightCount > 0 && occluderCount > 0;
 
+            double objCx = 0, objCy = 0, objCz = 0;
             if (doShadows) {
                 AABB aabb = go.getWorldAABB();
                 objCx = 0.5 * (aabb.minX + aabb.maxX);
@@ -620,7 +707,7 @@ public class Renderer {
 
             if (doShadows) {
                 for (int li = 0; li < lightCount; li++) {
-                    LightData L = frameLights.get(li);
+                    LightData L = frameLightArr[li];
                     if (L == null || !L.shadows || L.strength <= 0.0) continue;
 
                     double lx, ly, lz, maxDist;
@@ -658,17 +745,18 @@ public class Renderer {
                     double oz = objCz + lz * SHADOW_BIAS;
 
                     if (isOccluded(ox, oy, oz, lx, ly, lz, maxDist, go, L.owner)) {
-                        shadowedPerLight[li] = true;
+                        ctx.shadowedPerLight[li] = true;
                     }
                 }
             }
 
+            // faces -> per-triangle lighting + clip + project -> ctx.batch
             for (int[] face : facesArr) {
                 if (face == null || face.length != 3) continue;
                 int i0 = face[0], i1 = face[1], i2 = face[2];
                 if (i0 < 0 || i1 < 0 || i2 < 0 || i0 >= wverts.length || i1 >= wverts.length || i2 >= wverts.length) continue;
 
-                if (vz[i0] >= far && vz[i1] >= far && vz[i2] >= far) continue;
+                if (ctx.vz[i0] >= far && ctx.vz[i1] >= far && ctx.vz[i2] >= far) continue;
 
                 double[] p0 = wverts[i0];
                 double[] p1 = wverts[i1];
@@ -694,10 +782,10 @@ public class Renderer {
                 double lr = 0.0, lg = 0.0, lb = 0.0;
 
                 for (int li = 0; li < lightCount; li++) {
-                    LightData L = frameLights.get(li);
+                    LightData L = frameLightArr[li];
                     if (L == null || L.strength <= 0.0) continue;
 
-                    if (L.shadows && shadowedPerLight[li]) continue;
+                    if (L.shadows && ctx.shadowedPerLight[li]) continue;
 
                     if (L.type == LightType.DIRECTIONAL) {
                         double lx = -L.dx, ly = -L.dy, lz = -L.dz;
@@ -721,8 +809,8 @@ public class Renderer {
                         if (dist < 1e-9) continue;
                         if (L.range > 0.0 && dist > L.range) continue;
 
-                        double invD2 = 1.0 / dist;
-                        double lx = toX * invD2, ly = toY * invD2, lz = toZ * invD2;
+                        double invD = 1.0 / dist;
+                        double lx = toX * invD, ly = toY * invD, lz = toZ * invD;
 
                         double ndotl = nxw*lx + nyw*ly + nzw*lz;
                         if (doubleSided) ndotl = Math.abs(ndotl);
@@ -748,8 +836,8 @@ public class Renderer {
                         if (dist < 1e-9) continue;
                         if (L.range > 0.0 && dist > L.range) continue;
 
-                        double invD2 = 1.0 / dist;
-                        double lx = toX * invD2, ly = toY * invD2, lz = toZ * invD2;
+                        double invD = 1.0 / dist;
+                        double lx = toX * invD, ly = toY * invD, lz = toZ * invD;
 
                         double ndotl = nxw*lx + nyw*ly + nzw*lz;
                         if (doubleSided) ndotl = Math.abs(ndotl);
@@ -763,10 +851,10 @@ public class Renderer {
                         if (cosTheta >= L.innerCos) {
                             spotFactor = 1.0;
                         } else {
-                            double t = (cosTheta - L.outerCos) / (L.innerCos - L.outerCos);
-                            if (t < 0) t = 0;
-                            if (t > 1) t = 1;
-                            spotFactor = t * t * (3.0 - 2.0 * t);
+                            double tt = (cosTheta - L.outerCos) / (L.innerCos - L.outerCos);
+                            if (tt < 0) tt = 0;
+                            if (tt > 1) tt = 1;
+                            spotFactor = tt * tt * (3.0 - 2.0 * tt);
                         }
 
                         double denom = 1.0 + (L.attLinear * dist) + (L.attQuadratic * dist2);
@@ -785,21 +873,22 @@ public class Renderer {
                 int shadeG = to255(clamp01(ambient + diffuse * lg));
                 int shadeB = to255(clamp01(ambient + diffuse * lb));
 
-                cax[0] = vx[i0]; cay[0] = vy[i0]; caz[0] = vz[i0]; cau[0] = uu[i0]; cav[0] = vv[i0];
-                cax[1] = vx[i1]; cay[1] = vy[i1]; caz[1] = vz[i1]; cau[1] = uu[i1]; cav[1] = vv[i1];
-                cax[2] = vx[i2]; cay[2] = vy[i2]; caz[2] = vz[i2]; cau[2] = uu[i2]; cav[2] = vv[i2];
+                // near clip
+                ctx.cax[0] = ctx.vx[i0]; ctx.cay[0] = ctx.vy[i0]; ctx.caz[0] = ctx.vz[i0]; ctx.cau[0] = ctx.uu[i0]; ctx.cav[0] = ctx.vv[i0];
+                ctx.cax[1] = ctx.vx[i1]; ctx.cay[1] = ctx.vy[i1]; ctx.caz[1] = ctx.vz[i1]; ctx.cau[1] = ctx.uu[i1]; ctx.cav[1] = ctx.vv[i1];
+                ctx.cax[2] = ctx.vx[i2]; ctx.cay[2] = ctx.vy[i2]; ctx.caz[2] = ctx.vz[i2]; ctx.cau[2] = ctx.uu[i2]; ctx.cav[2] = ctx.vv[i2];
 
                 int clippedCount = clipPolyNear(thisNear + NEAR_CLIP_EPS,
-                        cax, cay, caz, cau, cav, 3,
-                        cbx, cby, cbz, cbu, cbv);
+                        ctx.cax, ctx.cay, ctx.caz, ctx.cau, ctx.cav, 3,
+                        ctx.cbx, ctx.cby, ctx.cbz, ctx.cbu, ctx.cbv);
 
                 if (clippedCount < 3) continue;
 
                 if (clippedCount == 3) {
-                    addProjectedTriangle(
-                            cbx[0], cby[0], cbz[0], cbu[0], cbv[0],
-                            cbx[1], cby[1], cbz[1], cbu[1], cbv[1],
-                            cbx[2], cby[2], cbz[2], cbu[2], cbv[2],
+                    ctx.batch.addProjectedTriangle(
+                            ctx.cbx[0], ctx.cby[0], ctx.cbz[0], ctx.cbu[0], ctx.cbv[0],
+                            ctx.cbx[1], ctx.cby[1], ctx.cbz[1], ctx.cbu[1], ctx.cbv[1],
+                            ctx.cbx[2], ctx.cby[2], ctx.cbz[2], ctx.cbu[2], ctx.cbv[2],
                             f, width, height, far,
                             tex, wrap,
                             tintR, tintG, tintB,
@@ -808,10 +897,10 @@ public class Renderer {
                             doubleSided
                     );
                 } else {
-                    addProjectedTriangle(
-                            cbx[0], cby[0], cbz[0], cbu[0], cbv[0],
-                            cbx[1], cby[1], cbz[1], cbu[1], cbv[1],
-                            cbx[2], cby[2], cbz[2], cbu[2], cbv[2],
+                    ctx.batch.addProjectedTriangle(
+                            ctx.cbx[0], ctx.cby[0], ctx.cbz[0], ctx.cbu[0], ctx.cbv[0],
+                            ctx.cbx[1], ctx.cby[1], ctx.cbz[1], ctx.cbu[1], ctx.cbv[1],
+                            ctx.cbx[2], ctx.cby[2], ctx.cbz[2], ctx.cbu[2], ctx.cbv[2],
                             f, width, height, far,
                             tex, wrap,
                             tintR, tintG, tintB,
@@ -819,10 +908,10 @@ public class Renderer {
                             emiR, emiG, emiB,
                             doubleSided
                     );
-                    addProjectedTriangle(
-                            cbx[0], cby[0], cbz[0], cbu[0], cbv[0],
-                            cbx[2], cby[2], cbz[2], cbu[2], cbv[2],
-                            cbx[3], cby[3], cbz[3], cbu[3], cbv[3],
+                    ctx.batch.addProjectedTriangle(
+                            ctx.cbx[0], ctx.cby[0], ctx.cbz[0], ctx.cbu[0], ctx.cbv[0],
+                            ctx.cbx[2], ctx.cby[2], ctx.cbz[2], ctx.cbu[2], ctx.cbv[2],
+                            ctx.cbx[3], ctx.cby[3], ctx.cbz[3], ctx.cbu[3], ctx.cbv[3],
                             f, width, height, far,
                             tex, wrap,
                             tintR, tintG, tintB,
@@ -833,6 +922,126 @@ public class Renderer {
                 }
             }
         }
+    }
+
+    // ----------------------------
+    // Raster slice
+    // ----------------------------
+    private void renderSlice(int yStart, int yEnd, int width, int height) {
+        int startIdx = yStart * width;
+        int endIdx = yEnd * width;
+        Arrays.fill(zBuffer, startIdx, endIdx, Float.NEGATIVE_INFINITY);
+
+        for (int y = yStart; y < yEnd; y++) {
+            int c = skyRowColors[y];
+            int row = y * width;
+            Arrays.fill(pixels, row, row + width, c);
+        }
+
+        final int n = triCount;
+        for (int i = 0; i < n; i++) {
+            int minY = tMinY[i];
+            int maxY = tMaxY[i];
+            if (maxY < yStart || minY >= yEnd) continue;
+
+            rasterizeTriangleTopLeftSlice(
+                    tX0[i], tY0[i], tIZ0[i], tUOZ0[i], tVOZ0[i],
+                    tX1[i], tY1[i], tIZ1[i], tUOZ1[i], tVOZ1[i],
+                    tX2[i], tY2[i], tIZ2[i], tUOZ2[i], tVOZ2[i],
+                    tTex[i], tWrap[i],
+                    tTint[i], tShade[i], tEmi[i],
+                    tDoubleSided[i] != 0,
+                    tMinX[i], tMaxX[i], minY, maxY,
+                    yStart, yEnd,
+                    width, height
+            );
+        }
+    }
+
+    private void updateTrigIfNeeded() {
+        double vyaw = camera.getViewYaw();
+        double vpitch = camera.getViewPitch();
+
+        if (!valuesCached || vyaw != cachedYaw || vpitch != cachedPitch) {
+            cachedYaw = vyaw;
+            cachedPitch = vpitch;
+            cy = Math.cos(cachedYaw);
+            sy = Math.sin(cachedYaw);
+            cp = Math.cos(cachedPitch);
+            sp = Math.sin(cachedPitch);
+            valuesCached = true;
+        }
+    }
+
+    private void ensureBuffers(int width, int height) {
+        if (frameBuffer == null || width != fbW || height != fbH) {
+            frameBuffer = new BufferedImage(width, height, BufferedImage.TYPE_INT_ARGB);
+            pixels = ((DataBufferInt) frameBuffer.getRaster().getDataBuffer()).getData();
+            zBuffer = new float[width * height];
+            fbW = width;
+            fbH = height;
+        }
+    }
+
+    private void ensureSkyCache(int height) {
+        if (skyRowColors.length != height) {
+            skyRowColors = new int[height];
+            for (int y = 0; y < height; y++) {
+                double t = (height <= 1) ? 0.0 : (y / (double) (height - 1));
+                skyRowColors[y] = lerpARGB(SKY_TOP, SKY_BOTTOM, t);
+            }
+        }
+    }
+
+    private static int lerpARGB(int a, int b, double t) {
+        if (t < 0) t = 0;
+        if (t > 1) t = 1;
+        int aA = (a >>> 24) & 255, aR = (a >>> 16) & 255, aG = (a >>> 8) & 255, aB = a & 255;
+        int bA = (b >>> 24) & 255, bR = (b >>> 16) & 255, bG = (b >>> 8) & 255, bB = b & 255;
+        int oA = (int) (aA + (bA - aA) * t + 0.5);
+        int oR = (int) (aR + (bR - aR) * t + 0.5);
+        int oG = (int) (aG + (bG - aG) * t + 0.5);
+        int oB = (int) (aB + (bB - aB) * t + 0.5);
+        return (oA << 24) | (oR << 16) | (oG << 8) | oB;
+    }
+
+    private boolean passesObjectCull(GameObject go,
+                                     double camX, double camY, double camZ,
+                                     double far,
+                                     double tanHalfFovX, double tanHalfFovY) {
+
+        if (go == null) return false;
+
+        AABB aabb = go.getWorldAABB();
+        double cxw = 0.5 * (aabb.minX + aabb.maxX);
+        double cyw = 0.5 * (aabb.minY + aabb.maxY);
+        double czw = 0.5 * (aabb.minZ + aabb.maxZ);
+
+        double hx = 0.5 * (aabb.maxX - aabb.minX);
+        double hy = 0.5 * (aabb.maxY - aabb.minY);
+        double hz = 0.5 * (aabb.maxZ - aabb.minZ);
+        double r = Math.sqrt(hx*hx + hy*hy + hz*hz);
+
+        double wx = cxw - camX;
+        double wy = cyw - camY;
+        double wz0 = czw - camZ;
+
+        double xr =  wx * cy + wz0 * sy;
+        double zr = -wx * sy + wz0 * cy;
+
+        double yr =  wy * cp + zr * sp;
+        double zf = -wy * sp + zr * cp;
+
+        if (zf + r <= 0.0) return false;
+        if (zf - r >= far) return false;
+
+        double maxX = zf * tanHalfFovX + r;
+        if (xr < -maxX || xr > maxX) return false;
+
+        double maxY = zf * tanHalfFovY + r;
+        if (yr < -maxY || yr > maxY) return false;
+
+        return true;
     }
 
     private void ensureTriCapacity(int required) {
@@ -873,70 +1082,6 @@ public class Renderer {
         tMaxX = Arrays.copyOf(tMaxX, newCap);
         tMinY = Arrays.copyOf(tMinY, newCap);
         tMaxY = Arrays.copyOf(tMaxY, newCap);
-    }
-
-    private void addProjectedTriangle(
-            double x0c, double y0c, double z0c, double u0, double v0,
-            double x1c, double y1c, double z1c, double u1, double v1,
-            double x2c, double y2c, double z2c, double u2, double v2,
-            double f, int width, int height, double far,
-            Texture tex, Texture.Wrap wrap,
-            int tintR, int tintG, int tintB,
-            int shadeR, int shadeG, int shadeB,
-            int emiR, int emiG, int emiB,
-            boolean doubleSided
-    ) {
-        if (z0c >= far && z1c >= far && z2c >= far) return;
-
-        double inv0 = 1.0 / z0c;
-        double inv1 = 1.0 / z1c;
-        double inv2 = 1.0 / z2c;
-
-        double sx0 = (x0c * f * inv0) + (width * 0.5);
-        double sy0 = -(y0c * f * inv0) + (height * 0.5);
-
-        double sx1 = (x1c * f * inv1) + (width * 0.5);
-        double sy1 = -(y1c * f * inv1) + (height * 0.5);
-
-        double sx2 = (x2c * f * inv2) + (width * 0.5);
-        double sy2 = -(y2c * f * inv2) + (height * 0.5);
-
-        int minX = (int) Math.max(0, Math.ceil(Math.min(sx0, Math.min(sx1, sx2))));
-        int maxX = (int) Math.min(width - 1, Math.floor(Math.max(sx0, Math.max(sx1, sx2))));
-        int minY = (int) Math.max(0, Math.ceil(Math.min(sy0, Math.min(sy1, sy2))));
-        int maxY = (int) Math.min(height - 1, Math.floor(Math.max(sy0, Math.max(sy1, sy2))));
-        if (minX > maxX || minY > maxY) return;
-
-        ensureTriCapacity(triCount + 1);
-
-        int idx = triCount++;
-
-        tX0[idx] = sx0; tY0[idx] = sy0;
-        tX1[idx] = sx1; tY1[idx] = sy1;
-        tX2[idx] = sx2; tY2[idx] = sy2;
-
-        tIZ0[idx] = (float) inv0;
-        tIZ1[idx] = (float) inv1;
-        tIZ2[idx] = (float) inv2;
-
-        tUOZ0[idx] = (float) (u0 * inv0);
-        tVOZ0[idx] = (float) (v0 * inv0);
-        tUOZ1[idx] = (float) (u1 * inv1);
-        tVOZ1[idx] = (float) (v1 * inv1);
-        tUOZ2[idx] = (float) (u2 * inv2);
-        tVOZ2[idx] = (float) (v2 * inv2);
-
-        tTex[idx] = tex;
-        tWrap[idx] = (wrap == null ? Texture.Wrap.REPEAT : wrap);
-
-        tTint[idx]  = (tintR << 16) | (tintG << 8) | tintB;
-        tShade[idx] = (shadeR << 16) | (shadeG << 8) | shadeB;
-        tEmi[idx]   = (emiR << 16) | (emiG << 8) | emiB;
-
-        tDoubleSided[idx] = (byte) (doubleSided ? 1 : 0);
-
-        tMinX[idx] = minX; tMaxX[idx] = maxX;
-        tMinY[idx] = minY; tMaxY[idx] = maxY;
     }
 
     private void rasterizeTriangleTopLeftSlice(
@@ -1248,5 +1393,165 @@ public class Renderer {
         }
 
         return outCount;
+    }
+
+    // ----------------------------
+    // Worker structures
+    // ----------------------------
+    private static final class WorkerContext {
+        // per-object temp arrays
+        double[] vx = new double[0], vy = new double[0], vz = new double[0], uu = new double[0], vv = new double[0];
+
+        // clip temps
+        final double[] cax = new double[4], cay = new double[4], caz = new double[4], cau = new double[4], cav = new double[4];
+        final double[] cbx = new double[4], cby = new double[4], cbz = new double[4], cbu = new double[4], cbv = new double[4];
+
+        // shadow flags
+        boolean[] shadowedPerLight = new boolean[0];
+
+        // traversal stack
+        final ArrayDeque<GameObject> stack = new ArrayDeque<>(256);
+
+        // per-worker triangle batch
+        final TriBatch batch = new TriBatch();
+
+        void ensureTemps(int n) {
+            if (vx.length < n) {
+                vx = new double[n];
+                vy = new double[n];
+                vz = new double[n];
+                uu = new double[n];
+                vv = new double[n];
+            }
+        }
+
+        void ensureShadowFlags(int n) {
+            if (shadowedPerLight.length < n) shadowedPerLight = new boolean[n];
+            Arrays.fill(shadowedPerLight, 0, n, false);
+        }
+    }
+
+    private static final class TriBatch {
+        int count = 0;
+
+        double[] tX0 = new double[0], tY0 = new double[0], tX1 = new double[0], tY1 = new double[0], tX2 = new double[0], tY2 = new double[0];
+        float[]  tIZ0 = new float[0],  tIZ1 = new float[0],  tIZ2 = new float[0];
+        float[]  tUOZ0 = new float[0], tVOZ0 = new float[0], tUOZ1 = new float[0], tVOZ1 = new float[0], tUOZ2 = new float[0], tVOZ2 = new float[0];
+
+        Texture[]      tTex = new Texture[0];
+        Texture.Wrap[] tWrap = new Texture.Wrap[0];
+
+        int[] tTint = new int[0];
+        int[] tShade = new int[0];
+        int[] tEmi = new int[0];
+
+        byte[] tDoubleSided = new byte[0];
+
+        int[] tMinX = new int[0], tMaxX = new int[0], tMinY = new int[0], tMaxY = new int[0];
+
+        void reset() { count = 0; }
+
+        private void ensureCapacity(int required) {
+            int cap = tX0.length;
+            if (cap >= required) return;
+
+            int newCap = (cap <= 0) ? 2048 : cap;
+            while (newCap < required) newCap <<= 1;
+
+            tX0 = Arrays.copyOf(tX0, newCap);
+            tY0 = Arrays.copyOf(tY0, newCap);
+            tX1 = Arrays.copyOf(tX1, newCap);
+            tY1 = Arrays.copyOf(tY1, newCap);
+            tX2 = Arrays.copyOf(tX2, newCap);
+            tY2 = Arrays.copyOf(tY2, newCap);
+
+            tIZ0 = Arrays.copyOf(tIZ0, newCap);
+            tIZ1 = Arrays.copyOf(tIZ1, newCap);
+            tIZ2 = Arrays.copyOf(tIZ2, newCap);
+
+            tUOZ0 = Arrays.copyOf(tUOZ0, newCap);
+            tVOZ0 = Arrays.copyOf(tVOZ0, newCap);
+            tUOZ1 = Arrays.copyOf(tUOZ1, newCap);
+            tVOZ1 = Arrays.copyOf(tVOZ1, newCap);
+            tUOZ2 = Arrays.copyOf(tUOZ2, newCap);
+            tVOZ2 = Arrays.copyOf(tVOZ2, newCap);
+
+            tTex = Arrays.copyOf(tTex, newCap);
+            tWrap = Arrays.copyOf(tWrap, newCap);
+
+            tTint = Arrays.copyOf(tTint, newCap);
+            tShade = Arrays.copyOf(tShade, newCap);
+            tEmi = Arrays.copyOf(tEmi, newCap);
+
+            tDoubleSided = Arrays.copyOf(tDoubleSided, newCap);
+
+            tMinX = Arrays.copyOf(tMinX, newCap);
+            tMaxX = Arrays.copyOf(tMaxX, newCap);
+            tMinY = Arrays.copyOf(tMinY, newCap);
+            tMaxY = Arrays.copyOf(tMaxY, newCap);
+        }
+
+        void addProjectedTriangle(
+                double x0c, double y0c, double z0c, double u0, double v0,
+                double x1c, double y1c, double z1c, double u1, double v1,
+                double x2c, double y2c, double z2c, double u2, double v2,
+                double f, int width, int height, double far,
+                Texture tex, Texture.Wrap wrap,
+                int tintR, int tintG, int tintB,
+                int shadeR, int shadeG, int shadeB,
+                int emiR, int emiG, int emiB,
+                boolean doubleSided
+        ) {
+            if (z0c >= far && z1c >= far && z2c >= far) return;
+
+            double inv0 = 1.0 / z0c;
+            double inv1 = 1.0 / z1c;
+            double inv2 = 1.0 / z2c;
+
+            double sx0 = (x0c * f * inv0) + (width * 0.5);
+            double sy0 = -(y0c * f * inv0) + (height * 0.5);
+
+            double sx1 = (x1c * f * inv1) + (width * 0.5);
+            double sy1 = -(y1c * f * inv1) + (height * 0.5);
+
+            double sx2 = (x2c * f * inv2) + (width * 0.5);
+            double sy2 = -(y2c * f * inv2) + (height * 0.5);
+
+            int minX = (int) Math.max(0, Math.ceil(Math.min(sx0, Math.min(sx1, sx2))));
+            int maxX = (int) Math.min(width - 1, Math.floor(Math.max(sx0, Math.max(sx1, sx2))));
+            int minY = (int) Math.max(0, Math.ceil(Math.min(sy0, Math.min(sy1, sy2))));
+            int maxY = (int) Math.min(height - 1, Math.floor(Math.max(sy0, Math.max(sy1, sy2))));
+            if (minX > maxX || minY > maxY) return;
+
+            ensureCapacity(count + 1);
+            int idx = count++;
+
+            tX0[idx] = sx0; tY0[idx] = sy0;
+            tX1[idx] = sx1; tY1[idx] = sy1;
+            tX2[idx] = sx2; tY2[idx] = sy2;
+
+            tIZ0[idx] = (float) inv0;
+            tIZ1[idx] = (float) inv1;
+            tIZ2[idx] = (float) inv2;
+
+            tUOZ0[idx] = (float) (u0 * inv0);
+            tVOZ0[idx] = (float) (v0 * inv0);
+            tUOZ1[idx] = (float) (u1 * inv1);
+            tVOZ1[idx] = (float) (v1 * inv1);
+            tUOZ2[idx] = (float) (u2 * inv2);
+            tVOZ2[idx] = (float) (v2 * inv2);
+
+            tTex[idx] = tex;
+            tWrap[idx] = (wrap == null ? Texture.Wrap.REPEAT : wrap);
+
+            tTint[idx]  = (tintR << 16) | (tintG << 8) | tintB;
+            tShade[idx] = (shadeR << 16) | (shadeG << 8) | shadeB;
+            tEmi[idx]   = (emiR << 16) | (emiG << 8) | emiB;
+
+            tDoubleSided[idx] = (byte) (doubleSided ? 1 : 0);
+
+            tMinX[idx] = minX; tMaxX[idx] = maxX;
+            tMinY[idx] = minY; tMaxY[idx] = maxY;
+        }
     }
 }
