@@ -3,26 +3,28 @@ package engine;
 import engine.animation.AnimationSystem;
 import engine.core.GameClock;
 import engine.event.EventBus;
-import engine.event.events.GuiToggleRequestedEvent;
-import engine.event.events.TickEvent;
+import engine.event.events.*;
+import engine.inventory.InventorySystem;
+import engine.inventory.InventoryUI;
+import engine.render.Material;
 import engine.systems.PlayerController;
 import gui.ClickGUI;
 import objects.GameObject;
 import objects.dynamic.Body;
 import objects.fixed.Cube;
+import objects.fixed.ImportedOBJ;
 import objects.lighting.LightObject;
-
-import engine.render.Material;
+import sound.SoundEngine;
+import util.Vector3;
 
 import javax.swing.*;
 import java.awt.*;
+import java.awt.event.WindowAdapter;
+import java.awt.event.WindowEvent;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.LockSupport;
-
-import sound.SoundEngine;
-import util.Vector3;
 
 public class GameEngine extends JPanel implements Runnable {
 
@@ -43,8 +45,6 @@ public class GameEngine extends JPanel implements Runnable {
 
     private static final double COLLIDER_CELL_SIZE = 6.0;
     private final ColliderIndex colliderIndex = new ColliderIndex(COLLIDER_CELL_SIZE);
-
-    // Render-space partition (same partition concept as collisions).
     private final SpatialIndex renderIndex = new SpatialIndex(COLLIDER_CELL_SIZE);
 
     private long fpsLastTime = System.nanoTime();
@@ -56,10 +56,15 @@ public class GameEngine extends JPanel implements Runnable {
 
     private final Body playerBody;
 
+    public final InventorySystem inventorySystem;
+    public final InventoryUI inventoryUI;
+
     private final AtomicBoolean repaintPending = new AtomicBoolean(false);
 
     private static final long TARGET_REPAINT_NS = (long) (1_000_000_000L / 60.0);
     private static final long IDLE_PARK_NS = 1_000_000L;
+
+    private Thread gameThread;
 
     public GameEngine() {
         this.eventBus = new EventBus();
@@ -69,9 +74,11 @@ public class GameEngine extends JPanel implements Runnable {
 
         this.camera = new Camera(0, 0.0, 0, 0, 0, this);
         this.renderer = new Renderer(camera, this);
-        this.soundEngine = new SoundEngine("./src/main/java/sound/wavs");
-        this.clickGUI = new ClickGUI(this);
 
+        this.soundEngine = new SoundEngine("./src/main/java/sound/wavs");
+        this.soundEngine.setMasterVolume(0.25); // sane default; tweak if you want
+
+        this.clickGUI = new ClickGUI(this);
         this.inputHandler = new InputHandler(eventBus, this);
 
         this.playerBody = new Body(Camera.WIDTH, Camera.HEIGHT);
@@ -83,15 +90,31 @@ public class GameEngine extends JPanel implements Runnable {
 
         this.playerController = new PlayerController(camera, eventBus, playerBody);
 
+        this.inventorySystem = new InventorySystem(this, eventBus);
+        this.inventoryUI = inventorySystem.getUI();
+
         setupWindow();
         setupInputListeners();
 
         inputHandler.centerCursor(this);
+
         initializeGameObjects();
 
-        eventBus.subscribe(GuiToggleRequestedEvent.class, e -> clickGUI.setOpen(!clickGUI.isOpen()));
+        eventBus.subscribe(GuiToggleRequestedEvent.class, e -> {
+            clickGUI.setOpen(!clickGUI.isOpen());
+            onGuiToggled(clickGUI.isOpen());
+        });
 
-        new Thread(this, "GameLoop").start();
+        eventBus.subscribe(InventoryOpenChangedEvent.class, e -> onInventoryToggled(e.open));
+
+        gameThread = new Thread(this, "GameLoop");
+        gameThread.start();
+    }
+
+    public void shutdown() {
+        try { if (gameThread != null) gameThread.interrupt(); } catch (Throwable ignored) {}
+        try { if (renderer != null) renderer.shutdown(); } catch (Throwable ignored) {}
+        try { if (soundEngine != null) soundEngine.shutdown(); } catch (Throwable ignored) {}
     }
 
     public Body getPlayerBody() { return playerBody; }
@@ -148,120 +171,17 @@ public class GameEngine extends JPanel implements Runnable {
                 inputHandler.setCaptureMouse(false);
             }
             @Override public void focusGained(java.awt.event.FocusEvent e) {
-                inputHandler.setCaptureMouse(true);
-                if (!clickGUI.isOpen()) inputHandler.centerCursor(GameEngine.this);
+                boolean wantCapture = !(clickGUI.isOpen() || inventoryUI.isOpen());
+                inputHandler.setCaptureMouse(wantCapture);
+                if (wantCapture) inputHandler.centerCursor(GameEngine.this);
             }
         });
     }
 
     private void initializeGameObjects() {
+        ImportedOBJ importedOBJ = new ImportedOBJ();
+        rootObjects.add(importedOBJ);
 
-        /* ================= SCALE ================= */
-
-        final double SCALE = 0.12;
-
-        /* ================= MATERIALS ================= */
-
-        final double AMB = 0.92;
-        final double DIF = 0.08;
-
-        final Material baseMat   = Material.solid(new Color(180,180,185)).setAmbient(AMB).setDiffuse(DIF);
-        final Material jumpMat   = Material.solid(new Color(120,160,220)).setAmbient(AMB).setDiffuse(DIF);
-        final Material safeMat   = Material.solid(new Color(90,200,120)).setAmbient(AMB).setDiffuse(DIF);
-        final Material dangerMat = Material.solid(new Color(220,70,70)).setAmbient(AMB).setDiffuse(DIF);
-
-        /* ================= UNITS ================= */
-
-        final double TILE = 6.0 * SCALE;
-        final double FLOOR_Y = -TILE * 0.5;
-
-        /* ================= START PLATFORM ================= */
-
-        Cube start = new Cube(TILE * 4, 0, TILE * 0.5, 0);
-        start.setFull(true);
-        start.setMaterial(safeMat);
-        addRootObject(start);
-
-        /* ================= LAVA FLOOR ================= */
-
-        for (int x = -40; x <= 40; x++) {
-            for (int z = -10; z <= 400; z++) {
-                Cube lava = new Cube(
-                        TILE,
-                        x * TILE,
-                        FLOOR_Y,
-                        z * TILE
-                );
-                lava.setFull(true);
-                lava.setMaterial(dangerMat);
-                addRootObject(lava);
-            }
-        }
-
-        /* ================= OBBY COURSE ================= */
-
-        double x = 0;
-        double y = TILE * 0.8;
-        double z = TILE * 4;
-
-        int STAGES = 180;
-
-        for (int i = 0; i < STAGES; i++) {
-
-            int type = i % 6;
-
-            double size;
-            Material mat;
-
-            switch (type) {
-                case 0: // normal jump
-                    size = TILE * 1.2;
-                    mat = jumpMat;
-                    break;
-                case 1: // small precision
-                    size = TILE * 0.6;
-                    mat = jumpMat;
-                    break;
-                case 2: // side offset
-                    size = TILE * 0.9;
-                    mat = jumpMat;
-                    x += ((i & 1) == 0 ? -1 : 1) * TILE * 1.4;
-                    break;
-                case 3: // stair up
-                    size = TILE * 1.1;
-                    mat = jumpMat;
-                    y += TILE * 0.45;
-                    break;
-                case 4: // danger pad
-                    size = TILE * 0.8;
-                    mat = dangerMat;
-                    break;
-                default: // safe checkpoint
-                    size = TILE * 2.0;
-                    mat = safeMat;
-                    break;
-            }
-
-            Cube step = new Cube(size, x, y, z);
-            step.setFull(true);
-            step.setMaterial(mat);
-            addRootObject(step);
-
-            // forward progression
-            z += TILE * 1.6;
-
-            // reset side drift every few stages
-            if (i % 12 == 0) x = 0;
-        }
-
-        /* ================= FINAL PLATFORM ================= */
-
-        Cube finish = new Cube(TILE * 5, 0, y + TILE, z + TILE * 3);
-        finish.setFull(true);
-        finish.setMaterial(safeMat);
-        addRootObject(finish);
-
-        /* ================= LIGHT ================= */
 
         LightObject sun = LightObject.directional(
                 new Vector3(-0.4, -0.85, 0.3),
@@ -271,11 +191,10 @@ public class GameEngine extends JPanel implements Runnable {
         );
         sun.setAutoRotateY(Math.toRadians(6.0));
         addRootObject(sun);
+
+        inventorySystem.spawnItemsOnInit();
+        inventorySystem.seedStartingInventory();
     }
-
-
-
-
 
     @Override
     protected void paintComponent(Graphics g) {
@@ -291,6 +210,8 @@ public class GameEngine extends JPanel implements Runnable {
         g2d.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING, RenderingHints.VALUE_TEXT_ANTIALIAS_OFF);
 
         renderer.render(g2d, rootObjects, getWidth(), getHeight());
+
+        inventoryUI.render(g2d, getWidth(), getHeight());
 
         clickGUI.render(g2d);
         if (clickGUI.isDebug()) drawDebugInfo(g2d);
@@ -354,6 +275,8 @@ public class GameEngine extends JPanel implements Runnable {
         camera.update(delta);
         syncPlayerBodyToCamera();
 
+        inventorySystem.update(delta);
+
         playerBody.setMotionState(
                 movingIntent,
                 camera.onGround,
@@ -369,12 +292,13 @@ public class GameEngine extends JPanel implements Runnable {
             if (obj == null) continue;
             obj.update(delta);
 
-            // keep both indices in sync
             colliderIndex.sync(obj);
             renderIndex.sync(obj);
         }
 
         AnimationSystem.updateAll(rootObjects, delta);
+
+        // improved sound system uses queued playback + pooling (polyphonic)
         soundEngine.tick();
     }
 
@@ -384,9 +308,6 @@ public class GameEngine extends JPanel implements Runnable {
         playerBody.getTransform().position.z = camera.z;
         playerBody.getTransform().rotation.y = -camera.getViewYaw();
 
-        // Body has no verts, so colliderIndex doesn't keep it; renderIndex would index as point at world pos,
-        // but we still rely on explicitly rendering it in Renderer (safer).
-        // Still sync to keep transforms correct if you later add verts to Body.
         renderIndex.sync(playerBody);
         colliderIndex.sync(playerBody);
     }
@@ -403,7 +324,20 @@ public class GameEngine extends JPanel implements Runnable {
     }
 
     public void onGuiToggled(boolean open) {
-        if (open) {
+        boolean anyOpen = open || inventoryUI.isOpen();
+        if (anyOpen) {
+            showCursor();
+            inputHandler.setCaptureMouse(false);
+        } else {
+            inputHandler.setCaptureMouse(true);
+            inputHandler.centerCursor(this);
+        }
+        requestFocusInWindow();
+    }
+
+    public void onInventoryToggled(boolean open) {
+        boolean anyOpen = open || clickGUI.isOpen();
+        if (anyOpen) {
             showCursor();
             inputHandler.setCaptureMouse(false);
         } else {
@@ -425,18 +359,31 @@ public class GameEngine extends JPanel implements Runnable {
         g.drawString("Loaded Objects: " + rootObjects.size(), 10, 160);
         g.drawString("Solid Colliders: " + getColliders().size(), 10, 180);
         g.drawString("GUI Open: " + clickGUI.isOpen(), 10, 200);
-        g.drawString("FOV: " + String.format("%.1f°", fovDegrees), 10, 220);
-        g.drawString("RenderDist: " + String.format("%.0f", getRenderDistance()), 10, 240);
-        g.drawString("Cam Mode: " + (camera.isFirstPerson() ? "First" : "Third"), 10, 260);
-        g.drawString("RenderScale: " + String.format("%.2f", renderer.getRenderScale()), 10, 280);
-        g.drawString("FXAA: " + renderer.isFxaaEnabled(), 10, 300);
+        g.drawString("Inv Open: " + inventoryUI.isOpen(), 10, 220);
+        g.drawString("FOV: " + String.format("%.1f°", fovDegrees), 10, 240);
+        g.drawString("RenderDist: " + String.format("%.0f", getRenderDistance()), 10, 260);
+        g.drawString("Cam Mode: " + (camera.isFirstPerson() ? "First" : "Third"), 10, 280);
+        g.drawString("RenderScale: " + String.format("%.2f", renderer.getRenderScale()), 10, 300);
+        g.drawString("FXAA: " + renderer.isFxaaEnabled(), 10, 320);
+        g.drawString("MasterVol: " + String.format("%.2f", soundEngine.getMasterVolume()), 10, 340);
     }
 
     public static void main(String[] args) {
         SwingUtilities.invokeLater(() -> {
             JFrame frame = new JFrame("Game Engine");
             GameEngine engine = new GameEngine();
-            frame.setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
+
+            frame.setDefaultCloseOperation(JFrame.DISPOSE_ON_CLOSE);
+            frame.addWindowListener(new WindowAdapter() {
+                @Override public void windowClosing(WindowEvent e) {
+                    try { engine.shutdown(); } catch (Throwable ignored) {}
+                }
+                @Override public void windowClosed(WindowEvent e) {
+                    try { engine.shutdown(); } catch (Throwable ignored) {}
+                    System.exit(0);
+                }
+            });
+
             frame.add(engine);
             frame.pack();
             frame.setLocationRelativeTo(null);

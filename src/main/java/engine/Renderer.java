@@ -1,24 +1,20 @@
 package engine;
 
-import engine.lighting.LightData;
-import engine.lighting.LightType;
-import engine.render.Material;
-import engine.render.Texture;
-import objects.GameObject;
+import engine.lighting.*;
+import engine.render.*;
+import objects.*;
+import objects.dynamic.*;
 import util.AABB;
 import util.Vector3;
 
 import java.awt.*;
 import java.awt.image.BufferedImage;
 import java.awt.image.DataBufferInt;
-import java.util.ArrayDeque;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Deque;
+import java.util.*;
 import java.util.List;
 import java.util.concurrent.*;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.atomic.*;
+import java.util.concurrent.locks.LockSupport;
 
 public class Renderer {
     private final GameEngine gameEngine;
@@ -40,6 +36,13 @@ public class Renderer {
     private static final double SHADOW_RECEIVER_MAX_DIST = 70.0;
     private static final double SHADOW_DIR_MAX_DIST = 80.0;
 
+    // FIRST PERSON: arm/viewmodel handling
+    // We only use X offset to classify "arm branches", and we inherit that classification through parents.
+    // This avoids flicker when hands/forearms swing inward (their own centers can cross thresholds).
+    private static final double FP_ARMS_MIN_ABS_X = 0.20; // keep torso/pelvis hidden, but allow shoulder branches
+    private static final double FP_ARMS_NEAR = 0.02;
+    private static final double FP_ARMS_Z_BIAS = 0.06;
+
     private BufferedImage frameBuffer;
     private int[] pixels;
     private float[] zBuffer;
@@ -56,7 +59,6 @@ public class Renderer {
     public boolean isFxaaEnabled() { return fxaaEnabled; }
     public void setFxaaEnabled(boolean enabled) { this.fxaaEnabled = enabled; }
 
-    // Per-frame lists
     private final ArrayList<LightData> frameLights = new ArrayList<>();
     private final ArrayList<GameObject> solidOccluders = new ArrayList<>();
 
@@ -64,14 +66,12 @@ public class Renderer {
     private AABB[] occluderAabbs = new AABB[0];
     private int occluderCount = 0;
 
-    // Snapshot arrays used by worker threads during geometry/lighting build
     private LightData[] frameLightArr = new LightData[0];
     private int frameLightCount = 0;
 
     private final ExecutorService renderPool;
     private final int maxWorkers;
 
-    // Final triangle batch arrays (consumed by rasterization slices)
     private int triCount = 0;
     private double[] tX0 = new double[0], tY0 = new double[0], tX1 = new double[0], tY1 = new double[0], tX2 = new double[0], tY2 = new double[0];
     private float[]  tIZ0 = new float[0],  tIZ1 = new float[0],  tIZ2 = new float[0];
@@ -88,19 +88,17 @@ public class Renderer {
 
     private int[] tMinX = new int[0], tMaxX = new int[0], tMinY = new int[0], tMaxY = new int[0];
 
-    // Reused query buffers
     private final ArrayList<GameObject> nearbyRenderables = new ArrayList<>(4096);
     private final ArrayList<GameObject> nearbyOccludersQ  = new ArrayList<>(4096);
     private final ArrayList<GameObject> renderRoots       = new ArrayList<>(4096);
 
-    // Worker contexts (allocated once, reused)
     private WorkerContext[] workerCtx = new WorkerContext[0];
 
     public Renderer(Camera camera, GameEngine gameEngine) {
         this.camera = camera;
         this.gameEngine = gameEngine;
 
-        int threads = Runtime.getRuntime().availableProcessors(); // max cores/max threads
+        int threads = Runtime.getRuntime().availableProcessors();
         this.maxWorkers = Math.max(1, threads);
 
         ThreadFactory tf = new ThreadFactory() {
@@ -147,21 +145,16 @@ public class Renderer {
         final double camY = camera.getViewY();
         final double camZ = camera.getViewZ();
 
-        // (1) Scene query/object collection (multi-core)
         buildNearbyRootListsParallel(camX, camZ, far);
 
-        // (2) Light + solid occluder collection (multi-core)
         gatherLightsAndOccludersParallel(roots, nearbyOccludersQ, camX, camY, camZ, far);
 
-        // Snapshot lights for worker threads
         frameLightCount = frameLights.size();
         if (frameLightArr.length < frameLightCount) frameLightArr = new LightData[frameLightCount];
         for (int i = 0; i < frameLightCount; i++) frameLightArr[i] = frameLights.get(i);
 
-        // (3) Geometry setup + per-triangle lighting + per-object shadow checks (multi-core)
         buildTriangleBatchParallel(renderRoots, width, height, f, far, tanHalfFov, camX, camY, camZ);
 
-        // (4) Rasterization (already multi-core)
         final int workers = Math.max(1, Math.min(maxWorkers, height));
         if (workers == 1) {
             renderSlice(0, height, width, height);
@@ -202,9 +195,6 @@ public class Renderer {
         g2d.drawImage(frameBuffer, 0, 0, windowW, windowH, null);
     }
 
-    // ----------------------------
-    // Stage 1: scene query / object collection (parallel)
-    // ----------------------------
     private void buildNearbyRootListsParallel(double camX, double camZ, double far) {
         nearbyRenderables.clear();
         nearbyOccludersQ.clear();
@@ -263,9 +253,6 @@ public class Renderer {
         }
     }
 
-    // ----------------------------
-    // Stage 2: light + occluder gathering (parallel)
-    // ----------------------------
     private void gatherLightsAndOccludersParallel(List<GameObject> roots,
                                                   List<GameObject> nearbyOccluders,
                                                   double camX, double camY, double camZ,
@@ -273,7 +260,6 @@ public class Renderer {
         frameLights.clear();
         solidOccluders.clear();
 
-        // ---- 2a) Solid occluders filtering in parallel
         if (nearbyOccluders != null && !nearbyOccluders.isEmpty()) {
             final int n = nearbyOccluders.size();
             final int workers = Math.max(1, Math.min(maxWorkers, n));
@@ -327,7 +313,6 @@ public class Renderer {
             }
         }
 
-        // ---- 2b) Light + emissive gathering in parallel over root partitions
         if (roots != null && !roots.isEmpty()) {
             final int nRoots = roots.size();
             final int workers = Math.max(1, Math.min(maxWorkers, nRoots));
@@ -381,7 +366,6 @@ public class Renderer {
             frameLights.add(fallback);
         }
 
-        // Snapshot occluder arrays
         occluderCount = solidOccluders.size();
         if (occluderObjs.length < occluderCount) occluderObjs = new GameObject[occluderCount];
         if (occluderAabbs.length < occluderCount) occluderAabbs = new AABB[occluderCount];
@@ -408,7 +392,6 @@ public class Renderer {
             GameObject g = stack.pop();
             if (g == null || !g.isActive()) continue;
 
-            // LightObjects
             if (g instanceof objects.lighting.LightObject lo) {
                 LightData ld = lo.getLight();
                 if (ld != null && ld.strength > 0.0) {
@@ -424,7 +407,6 @@ public class Renderer {
                 }
             }
 
-            // Emissive -> create a LightData (no shared pool contention)
             Material m = g.getMaterial();
             if (m != null && m.getEmissiveStrength() > 0.0 && m.getEmissiveRange() > 0.0) {
                 Vector3 wp = g.getWorldPosition();
@@ -469,9 +451,37 @@ public class Renderer {
         return false;
     }
 
-    // ----------------------------
-    // Stage 3: geometry + per-triangle lighting + shadows (parallel)
-    // ----------------------------
+    /**
+     * First-person player rendering filter:
+     * Render a node if it is part of an "arm branch", meaning the node itself OR ANY ancestor (up to playerRoot)
+     * has enough lateral offset from the player center in camera-space.
+     *
+     * This keeps hands/forearms from flickering when they swing inward.
+     */
+    private boolean shouldRenderPlayerNodeFirstPerson(GameObject node,
+                                                      GameObject playerRoot,
+                                                      double feetX, double feetY, double feetZ) {
+        if (node == null) return false;
+        if (node == playerRoot) return false;
+
+        // Walk up the chain: if any ancestor is clearly an arm branch, render this node.
+        // Use world POSITION (not AABB center) for stability.
+        for (GameObject p = node; p != null && p != playerRoot; p = p.getParent()) {
+            Vector3 wp = p.getWorldPosition();
+
+            double dx = wp.x - feetX;
+            double dz = wp.z - feetZ;
+
+            double xLocal = dx * cy + dz * sy;
+
+            if (Math.abs(xLocal) >= (FP_ARMS_MIN_ABS_X - 1e-6)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     private void buildTriangleBatchParallel(List<GameObject> topLevel,
                                             int width, int height,
                                             double f, double far,
@@ -483,7 +493,6 @@ public class Renderer {
         final double tanHalfFovY = tanHalfFovX * (height / (double) width);
         final GameObject playerBody = gameEngine.getPlayerBody();
 
-        // Worker count based on number of top-level roots to process
         final int n = topLevel.size();
         final int workers = Math.max(1, Math.min(maxWorkers, n));
 
@@ -605,21 +614,34 @@ public class Renderer {
             if (r != null) stack.push(r);
         }
 
+        final boolean firstPerson = gameEngine.isFirstPerson();
+        final double feetX = camera.x;
+        final double feetY = camera.y;
+        final double feetZ = camera.z;
+
         while (!stack.isEmpty()) {
             GameObject go = stack.pop();
             if (go == null || !go.isVisible()) continue;
 
             boolean isPlayerFamily = (playerBody != null) && isDescendantOrSelf(go, playerBody);
-            if (camera.isFirstPerson() && isPlayerFamily) continue;
 
-            // push children
             List<GameObject> kids = go.getChildren();
             if (kids != null && !kids.isEmpty()) {
                 for (int i = kids.size() - 1; i >= 0; i--) stack.push(kids.get(i));
             }
 
-            // object cull
-            if (!passesObjectCull(go, camX, camY, camZ, far, tanHalfFovX, tanHalfFovY)) continue;
+            // FIRST PERSON: keep only arm branches from the player model.
+            if (firstPerson && isPlayerFamily) {
+                if (!shouldRenderPlayerNodeFirstPerson(go, playerBody, feetX, feetY, feetZ)) {
+                    continue;
+                }
+            }
+
+            // IMPORTANT: do NOT run the coarse frustum-sphere cull for first-person player arms.
+            // Those parts are extremely close to the camera and can get incorrectly rejected.
+            if (!(firstPerson && isPlayerFamily)) {
+                if (!passesObjectCull(go, camX, camY, camZ, far, tanHalfFovX, tanHalfFovY)) continue;
+            }
 
             double[][] wverts = go.getTransformedVertices();
             int[][] facesArr = go.getFacesArray();
@@ -652,10 +674,22 @@ public class Renderer {
 
             final boolean doubleSided = !go.isFull();
             final boolean treatAsPlayer = isPlayerFamily;
-            final double thisNear = treatAsPlayer ? Math.max(NEAR, BODY_NEAR_PAD) : NEAR;
-            final double thisBias = treatAsPlayer ? BODY_Z_BIAS : 0.0;
 
-            // camera-space verts
+            final double thisNear;
+            final double thisBias;
+            if (treatAsPlayer) {
+                if (firstPerson) {
+                    thisNear = Math.max(1e-6, FP_ARMS_NEAR);
+                    thisBias = FP_ARMS_Z_BIAS;
+                } else {
+                    thisNear = Math.max(NEAR, BODY_NEAR_PAD);
+                    thisBias = BODY_Z_BIAS;
+                }
+            } else {
+                thisNear = NEAR;
+                thisBias = 0.0;
+            }
+
             for (int i = 0; i < wverts.length; i++) {
                 double[] w = wverts[i];
                 double wx = w[0] - camX;
@@ -683,7 +717,6 @@ public class Renderer {
                 ctx.vv[i] = v;
             }
 
-            // object-level shadow flags (per light)
             final int lightCount = frameLightCount;
             ctx.ensureShadowFlags(lightCount);
             boolean doShadows = lightCount > 0 && occluderCount > 0;
@@ -750,7 +783,6 @@ public class Renderer {
                 }
             }
 
-            // faces -> per-triangle lighting + clip + project -> ctx.batch
             for (int[] face : facesArr) {
                 if (face == null || face.length != 3) continue;
                 int i0 = face[0], i1 = face[1], i2 = face[2];
@@ -873,7 +905,6 @@ public class Renderer {
                 int shadeG = to255(clamp01(ambient + diffuse * lg));
                 int shadeB = to255(clamp01(ambient + diffuse * lb));
 
-                // near clip
                 ctx.cax[0] = ctx.vx[i0]; ctx.cay[0] = ctx.vy[i0]; ctx.caz[0] = ctx.vz[i0]; ctx.cau[0] = ctx.uu[i0]; ctx.cav[0] = ctx.vv[i0];
                 ctx.cax[1] = ctx.vx[i1]; ctx.cay[1] = ctx.vy[i1]; ctx.caz[1] = ctx.vz[i1]; ctx.cau[1] = ctx.uu[i1]; ctx.cav[1] = ctx.vv[i1];
                 ctx.cax[2] = ctx.vx[i2]; ctx.cay[2] = ctx.vy[i2]; ctx.caz[2] = ctx.vz[i2]; ctx.cau[2] = ctx.uu[i2]; ctx.cav[2] = ctx.vv[i2];
@@ -924,9 +955,6 @@ public class Renderer {
         }
     }
 
-    // ----------------------------
-    // Raster slice
-    // ----------------------------
     private void renderSlice(int yStart, int yEnd, int width, int height) {
         int startIdx = yStart * width;
         int endIdx = yEnd * width;
@@ -1083,6 +1111,8 @@ public class Renderer {
         tMinY = Arrays.copyOf(tMinY, newCap);
         tMaxY = Arrays.copyOf(tMaxY, newCap);
     }
+
+    // --- Rasterizer + shading + occlusion + clip code unchanged below ---
 
     private void rasterizeTriangleTopLeftSlice(
             double x0, double y0, float iz0, float uoz0, float voz0,
@@ -1395,24 +1425,16 @@ public class Renderer {
         return outCount;
     }
 
-    // ----------------------------
-    // Worker structures
-    // ----------------------------
     private static final class WorkerContext {
-        // per-object temp arrays
         double[] vx = new double[0], vy = new double[0], vz = new double[0], uu = new double[0], vv = new double[0];
 
-        // clip temps
         final double[] cax = new double[4], cay = new double[4], caz = new double[4], cau = new double[4], cav = new double[4];
         final double[] cbx = new double[4], cby = new double[4], cbz = new double[4], cbu = new double[4], cbv = new double[4];
 
-        // shadow flags
         boolean[] shadowedPerLight = new boolean[0];
 
-        // traversal stack
         final ArrayDeque<GameObject> stack = new ArrayDeque<>(256);
 
-        // per-worker triangle batch
         final TriBatch batch = new TriBatch();
 
         void ensureTemps(int n) {

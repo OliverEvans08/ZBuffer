@@ -12,7 +12,11 @@ public class Camera {
 
     public static final double WIDTH = 0.6;
     public static final double HEIGHT = 1.8;
+
     public static final double EYE_HEIGHT = 1.6;
+    public static final double HEAD_HEIGHT = HEIGHT - 0.08;
+
+    private static final double FP_FORWARD_OFFSET = 0.06;
 
     public static final double GRAVITY = -30.0;
     public static final double JUMP_STRENGTH = 10.0;
@@ -62,7 +66,6 @@ public class Camera {
     private double fwdX, fwdY, fwdZ;
     private double rightX, rightY, rightZ;
 
-    // Reused nearby-collider buffer (no rootObjects scan).
     private final ArrayList<GameObject> nearby = new ArrayList<>(256);
 
     public Camera(double x, double y, double z, double pitch, double yaw, GameEngine gameEngine) {
@@ -93,6 +96,21 @@ public class Camera {
     public double getViewYaw()   { return viewYaw; }
     public double getViewPitch() { return viewPitch; }
 
+    /**
+     * Gameplay/interaction ray origin.
+     * - First person: exactly the camera view position
+     * - Third person: the player's eye pivot near the body (NOT the camera behind)
+     */
+    public double getAimX() {
+        return (mode == Mode.FIRST_PERSON) ? eyeX : (x + bobX);
+    }
+    public double getAimY() {
+        return (mode == Mode.FIRST_PERSON) ? eyeY : (y + EYE_HEIGHT + bobY);
+    }
+    public double getAimZ() {
+        return (mode == Mode.FIRST_PERSON) ? eyeZ : z;
+    }
+
     public double getForwardX() { updateBasisIfNeeded(); return fwdX; }
     public double getForwardY() { updateBasisIfNeeded(); return fwdY; }
     public double getForwardZ() { updateBasisIfNeeded(); return fwdZ; }
@@ -112,8 +130,9 @@ public class Camera {
         if (!flightMode && onGround) {
             yVelocity = JUMP_STRENGTH;
             onGround = false;
+
             if (gameEngine != null && gameEngine.soundEngine != null) {
-                gameEngine.soundEngine.fireSound("jump.wav");
+                gameEngine.soundEngine.fireSound("jump.wav", 0.55);
             }
         }
     }
@@ -203,7 +222,6 @@ public class Camera {
 
         final double halfW = WIDTH * 0.5;
 
-        // Query only nearby colliders (grid cells overlapped by player footprint).
         gameEngine.queryNearbyCollidersXZ(
                 x - halfW, x + halfW,
                 z - halfW, z + halfW,
@@ -211,7 +229,7 @@ public class Camera {
         );
 
         for (GameObject obj : nearby) {
-            if (obj == null) continue; // already solid-only from index, but be safe
+            if (obj == null) continue;
 
             AABB b = obj.getWorldAABB();
             if (!intersectsAABB(b, halfW)) continue;
@@ -239,7 +257,6 @@ public class Camera {
 
         onGround = false;
 
-        // Same nearby query (XZ footprint); exact Y is filtered by intersectsAABB.
         gameEngine.queryNearbyCollidersXZ(
                 x - halfW, x + halfW,
                 z - halfW, z + halfW,
@@ -282,13 +299,19 @@ public class Camera {
 
     private void recomputeViewOrigin(double dt) {
         final double pivotX = x + bobX;
-        final double pivotY = y + EYE_HEIGHT + bobY;
         final double pivotZ = z;
 
+        final double tpsPivotY = y + EYE_HEIGHT + bobY;
+        final double fpY = y + HEAD_HEIGHT + bobY;
+
         if (mode == Mode.FIRST_PERSON) {
-            eyeX = pivotX;
-            eyeY = pivotY;
-            eyeZ = pivotZ;
+            double pfX = -Math.sin(yaw);
+            double pfZ =  Math.cos(yaw);
+
+            eyeX = pivotX + pfX * FP_FORWARD_OFFSET;
+            eyeY = fpY;
+            eyeZ = pivotZ + pfZ * FP_FORWARD_OFFSET;
+
             viewYaw = yaw;
             viewPitch = pitch;
             return;
@@ -297,17 +320,17 @@ public class Camera {
         updateBasisIfNeeded();
 
         double desiredX = pivotX - fwdX * thirdPersonDistance + rightX * shoulderOffset;
-        double desiredY = pivotY - fwdY * thirdPersonDistance + rightY * shoulderOffset;
+        double desiredY = tpsPivotY - fwdY * thirdPersonDistance + rightY * shoulderOffset;
         double desiredZ = pivotZ - fwdZ * thirdPersonDistance + rightZ * shoulderOffset;
 
-        double[] adjusted = resolveThirdPersonCameraCollision(pivotX, pivotY, pivotZ, desiredX, desiredY, desiredZ);
+        double[] adjusted = resolveThirdPersonCameraCollision(pivotX, tpsPivotY, pivotZ, desiredX, desiredY, desiredZ);
         double tx = adjusted[0], ty = adjusted[1], tz = adjusted[2];
 
         if (dt <= 0.0) {
             eyeX = tx; eyeY = ty; eyeZ = tz;
         } else {
-            double currDist = dist3(eyeX, eyeY, eyeZ, pivotX, pivotY, pivotZ);
-            double targDist = dist3(tx, ty, tz, pivotX, pivotY, pivotZ);
+            double currDist = dist3(eyeX, eyeY, eyeZ, pivotX, tpsPivotY, pivotZ);
+            double targDist = dist3(tx, ty, tz, pivotX, tpsPivotY, pivotZ);
             double k = (targDist < currDist) ? TPS_SMOOTH_IN : TPS_SMOOTH_OUT;
             double a = 1.0 - Math.exp(-dt * k);
 
@@ -360,7 +383,6 @@ public class Camera {
 
         double bestHit = Double.POSITIVE_INFINITY;
 
-        // Query only nearby colliders (XZ span of the segment box).
         gameEngine.queryNearbyCollidersXZ(segMinX, segMaxX, segMinZ, segMaxZ, nearby);
 
         for (GameObject obj : nearby) {
@@ -369,9 +391,7 @@ public class Camera {
 
             AABB b = obj.getWorldAABB();
 
-            // Keep existing Y cull (even though grid is XZ).
             if (b.maxY < segMinY || b.minY > segMaxY) continue;
-
             if (aabbContainsPoint(b, pivotX, pivotY, pivotZ)) continue;
 
             double hit = rayAabbHitDistance(pivotX, pivotY, pivotZ, dirX, dirY, dirZ, dist, b);

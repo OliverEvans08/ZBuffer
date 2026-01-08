@@ -17,18 +17,16 @@ public class InputHandler implements KeyListener, MouseMotionListener, MouseList
     private final Set<Integer> pressedKeys;
     private final Robot robot;
 
-    private static final long ACTION_COOLDOWN_MS = 200;
+    private static final long ACTION_COOLDOWN_MS = 120;
     private long lastActionTime = 0;
 
     private boolean captureMouse = true;
 
     private volatile boolean ignoreNextMouseMove = false;
 
-    // For relative mouse without constant warps
     private int lastMouseX = -1;
     private int lastMouseY = -1;
 
-    // How close to edge before we warp back to center
     private static final int EDGE_MARGIN = 20;
 
     public InputHandler(EventBus bus, GameEngine gameEngine) {
@@ -46,6 +44,22 @@ public class InputHandler implements KeyListener, MouseMotionListener, MouseList
     private void setupGlobalKeyDispatcher() {
         KeyboardFocusManager.getCurrentKeyboardFocusManager().addKeyEventDispatcher(event -> {
             if (event.getID() != KeyEvent.KEY_PRESSED) return false;
+
+            // Always allow inventory toggle with no cooldown (feels better)
+            if (event.getKeyCode() == KeyEvent.VK_E) {
+                bus.publish(new InventoryToggleRequestedEvent());
+                return true;
+            }
+
+            // Hotbar number keys: 1..9 (no cooldown)
+            int kc = event.getKeyCode();
+            if (kc >= KeyEvent.VK_1 && kc <= KeyEvent.VK_9) {
+                int idx = kc - KeyEvent.VK_1;
+                bus.publish(new HotbarSelectRequestedEvent(idx));
+                return true;
+            }
+
+            // For actions below, apply cooldown
             if (!actionReady()) return false;
 
             if (event.getKeyCode() == KeyEvent.VK_P) {
@@ -60,11 +74,31 @@ public class InputHandler implements KeyListener, MouseMotionListener, MouseList
                 bus.publish(new ToggleViewRequestedEvent());
                 return true;
             }
+
+            // Pickup & Drop
+            if (event.getKeyCode() == KeyEvent.VK_F) {
+                bus.publish(new PickupRequestedEvent());
+                return true;
+            }
+            if (event.getKeyCode() == KeyEvent.VK_Q) {
+                bus.publish(new DropHeldItemRequestedEvent());
+                return true;
+            }
+
             return false;
         });
     }
 
     public void updatePerTick() {
+        // Freeze movement while either UI is open
+        boolean uiOpen = (gameEngine.clickGUI != null && gameEngine.clickGUI.isOpen())
+                || (gameEngine.inventoryUI != null && gameEngine.inventoryUI.isOpen());
+
+        if (uiOpen) {
+            bus.publish(new MovementIntentEvent(false, false, false, false, false, false));
+            return;
+        }
+
         boolean forward = pressedKeys.contains(KeyEvent.VK_W);
         boolean backward = pressedKeys.contains(KeyEvent.VK_S);
         boolean left = pressedKeys.contains(KeyEvent.VK_A);
@@ -92,6 +126,10 @@ public class InputHandler implements KeyListener, MouseMotionListener, MouseList
             gameEngine.showCursor();
             return;
         }
+        if (gameEngine.inventoryUI != null && gameEngine.inventoryUI.isOpen()) {
+            gameEngine.showCursor();
+            return;
+        }
 
         int centerX = panel.getWidth() / 2;
         int centerY = panel.getHeight() / 2;
@@ -101,7 +139,6 @@ public class InputHandler implements KeyListener, MouseMotionListener, MouseList
         ignoreNextMouseMove = true;
         robot.mouseMove(p.x, p.y);
 
-        // Reset last positions so next delta is clean
         lastMouseX = centerX;
         lastMouseY = centerY;
 
@@ -114,8 +151,14 @@ public class InputHandler implements KeyListener, MouseMotionListener, MouseList
 
     @Override
     public void mouseMoved(MouseEvent e) {
-        ClickGUI gui = gameEngine.clickGUI;
+        // Inventory UI gets mouse first if open
+        if (gameEngine.inventoryUI != null && gameEngine.inventoryUI.isOpen()) {
+            gameEngine.showCursor();
+            gameEngine.inventoryUI.mouseMoved(e);
+            return;
+        }
 
+        ClickGUI gui = gameEngine.clickGUI;
         if (gui != null && gui.isOpen()) {
             gameEngine.showCursor();
             gui.mouseMoved(e);
@@ -150,7 +193,6 @@ public class InputHandler implements KeyListener, MouseMotionListener, MouseList
             bus.publish(new MouseLookEvent(dx, dy));
         }
 
-        // Only warp when close to edges (reduces stutter massively)
         int w = gameEngine.getWidth();
         int h = gameEngine.getHeight();
         if (robot != null && w > 0 && h > 0) {
@@ -164,14 +206,50 @@ public class InputHandler implements KeyListener, MouseMotionListener, MouseList
 
     @Override
     public void mouseDragged(MouseEvent e) {
+        if (gameEngine.inventoryUI != null && gameEngine.inventoryUI.isOpen()) {
+            gameEngine.inventoryUI.mouseDragged(e);
+            return;
+        }
         if (gameEngine.clickGUI != null) {
             gameEngine.clickGUI.mouseDragged(e.getX(), e.getY());
         }
     }
 
-    @Override public void mouseClicked(MouseEvent e) { if (gameEngine.clickGUI != null) gameEngine.clickGUI.clicked(e.getX(), e.getY()); }
-    @Override public void mousePressed(MouseEvent e) { if (gameEngine.clickGUI != null) gameEngine.clickGUI.mousePressed(e); }
-    @Override public void mouseReleased(MouseEvent e){ if (gameEngine.clickGUI != null) gameEngine.clickGUI.mouseReleased(e); }
+    @Override
+    public void mouseClicked(MouseEvent e) {
+        if (gameEngine.inventoryUI != null && gameEngine.inventoryUI.isOpen()) {
+            gameEngine.inventoryUI.mouseClicked(e);
+            return;
+        }
+        if (gameEngine.clickGUI != null) gameEngine.clickGUI.clicked(e.getX(), e.getY());
+    }
+
+    @Override
+    public void mousePressed(MouseEvent e) {
+        if (gameEngine.inventoryUI != null && gameEngine.inventoryUI.isOpen()) {
+            gameEngine.inventoryUI.mousePressed(e);
+            return;
+        }
+        if (gameEngine.clickGUI != null && gameEngine.clickGUI.isOpen()) {
+            gameEngine.clickGUI.mousePressed(e);
+            return;
+        }
+
+        // In game: left click uses held item
+        if (e.getButton() == MouseEvent.BUTTON1) {
+            if (actionReady()) bus.publish(new UseHeldItemRequestedEvent());
+        }
+    }
+
+    @Override
+    public void mouseReleased(MouseEvent e) {
+        if (gameEngine.inventoryUI != null && gameEngine.inventoryUI.isOpen()) {
+            gameEngine.inventoryUI.mouseReleased(e);
+            return;
+        }
+        if (gameEngine.clickGUI != null) gameEngine.clickGUI.mouseReleased(e);
+    }
+
     @Override public void mouseEntered(MouseEvent e) {}
     @Override public void mouseExited(MouseEvent e)  {}
 
