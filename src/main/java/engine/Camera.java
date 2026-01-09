@@ -1,10 +1,10 @@
 package engine;
 
+import java.util.ArrayList;
+
 import objects.GameObject;
 import objects.dynamic.Body;
 import util.AABB;
-
-import java.util.ArrayList;
 
 public class Camera {
 
@@ -68,15 +68,12 @@ public class Camera {
 
     private final ArrayList<GameObject> nearby = new ArrayList<>(256);
 
-    // --- Mesh-collider tuning ---
-    // Pad per-triangle bounds so perfectly-flat faces still collide (floors/ceilings).
     private static final double MESH_TRI_PAD = 0.02;
-
-    // abs(ny) >= this => treat triangle as floor/ceiling (vertical collision)
     private static final double TRI_FLOOR_NY = 0.65;
-
-    // Helps "snap" to floors and avoids jitter when falling tiny amounts each tick
     private static final double VERT_SNAP_EPS = 0.06;
+
+    // --- NEW: ray/triangle epsilon for camera mesh collision
+    private static final double TRI_EPS = 1e-9;
 
     public Camera(double x, double y, double z, double pitch, double yaw, GameEngine gameEngine) {
         this.x = x;
@@ -222,8 +219,6 @@ public class Camera {
         if (yaw < -Math.PI) yaw += twoPi;
     }
 
-    // ---------------- COLLISION (FIXED) ----------------
-
     private void resolveHorizontalCollisions() {
         if (gameEngine == null) return;
 
@@ -241,8 +236,6 @@ public class Camera {
             AABB broad = obj.getWorldAABB();
             if (!intersectsAABB(broad, halfW)) continue;
 
-            // If this object has triangles, collide against the mesh surface (per-triangle AABBs),
-            // instead of treating the whole object AABB as solid.
             int[][] faces = obj.getFacesArray();
             double[][] wverts = obj.getTransformedVertices();
 
@@ -255,7 +248,6 @@ public class Camera {
     }
 
     private void resolveHorizontalAgainstAabb(AABB b, double halfW) {
-        // Same as your old logic (box collider)
         double penX = Math.min((x + halfW) - b.minX, b.maxX - (x - halfW));
         double penZ = Math.min((z + halfW) - b.minZ, b.maxZ - (z - halfW));
 
@@ -289,7 +281,6 @@ public class Camera {
             double bx = b[0], by = b[1], bz = b[2];
             double cx = c[0], cy = c[1], cz = c[2];
 
-            // Classify: skip near-horizontal faces here (floors/ceilings) so walking doesn't get "pushed" by floors.
             double ux = bx - ax, uy = by - ay, uz = bz - az;
             double vx = cx - ax, vy = cy - ay, vz = cz - az;
 
@@ -301,7 +292,7 @@ public class Camera {
             if (nlen < 1e-12) continue;
 
             double absNy = Math.abs(ny) / nlen;
-            if (absNy >= TRI_FLOOR_NY) continue; // floors/ceilings handled by vertical resolver
+            if (absNy >= TRI_FLOOR_NY) continue;
 
             double minX = min3(ax, bx, cx) - MESH_TRI_PAD;
             double maxX = max3(ax, bx, cx) + MESH_TRI_PAD;
@@ -334,7 +325,6 @@ public class Camera {
         final double halfW = WIDTH * 0.5;
         final boolean movingDown = (y < prevY);
 
-        // Important: reset ground state here; we recompute it based on actual floor hits.
         onGround = false;
 
         gameEngine.queryNearbyCollidersXZ(
@@ -356,7 +346,6 @@ public class Camera {
 
             AABB broad = obj.getWorldAABB();
 
-            // XZ overlap test only (cheaper, and avoids vertical “teleport to top” when inside sideways volumes)
             if ((x + halfW) <= broad.minX || (x - halfW) >= broad.maxX ||
                     (z + halfW) <= broad.minZ || (z - halfW) >= broad.maxZ) {
                 continue;
@@ -374,7 +363,6 @@ public class Camera {
                     if (ceil < bestCeil) bestCeil = ceil;
                 }
             } else {
-                // Box collider vertical resolution (but fixed: only resolve if you actually cross the top/bottom)
                 if (movingDown) {
                     double top = broad.maxY;
                     if (prevFeet >= top - VERT_SNAP_EPS && newFeet <= top + VERT_SNAP_EPS) {
@@ -428,7 +416,6 @@ public class Camera {
             double bx = b[0], by = b[1], bz = b[2];
             double cx = c[0], cy = c[1], cz = c[2];
 
-            // Floor/ceiling classification by normal
             double ux = bx - ax, uy = by - ay, uz = bz - az;
             double vx = cx - ax, vy = cy - ay, vz = cz - az;
 
@@ -450,15 +437,12 @@ public class Camera {
             double minZ = min3(az, bz, cz) - MESH_TRI_PAD;
             double maxZ = max3(az, bz, cz) + MESH_TRI_PAD;
 
-            // XZ overlap
             if ((x + halfW) <= minX || (x - halfW) >= maxX ||
                     (z + halfW) <= minZ || (z - halfW) >= maxZ) {
                 continue;
             }
 
-            // Only "land" if we came from above (or very near above) and are now at/below the surface.
             if (prevFeet >= rawMaxY - VERT_SNAP_EPS && newFeet <= rawMaxY + VERT_SNAP_EPS) {
-                // Ensure player volume is actually above the triangle slab
                 if (newHead > (rawMinY - MESH_TRI_PAD)) {
                     if (rawMaxY > best) best = rawMaxY;
                 }
@@ -489,7 +473,6 @@ public class Camera {
             double bx = b[0], by = b[1], bz = b[2];
             double cx = c[0], cy = c[1], cz = c[2];
 
-            // Floor/ceiling classification by normal
             double ux = bx - ax, uy = by - ay, uz = bz - az;
             double vx = cx - ax, vy = cy - ay, vz = cz - az;
 
@@ -511,13 +494,11 @@ public class Camera {
             double minZ = min3(az, bz, cz) - MESH_TRI_PAD;
             double maxZ = max3(az, bz, cz) + MESH_TRI_PAD;
 
-            // XZ overlap
             if ((x + halfW) <= minX || (x - halfW) >= maxX ||
                     (z + halfW) <= minZ || (z - halfW) >= maxZ) {
                 continue;
             }
 
-            // Only "hit head" if we came from below (or near below) and are now at/above the ceiling plane.
             if (prevHead <= rawMinY + VERT_SNAP_EPS && newHead >= rawMinY - VERT_SNAP_EPS) {
                 if (newFeet < (rawMaxY + MESH_TRI_PAD)) {
                     if (rawMinY < best) best = rawMinY;
@@ -646,9 +627,34 @@ public class Camera {
             AABB b = obj.getWorldAABB();
 
             if (b.maxY < segMinY || b.minY > segMaxY) continue;
-            if (aabbContainsPoint(b, pivotX, pivotY, pivotZ)) continue;
 
-            double hit = rayAabbHitDistance(pivotX, pivotY, pivotZ, dirX, dirY, dirZ, dist, b);
+            // --- CHANGED: do NOT skip just because pivot is inside AABB.
+            // Instead, we test mesh triangles when available (prevents "see through wall" in hollow meshes).
+
+            int[][] faces = obj.getFacesArray();
+            double[][] wverts = obj.getTransformedVertices();
+
+            double hit = Double.POSITIVE_INFINITY;
+
+            if (faces != null && wverts != null && faces.length > 0 && wverts.length > 0) {
+                // Broad-phase: does the ray segment even intersect the object's AABB?
+                double aabbHit = rayAabbHitDistance(pivotX, pivotY, pivotZ, dirX, dirY, dirZ, dist, b);
+                if (aabbHit == Double.POSITIVE_INFINITY) continue;
+
+                // If origin is outside, entry distance is a lower bound for any triangle hit.
+                boolean originInside = aabbContainsPoint(b, pivotX, pivotY, pivotZ);
+                if (!originInside && aabbHit >= bestHit) continue;
+
+                hit = rayMeshHitDistance(
+                        pivotX, pivotY, pivotZ,
+                        dirX, dirY, dirZ,
+                        Math.min(dist, bestHit),
+                        faces, wverts
+                );
+            } else {
+                hit = rayAabbHitDistance(pivotX, pivotY, pivotZ, dirX, dirY, dirZ, dist, b);
+            }
+
             if (hit > 0.0 && hit < bestHit) bestHit = hit;
         }
 
@@ -673,6 +679,89 @@ public class Camera {
                 pz >= b.minZ && pz <= b.maxZ;
     }
 
+    // --- NEW: Ray vs mesh (triangles) for camera collision
+    private static double rayMeshHitDistance(
+            double ox, double oy, double oz,
+            double dx, double dy, double dz,
+            double maxDist,
+            int[][] faces,
+            double[][] wverts
+    ) {
+        double best = Double.POSITIVE_INFINITY;
+        if (faces == null || wverts == null) return best;
+        if (maxDist <= 1e-9) return best;
+
+        for (int fi = 0; fi < faces.length; fi++) {
+            int[] f = faces[fi];
+            if (f == null || f.length != 3) continue;
+
+            int i0 = f[0], i1 = f[1], i2 = f[2];
+            if (i0 < 0 || i1 < 0 || i2 < 0 || i0 >= wverts.length || i1 >= wverts.length || i2 >= wverts.length) continue;
+
+            double[] a = wverts[i0];
+            double[] b = wverts[i1];
+            double[] c = wverts[i2];
+            if (a == null || b == null || c == null) continue;
+
+            double t = rayTriangleHitDistance(
+                    ox, oy, oz, dx, dy, dz,
+                    a[0], a[1], a[2],
+                    b[0], b[1], b[2],
+                    c[0], c[1], c[2],
+                    Math.min(maxDist, best)
+            );
+
+            if (t < best) {
+                best = t;
+                if (best <= TRI_EPS) break;
+            }
+        }
+
+        return best;
+    }
+
+    // --- NEW: Möller–Trumbore, double-sided (we want walls to block from either side)
+    private static double rayTriangleHitDistance(
+            double ox, double oy, double oz,
+            double dx, double dy, double dz,
+            double ax, double ay, double az,
+            double bx, double by, double bz,
+            double cx, double cy, double cz,
+            double maxDist
+    ) {
+        double e1x = bx - ax, e1y = by - ay, e1z = bz - az;
+        double e2x = cx - ax, e2y = cy - ay, e2z = cz - az;
+
+        // p = d x e2
+        double px = dy * e2z - dz * e2y;
+        double py = dz * e2x - dx * e2z;
+        double pz = dx * e2y - dy * e2x;
+
+        double det = e1x * px + e1y * py + e1z * pz;
+
+        // double-sided: just reject near-parallel
+        if (det > -TRI_EPS && det < TRI_EPS) return Double.POSITIVE_INFINITY;
+        double invDet = 1.0 / det;
+
+        double tx = ox - ax, ty = oy - ay, tz = oz - az;
+        double u = (tx * px + ty * py + tz * pz) * invDet;
+        if (u < 0.0 || u > 1.0) return Double.POSITIVE_INFINITY;
+
+        // q = t x e1
+        double qx = ty * e1z - tz * e1y;
+        double qy = tz * e1x - tx * e1z;
+        double qz = tx * e1y - ty * e1x;
+
+        double v = (dx * qx + dy * qy + dz * qz) * invDet;
+        if (v < 0.0 || (u + v) > 1.0) return Double.POSITIVE_INFINITY;
+
+        double t = (e2x * qx + e2y * qy + e2z * qz) * invDet;
+        if (t <= 1e-6) return Double.POSITIVE_INFINITY;
+        if (t > maxDist) return Double.POSITIVE_INFINITY;
+        return t;
+    }
+
+    // --- CHANGED: Ray vs AABB now handles the "origin inside box" case (returns exit distance)
     private static double rayAabbHitDistance(
             double ox, double oy, double oz,
             double dx, double dy, double dz,
@@ -718,8 +807,15 @@ public class Camera {
             if (tmin > tmax) return Double.POSITIVE_INFINITY;
         }
 
-        if (tmin <= 1e-6) return Double.POSITIVE_INFINITY;
-        return tmin;
+        boolean inside = aabbContainsPoint(b, ox, oy, oz);
+
+        if (!inside) {
+            if (tmin <= 1e-6) return Double.POSITIVE_INFINITY;
+            return tmin;
+        } else {
+            if (tmax <= 1e-6) return Double.POSITIVE_INFINITY;
+            return tmax; // exit distance
+        }
     }
 
     private static double clamp01(double v) {

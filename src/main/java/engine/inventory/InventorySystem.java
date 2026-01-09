@@ -5,6 +5,7 @@ import engine.GameEngine;
 import engine.event.EventBus;
 import engine.event.events.*;
 import engine.render.Material;
+
 import objects.GameObject;
 import util.AABB;
 import util.Vector3;
@@ -52,6 +53,11 @@ public final class InventorySystem {
     private static final double DROP_XZ_PAD = 0.03;
 
     private static final double WORLD_GROUND_Y = 0.0;
+
+    // --- NEW: mesh-floor support for drops (mirrors camera/player "empty space within AABB" logic)
+    private static final double DROP_TRI_PAD = 0.02;
+    private static final double DROP_FLOOR_NY = 0.65;
+    private static final double DROP_SUPPORT_EPS = 0.06;
 
     private final java.util.ArrayList<GameObject> tmpColliders = new java.util.ArrayList<>(256);
 
@@ -135,6 +141,9 @@ public final class InventorySystem {
 
         double t0;
 
+        // --- NEW: track previous Y so we can choose the correct supporting surface (not roof/AABB top)
+        double prevY;
+
         DropState(ItemInstance item, GameObject model) {
             this.item = item;
             this.model = model;
@@ -173,6 +182,7 @@ public final class InventorySystem {
         st.yVel = 0.0;
         st.bottomOffset = bottomOffset;
         st.t0 = Math.random() * 10.0;
+        st.prevY = y;
 
         settleDropAgainstWorld(st);
 
@@ -219,7 +229,6 @@ public final class InventorySystem {
         DropState target = lookedAt;
         if (target == null || target.model == null) return;
 
-        // FIX: use gameplay aim origin (player head), not the third-person camera position.
         double ex = engine.camera.getAimX();
         double ey = engine.camera.getAimY();
         double ez = engine.camera.getAimZ();
@@ -248,6 +257,9 @@ public final class InventorySystem {
             for (DropState st : drops.values()) {
                 if (st == null || st.model == null) continue;
 
+                // record prev Y (used by settling logic)
+                st.prevY = st.model.getTransform().position.y;
+
                 double t = st.t0 + (System.nanoTime() / 1_000_000_000.0);
                 st.model.getTransform().rotation.y += DROP_SPIN_SPEED * dt;
 
@@ -255,32 +267,36 @@ public final class InventorySystem {
 
                 if (st.onGround) {
                     st.model.getTransform().position.y = st.baseY + bob;
+                    continue;
                 }
 
-                if (!st.onGround) {
-                    st.yVel += DROP_GRAVITY * dt;
-                    st.model.getTransform().position.y += st.yVel * dt;
+                st.yVel += DROP_GRAVITY * dt;
+                st.model.getTransform().position.y += st.yVel * dt;
 
-                    settleDropAgainstWorld(st);
-                }
+                settleDropAgainstWorld(st);
             }
         }
     }
 
+    // --- CHANGED: drops now settle using mesh-floor triangles (and only floors below them),
+    //              not the outer AABB top of a hollow object.
     private void settleDropAgainstWorld(DropState st) {
         if (st == null || st.model == null) return;
 
         AABB a = st.model.getWorldAABB();
 
-        double minX = a.minX - DROP_XZ_PAD;
-        double maxX = a.maxX + DROP_XZ_PAD;
-        double minZ = a.minZ - DROP_XZ_PAD;
-        double maxZ = a.maxZ + DROP_XZ_PAD;
+        double dropMinX = a.minX - DROP_XZ_PAD;
+        double dropMaxX = a.maxX + DROP_XZ_PAD;
+        double dropMinZ = a.minZ - DROP_XZ_PAD;
+        double dropMaxZ = a.maxZ + DROP_XZ_PAD;
 
-        engine.queryNearbyCollidersXZ(minX, maxX, minZ, maxZ, tmpColliders);
+        engine.queryNearbyCollidersXZ(dropMinX, dropMaxX, dropMinZ, dropMaxZ, tmpColliders);
 
-        double bestTop = WORLD_GROUND_Y;
-        boolean found = false;
+        // We only allow support surfaces up to this height, which prevents snapping to roofs / AABB tops above the item.
+        double prevBottomApprox = st.prevY + st.bottomOffset;
+        double supportMaxY = Math.max(prevBottomApprox, a.minY) + DROP_SUPPORT_EPS;
+
+        double bestFloorY = WORLD_GROUND_Y;
 
         for (GameObject g : tmpColliders) {
             if (g == null) continue;
@@ -289,23 +305,35 @@ public final class InventorySystem {
 
             AABB b = g.getWorldAABB();
 
-            if (a.maxX <= b.minX || a.minX >= b.maxX) continue;
-            if (a.maxZ <= b.minZ || a.minZ >= b.maxZ) continue;
+            if (dropMaxX <= b.minX || dropMinX >= b.maxX) continue;
+            if (dropMaxZ <= b.minZ || dropMinZ >= b.maxZ) continue;
 
-            double top = b.maxY;
-            if (top > bestTop) {
-                bestTop = top;
-                found = true;
+            int[][] faces = g.getFacesArray();
+            double[][] wverts = g.getTransformedVertices();
+
+            if (faces != null && wverts != null && faces.length > 0 && wverts.length > 0) {
+                double floor = findBestMeshFloorYForDrop(
+                        faces, wverts,
+                        dropMinX, dropMaxX,
+                        dropMinZ, dropMaxZ,
+                        supportMaxY
+                );
+                if (floor > bestFloorY) bestFloorY = floor;
+            } else {
+                double top = b.maxY;
+                if (top <= supportMaxY && top > bestFloorY) {
+                    bestFloorY = top;
+                }
             }
         }
 
-        double desiredBaseY = bestTop - st.bottomOffset;
+        double desiredBaseY = bestFloorY - st.bottomOffset;
 
         double minBaseY = WORLD_GROUND_Y - st.bottomOffset;
         if (desiredBaseY < minBaseY) desiredBaseY = minBaseY;
 
-        double bottomY = a.minY;
-        if (bottomY <= bestTop + DROP_EPS) {
+        // land if the item bottom is at/below the best floor
+        if (a.minY <= bestFloorY + DROP_EPS) {
             st.baseY = desiredBaseY;
             st.model.getTransform().position.y = st.baseY;
             st.yVel = 0.0;
@@ -315,12 +343,67 @@ public final class InventorySystem {
         }
     }
 
+    // --- NEW: floor search inside a mesh (horizontal-ish triangles only), restricted to floors below the drop
+    private static double findBestMeshFloorYForDrop(
+            int[][] faces, double[][] wverts,
+            double dropMinX, double dropMaxX,
+            double dropMinZ, double dropMaxZ,
+            double supportMaxY
+    ) {
+        double best = Double.NEGATIVE_INFINITY;
+
+        for (int fi = 0; fi < faces.length; fi++) {
+            int[] f = faces[fi];
+            if (f == null || f.length != 3) continue;
+
+            int i0 = f[0], i1 = f[1], i2 = f[2];
+            if (i0 < 0 || i1 < 0 || i2 < 0 || i0 >= wverts.length || i1 >= wverts.length || i2 >= wverts.length) continue;
+
+            double[] a = wverts[i0];
+            double[] b = wverts[i1];
+            double[] c = wverts[i2];
+            if (a == null || b == null || c == null) continue;
+
+            double ax = a[0], ay = a[1], az = a[2];
+            double bx = b[0], by = b[1], bz = b[2];
+            double cx = c[0], cy = c[1], cz = c[2];
+
+            // normal for "floor-ish" test
+            double ux = bx - ax, uy = by - ay, uz = bz - az;
+            double vx = cx - ax, vy = cy - ay, vz = cz - az;
+
+            double nx = uy * vz - uz * vy;
+            double ny = uz * vx - ux * vz;
+            double nz = ux * vy - uy * vx;
+
+            double nlen = Math.sqrt(nx*nx + ny*ny + nz*nz);
+            if (nlen < 1e-12) continue;
+
+            double absNy = Math.abs(ny) / nlen;
+            if (absNy < DROP_FLOOR_NY) continue;
+
+            double triMaxY = max3(ay, by, cy);
+            if (triMaxY > supportMaxY) continue;
+
+            double minX = min3(ax, bx, cx) - DROP_TRI_PAD;
+            double maxX = max3(ax, bx, cx) + DROP_TRI_PAD;
+            double minZ = min3(az, bz, cz) - DROP_TRI_PAD;
+            double maxZ = max3(az, bz, cz) + DROP_TRI_PAD;
+
+            if (dropMaxX <= minX || dropMinX >= maxX) continue;
+            if (dropMaxZ <= minZ || dropMinZ >= maxZ) continue;
+
+            if (triMaxY > best) best = triMaxY;
+        }
+
+        return best;
+    }
+
     private void updateLookedAt() {
         lookedAt = null;
         if (ui.isOpen()) return;
         if (drops.isEmpty()) return;
 
-        // FIX: use gameplay aim origin (player head), not the third-person camera position.
         double ex = engine.camera.getAimX();
         double ey = engine.camera.getAimY();
         double ez = engine.camera.getAimZ();
@@ -512,5 +595,13 @@ public final class InventorySystem {
         if (p != null) {
             try { p.removeChild(child); } catch (Throwable ignored) {}
         }
+    }
+
+    private static double min3(double a, double b, double c) {
+        return Math.min(a, Math.min(b, c));
+    }
+
+    private static double max3(double a, double b, double c) {
+        return Math.max(a, Math.max(b, c));
     }
 }
