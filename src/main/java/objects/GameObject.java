@@ -1,5 +1,6 @@
 package objects;
 
+import engine.MeshData;
 import engine.animation.Animator;
 import engine.render.Material;
 import util.AABB;
@@ -7,9 +8,9 @@ import util.Matrix4;
 import util.Transform;
 import util.Vector3;
 
-import java.awt.*;
+import java.awt.Color;
 import java.util.*;
-import java.util.List;
+import java.util.UUID;
 
 public abstract class GameObject {
 
@@ -33,11 +34,14 @@ public abstract class GameObject {
 
     private Animator animator;
 
-    // --- caches ---
+    // Optional mesh reference (data-driven meshes)
+    private MeshData mesh = null;
+
     private final Matrix4 cachedWorld = new Matrix4();
     private long cachedWorldStamp = Long.MIN_VALUE;
 
     private static final double[][] EMPTY_VERTS = new double[0][0];
+    private static final int[][] EMPTY_EDGES = new int[0][];
 
     private double[][] cachedTransformed = null;
     private int cachedVertCount = -1;
@@ -56,6 +60,36 @@ public abstract class GameObject {
         this.childrenView = Collections.unmodifiableList(children);
     }
 
+    // ---------------------------
+    // MeshData attachment (optional)
+    // ---------------------------
+
+    public MeshData getMesh() { return mesh; }
+
+    /**
+     * Attach/detach a mesh reference.
+     * This does NOT copy arrays; MeshData is shared & cached by AssetManager.
+     */
+    public GameObject setMesh(MeshData mesh) {
+        this.mesh = mesh;
+
+        // Mesh swap must invalidate geometry caches even if transform didn't change.
+        cachedWorldStamp = Long.MIN_VALUE;
+        cachedTransformedStamp = Long.MIN_VALUE;
+        cachedWorldAabbStamp = Long.MIN_VALUE;
+
+        cachedTransformed = null;
+        cachedVertCount = -1;
+        cachedAabbVertCount = -1;
+        worldAabbDirty = true;
+
+        return this;
+    }
+
+    // ---------------------------
+    // Scene graph
+    // ---------------------------
+
     public void addChild(GameObject child) {
         if (child == null || child == this) return;
         if (child.parent == this) return;
@@ -64,7 +98,6 @@ public abstract class GameObject {
         children.add(child);
 
         child.markWorldAABBDirty();
-        // world stamp will change automatically due to parent chain
     }
 
     public void removeChild(GameObject child) {
@@ -97,11 +130,27 @@ public abstract class GameObject {
         return getWorldTransform().transform(new Vector3(0,0,0));
     }
 
-    public abstract double[][] getVertices();
-    public abstract int[][] getEdges();
+    // ---------------------------
+    // Geometry (default: from MeshData if attached; else empty)
+    // Existing procedural objects can still override these.
+    // ---------------------------
 
-    public int[][] getFacesArray() { return null; }
-    public double[][] getUVs() { return null; }
+    public double[][] getVertices() {
+        MeshData m = this.mesh;
+        return (m != null ? m.getVertices() : EMPTY_VERTS);
+    }
+
+    public int[][] getEdges() { return EMPTY_EDGES; }
+
+    public int[][] getFacesArray() {
+        MeshData m = this.mesh;
+        return (m != null ? m.getFaces() : null);
+    }
+
+    public double[][] getUVs() {
+        MeshData m = this.mesh;
+        return (m != null ? m.getUVs() : null);
+    }
 
     public double[][] getTransformedVertices() {
         double[][] local = getVertices();
@@ -116,7 +165,7 @@ public abstract class GameObject {
 
         long stamp = computeWorldStamp();
         if (stamp == cachedTransformedStamp) {
-            return cachedTransformed; // huge win for static objects
+            return cachedTransformed;
         }
 
         Matrix4 M = getWorldTransform();
@@ -156,7 +205,6 @@ public abstract class GameObject {
         cachedWorldAabbStamp = Long.MIN_VALUE;
     }
 
-    // Made protected so LightObject can reuse it for cheap "sync only if changed"
     protected long computeWorldStamp() {
         long localVer = transform.getVersion();
         if (parent == null) return mix64(localVer);
@@ -203,7 +251,12 @@ public abstract class GameObject {
         return new AABB(minX, maxX, minY, maxY, minZ, maxZ);
     }
 
+    // Behavior
     public abstract void update(double delta);
+
+    // ---------------------------
+    // Flags / render properties
+    // ---------------------------
 
     public boolean isActive()  { return active; }
     public void setActive(boolean active) { this.active = active; }

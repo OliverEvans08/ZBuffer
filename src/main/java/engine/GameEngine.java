@@ -3,16 +3,16 @@ package engine;
 import engine.animation.AnimationSystem;
 import engine.core.GameClock;
 import engine.event.EventBus;
-import engine.event.events.*;
+import engine.event.events.GuiToggleRequestedEvent;
+import engine.event.events.InventoryOpenChangedEvent;
+import engine.event.events.TickEvent;
 import engine.inventory.InventorySystem;
 import engine.inventory.InventoryUI;
-import engine.render.Material;
 import engine.systems.PlayerController;
 import gui.ClickGUI;
 import objects.GameObject;
+import objects.MeshObject;
 import objects.dynamic.Body;
-import objects.fixed.Cube;
-import objects.fixed.ImportedOBJ;
 import objects.lighting.LightObject;
 import sound.SoundEngine;
 import util.Vector3;
@@ -66,6 +66,9 @@ public class GameEngine extends JPanel implements Runnable {
 
     private Thread gameThread;
 
+    // NEW: asset-driven meshes
+    public final AssetManager assetManager;
+
     public GameEngine() {
         this.eventBus = new EventBus();
         this.clock = new GameClock(1.0 / 60.0);
@@ -76,10 +79,14 @@ public class GameEngine extends JPanel implements Runnable {
         this.renderer = new Renderer(camera, this);
 
         this.soundEngine = new SoundEngine("./src/main/java/sound/wavs");
-        this.soundEngine.setMasterVolume(0.25); // sane default; tweak if you want
+        this.soundEngine.setMasterVolume(0.25);
 
         this.clickGUI = new ClickGUI(this);
         this.inputHandler = new InputHandler(eventBus, this);
+
+        // NEW: load meshes once at startup
+        this.assetManager = new AssetManager();
+        this.assetManager.loadAllMeshes();
 
         this.playerBody = new Body(Camera.WIDTH, Camera.HEIGHT);
         this.playerBody.setFull(false);
@@ -179,9 +186,41 @@ public class GameEngine extends JPanel implements Runnable {
     }
 
     private void initializeGameObjects() {
-        ImportedOBJ importedOBJ = new ImportedOBJ();
-        rootObjects.add(importedOBJ);
 
+        // ✅ Spawn *all* loaded meshes, not just the first one.
+        List<String> ids = assetManager.getMeshIds();
+        if (ids.isEmpty()) {
+            System.err.println("[GameEngine] No meshes found. Place .obj files under: " + AssetManager.DEFAULT_MODELS_ROOT);
+        } else {
+            System.out.println("[GameEngine] Available meshes: " + ids);
+
+            final double spacing = 6.0;
+            final int cols = Math.max(1, (int) Math.ceil(Math.sqrt(ids.size())));
+            final double baseX = -((Math.min(cols, ids.size()) - 1) * spacing) * 0.5;
+            final double baseZ = 12.0;
+
+            for (int i = 0; i < ids.size(); i++) {
+                String id = ids.get(i);
+                MeshData mesh = assetManager.getMeshOrNull(id);
+                if (mesh == null) continue;
+
+                int col = i % cols;
+                int row = i / cols;
+
+                MeshObject m = new MeshObject(mesh);
+                m.setFull(true);
+                m.setName(mesh.getId());
+                m.getTransform().position = new Vector3(
+                        baseX + col * spacing,
+                        0.0,
+                        baseZ + row * spacing
+                );
+
+                addRootObject(m);
+            }
+
+            System.out.println("[GameEngine] Spawned mesh instances: " + ids.size());
+        }
 
         LightObject sun = LightObject.directional(
                 new Vector3(-0.4, -0.85, 0.3),
@@ -298,7 +337,6 @@ public class GameEngine extends JPanel implements Runnable {
 
         AnimationSystem.updateAll(rootObjects, delta);
 
-        // improved sound system uses queued playback + pooling (polyphonic)
         soundEngine.tick();
     }
 

@@ -68,6 +68,16 @@ public class Camera {
 
     private final ArrayList<GameObject> nearby = new ArrayList<>(256);
 
+    // --- Mesh-collider tuning ---
+    // Pad per-triangle bounds so perfectly-flat faces still collide (floors/ceilings).
+    private static final double MESH_TRI_PAD = 0.02;
+
+    // abs(ny) >= this => treat triangle as floor/ceiling (vertical collision)
+    private static final double TRI_FLOOR_NY = 0.65;
+
+    // Helps "snap" to floors and avoids jitter when falling tiny amounts each tick
+    private static final double VERT_SNAP_EPS = 0.06;
+
     public Camera(double x, double y, double z, double pitch, double yaw, GameEngine gameEngine) {
         this.x = x;
         this.y = y;
@@ -96,11 +106,6 @@ public class Camera {
     public double getViewYaw()   { return viewYaw; }
     public double getViewPitch() { return viewPitch; }
 
-    /**
-     * Gameplay/interaction ray origin.
-     * - First person: exactly the camera view position
-     * - Third person: the player's eye pivot near the body (NOT the camera behind)
-     */
     public double getAimX() {
         return (mode == Mode.FIRST_PERSON) ? eyeX : (x + bobX);
     }
@@ -217,6 +222,8 @@ public class Camera {
         if (yaw < -Math.PI) yaw += twoPi;
     }
 
+    // ---------------- COLLISION (FIXED) ----------------
+
     private void resolveHorizontalCollisions() {
         if (gameEngine == null) return;
 
@@ -231,19 +238,91 @@ public class Camera {
         for (GameObject obj : nearby) {
             if (obj == null) continue;
 
-            AABB b = obj.getWorldAABB();
-            if (!intersectsAABB(b, halfW)) continue;
+            AABB broad = obj.getWorldAABB();
+            if (!intersectsAABB(broad, halfW)) continue;
 
-            double penX = Math.min((x + halfW) - b.minX, b.maxX - (x - halfW));
-            double penZ = Math.min((z + halfW) - b.minZ, b.maxZ - (z - halfW));
+            // If this object has triangles, collide against the mesh surface (per-triangle AABBs),
+            // instead of treating the whole object AABB as solid.
+            int[][] faces = obj.getFacesArray();
+            double[][] wverts = obj.getTransformedVertices();
+
+            if (faces != null && wverts != null && faces.length > 0 && wverts.length > 0) {
+                resolveHorizontalAgainstMeshFaces(faces, wverts, halfW);
+            } else {
+                resolveHorizontalAgainstAabb(broad, halfW);
+            }
+        }
+    }
+
+    private void resolveHorizontalAgainstAabb(AABB b, double halfW) {
+        // Same as your old logic (box collider)
+        double penX = Math.min((x + halfW) - b.minX, b.maxX - (x - halfW));
+        double penZ = Math.min((z + halfW) - b.minZ, b.maxZ - (z - halfW));
+
+        if (penX <= 0 || penZ <= 0) return;
+
+        if (penX < penZ) {
+            double leftDist = (x + halfW) - b.minX;
+            double rightDist = b.maxX - (x - halfW);
+            if (leftDist < rightDist) x -= penX; else x += penX;
+        } else {
+            double frontDist = (z + halfW) - b.minZ;
+            double backDist  = b.maxZ - (z - halfW);
+            if (frontDist < backDist) z -= penZ; else z += penZ;
+        }
+    }
+
+    private void resolveHorizontalAgainstMeshFaces(int[][] faces, double[][] wverts, double halfW) {
+        for (int fi = 0; fi < faces.length; fi++) {
+            int[] f = faces[fi];
+            if (f == null || f.length != 3) continue;
+
+            int i0 = f[0], i1 = f[1], i2 = f[2];
+            if (i0 < 0 || i1 < 0 || i2 < 0 || i0 >= wverts.length || i1 >= wverts.length || i2 >= wverts.length) continue;
+
+            double[] a = wverts[i0];
+            double[] b = wverts[i1];
+            double[] c = wverts[i2];
+            if (a == null || b == null || c == null) continue;
+
+            double ax = a[0], ay = a[1], az = a[2];
+            double bx = b[0], by = b[1], bz = b[2];
+            double cx = c[0], cy = c[1], cz = c[2];
+
+            // Classify: skip near-horizontal faces here (floors/ceilings) so walking doesn't get "pushed" by floors.
+            double ux = bx - ax, uy = by - ay, uz = bz - az;
+            double vx = cx - ax, vy = cy - ay, vz = cz - az;
+
+            double nx = uy * vz - uz * vy;
+            double ny = uz * vx - ux * vz;
+            double nz = ux * vy - uy * vx;
+
+            double nlen = Math.sqrt(nx*nx + ny*ny + nz*nz);
+            if (nlen < 1e-12) continue;
+
+            double absNy = Math.abs(ny) / nlen;
+            if (absNy >= TRI_FLOOR_NY) continue; // floors/ceilings handled by vertical resolver
+
+            double minX = min3(ax, bx, cx) - MESH_TRI_PAD;
+            double maxX = max3(ax, bx, cx) + MESH_TRI_PAD;
+            double minY = min3(ay, by, cy) - MESH_TRI_PAD;
+            double maxY = max3(ay, by, cy) + MESH_TRI_PAD;
+            double minZ = min3(az, bz, cz) - MESH_TRI_PAD;
+            double maxZ = max3(az, bz, cz) + MESH_TRI_PAD;
+
+            if (!intersectsPlayerBounds(minX, maxX, minY, maxY, minZ, maxZ, halfW)) continue;
+
+            double penX = Math.min((x + halfW) - minX, maxX - (x - halfW));
+            double penZ = Math.min((z + halfW) - minZ, maxZ - (z - halfW));
+            if (penX <= 0 || penZ <= 0) continue;
 
             if (penX < penZ) {
-                double leftDist = (x + halfW) - b.minX;
-                double rightDist = b.maxX - (x - halfW);
+                double leftDist = (x + halfW) - minX;
+                double rightDist = maxX - (x - halfW);
                 if (leftDist < rightDist) x -= penX; else x += penX;
             } else {
-                double frontDist = (z + halfW) - b.minZ;
-                double backDist  = b.maxZ - (z - halfW);
+                double frontDist = (z + halfW) - minZ;
+                double backDist  = maxZ - (z - halfW);
                 if (frontDist < backDist) z -= penZ; else z += penZ;
             }
         }
@@ -253,8 +332,9 @@ public class Camera {
         if (gameEngine == null) return;
 
         final double halfW = WIDTH * 0.5;
-        boolean movingDown = (y < prevY);
+        final boolean movingDown = (y < prevY);
 
+        // Important: reset ground state here; we recompute it based on actual floor hits.
         onGround = false;
 
         gameEngine.queryNearbyCollidersXZ(
@@ -263,24 +343,198 @@ public class Camera {
                 nearby
         );
 
+        final double prevFeet = prevY;
+        final double prevHead = prevY + HEIGHT;
+        final double newFeet  = y;
+        final double newHead  = y + HEIGHT;
+
+        double bestFloor = Double.NEGATIVE_INFINITY;
+        double bestCeil  = Double.POSITIVE_INFINITY;
+
         for (GameObject obj : nearby) {
             if (obj == null) continue;
 
-            AABB b = obj.getWorldAABB();
-            if (!intersectsAABB(b, halfW)) continue;
+            AABB broad = obj.getWorldAABB();
 
-            double penY = Math.min((y + HEIGHT) - b.minY, b.maxY - y);
-            if (penY <= 0) continue;
+            // XZ overlap test only (cheaper, and avoids vertical “teleport to top” when inside sideways volumes)
+            if ((x + halfW) <= broad.minX || (x - halfW) >= broad.maxX ||
+                    (z + halfW) <= broad.minZ || (z - halfW) >= broad.maxZ) {
+                continue;
+            }
 
-            if (movingDown) {
-                y = b.maxY;
+            int[][] faces = obj.getFacesArray();
+            double[][] wverts = obj.getTransformedVertices();
+
+            if (faces != null && wverts != null && faces.length > 0 && wverts.length > 0) {
+                if (movingDown) {
+                    double floor = findBestMeshFloorY(faces, wverts, halfW, prevFeet, newFeet, newHead);
+                    if (floor > bestFloor) bestFloor = floor;
+                } else {
+                    double ceil = findBestMeshCeilY(faces, wverts, halfW, prevHead, newHead, newFeet);
+                    if (ceil < bestCeil) bestCeil = ceil;
+                }
+            } else {
+                // Box collider vertical resolution (but fixed: only resolve if you actually cross the top/bottom)
+                if (movingDown) {
+                    double top = broad.maxY;
+                    if (prevFeet >= top - VERT_SNAP_EPS && newFeet <= top + VERT_SNAP_EPS) {
+                        if (newHead > broad.minY - 1e-9) {
+                            if (top > bestFloor) bestFloor = top;
+                        }
+                    }
+                } else {
+                    double bottom = broad.minY;
+                    if (prevHead <= bottom + VERT_SNAP_EPS && newHead >= bottom - VERT_SNAP_EPS) {
+                        if (newFeet < broad.maxY + 1e-9) {
+                            if (bottom < bestCeil) bestCeil = bottom;
+                        }
+                    }
+                }
+            }
+        }
+
+        if (movingDown) {
+            if (bestFloor != Double.NEGATIVE_INFINITY) {
+                y = bestFloor;
                 yVelocity = 0;
                 onGround = true;
-            } else {
-                y = b.minY - HEIGHT;
+            }
+        } else {
+            if (bestCeil != Double.POSITIVE_INFINITY) {
+                y = bestCeil - HEIGHT;
                 yVelocity = 0;
             }
         }
+    }
+
+    private double findBestMeshFloorY(int[][] faces, double[][] wverts,
+                                      double halfW,
+                                      double prevFeet, double newFeet, double newHead) {
+        double best = Double.NEGATIVE_INFINITY;
+
+        for (int fi = 0; fi < faces.length; fi++) {
+            int[] f = faces[fi];
+            if (f == null || f.length != 3) continue;
+
+            int i0 = f[0], i1 = f[1], i2 = f[2];
+            if (i0 < 0 || i1 < 0 || i2 < 0 || i0 >= wverts.length || i1 >= wverts.length || i2 >= wverts.length) continue;
+
+            double[] a = wverts[i0];
+            double[] b = wverts[i1];
+            double[] c = wverts[i2];
+            if (a == null || b == null || c == null) continue;
+
+            double ax = a[0], ay = a[1], az = a[2];
+            double bx = b[0], by = b[1], bz = b[2];
+            double cx = c[0], cy = c[1], cz = c[2];
+
+            // Floor/ceiling classification by normal
+            double ux = bx - ax, uy = by - ay, uz = bz - az;
+            double vx = cx - ax, vy = cy - ay, vz = cz - az;
+
+            double nx = uy * vz - uz * vy;
+            double ny = uz * vx - ux * vz;
+            double nz = ux * vy - uy * vx;
+
+            double nlen = Math.sqrt(nx*nx + ny*ny + nz*nz);
+            if (nlen < 1e-12) continue;
+
+            double absNy = Math.abs(ny) / nlen;
+            if (absNy < TRI_FLOOR_NY) continue;
+
+            double rawMaxY = max3(ay, by, cy);
+            double rawMinY = min3(ay, by, cy);
+
+            double minX = min3(ax, bx, cx) - MESH_TRI_PAD;
+            double maxX = max3(ax, bx, cx) + MESH_TRI_PAD;
+            double minZ = min3(az, bz, cz) - MESH_TRI_PAD;
+            double maxZ = max3(az, bz, cz) + MESH_TRI_PAD;
+
+            // XZ overlap
+            if ((x + halfW) <= minX || (x - halfW) >= maxX ||
+                    (z + halfW) <= minZ || (z - halfW) >= maxZ) {
+                continue;
+            }
+
+            // Only "land" if we came from above (or very near above) and are now at/below the surface.
+            if (prevFeet >= rawMaxY - VERT_SNAP_EPS && newFeet <= rawMaxY + VERT_SNAP_EPS) {
+                // Ensure player volume is actually above the triangle slab
+                if (newHead > (rawMinY - MESH_TRI_PAD)) {
+                    if (rawMaxY > best) best = rawMaxY;
+                }
+            }
+        }
+
+        return best;
+    }
+
+    private double findBestMeshCeilY(int[][] faces, double[][] wverts,
+                                     double halfW,
+                                     double prevHead, double newHead, double newFeet) {
+        double best = Double.POSITIVE_INFINITY;
+
+        for (int fi = 0; fi < faces.length; fi++) {
+            int[] f = faces[fi];
+            if (f == null || f.length != 3) continue;
+
+            int i0 = f[0], i1 = f[1], i2 = f[2];
+            if (i0 < 0 || i1 < 0 || i2 < 0 || i0 >= wverts.length || i1 >= wverts.length || i2 >= wverts.length) continue;
+
+            double[] a = wverts[i0];
+            double[] b = wverts[i1];
+            double[] c = wverts[i2];
+            if (a == null || b == null || c == null) continue;
+
+            double ax = a[0], ay = a[1], az = a[2];
+            double bx = b[0], by = b[1], bz = b[2];
+            double cx = c[0], cy = c[1], cz = c[2];
+
+            // Floor/ceiling classification by normal
+            double ux = bx - ax, uy = by - ay, uz = bz - az;
+            double vx = cx - ax, vy = cy - ay, vz = cz - az;
+
+            double nx = uy * vz - uz * vy;
+            double ny = uz * vx - ux * vz;
+            double nz = ux * vy - uy * vx;
+
+            double nlen = Math.sqrt(nx*nx + ny*ny + nz*nz);
+            if (nlen < 1e-12) continue;
+
+            double absNy = Math.abs(ny) / nlen;
+            if (absNy < TRI_FLOOR_NY) continue;
+
+            double rawMinY = min3(ay, by, cy);
+            double rawMaxY = max3(ay, by, cy);
+
+            double minX = min3(ax, bx, cx) - MESH_TRI_PAD;
+            double maxX = max3(ax, bx, cx) + MESH_TRI_PAD;
+            double minZ = min3(az, bz, cz) - MESH_TRI_PAD;
+            double maxZ = max3(az, bz, cz) + MESH_TRI_PAD;
+
+            // XZ overlap
+            if ((x + halfW) <= minX || (x - halfW) >= maxX ||
+                    (z + halfW) <= minZ || (z - halfW) >= maxZ) {
+                continue;
+            }
+
+            // Only "hit head" if we came from below (or near below) and are now at/above the ceiling plane.
+            if (prevHead <= rawMinY + VERT_SNAP_EPS && newHead >= rawMinY - VERT_SNAP_EPS) {
+                if (newFeet < (rawMaxY + MESH_TRI_PAD)) {
+                    if (rawMinY < best) best = rawMinY;
+                }
+            }
+        }
+
+        return best;
+    }
+
+    private boolean intersectsPlayerBounds(double bMinX, double bMaxX,
+                                           double bMinY, double bMaxY,
+                                           double bMinZ, double bMaxZ,
+                                           double halfW) {
+        return (x + halfW > bMinX && x - halfW < bMaxX) &&
+                (y + HEIGHT > bMinY && y < bMaxY) &&
+                (z + halfW > bMinZ && z - halfW < bMaxZ);
     }
 
     private boolean intersectsAABB(AABB b, double halfW) {
@@ -472,5 +726,13 @@ public class Camera {
         if (v < 0) return 0;
         if (v > 1) return 1;
         return v;
+    }
+
+    private static double min3(double a, double b, double c) {
+        return Math.min(a, Math.min(b, c));
+    }
+
+    private static double max3(double a, double b, double c) {
+        return Math.max(a, Math.max(b, c));
     }
 }
