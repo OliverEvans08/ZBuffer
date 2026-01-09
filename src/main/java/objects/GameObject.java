@@ -8,8 +8,10 @@ import util.Matrix4;
 import util.Transform;
 import util.Vector3;
 
-import java.awt.Color;
-import java.util.*;
+import java.awt.*;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
 import java.util.UUID;
 
 public abstract class GameObject {
@@ -23,7 +25,13 @@ public abstract class GameObject {
 
     private boolean active  = true;
     private boolean visible = true;
-    private boolean full = false;
+
+    // Separate flags:
+    // - solid: affects collision/occlusion/physics-style "is this a solid object?"
+    // - wireframe: affects how it should be rendered (filled vs wireframe)
+    private boolean solid = false;
+    private boolean wireframe = false;
+
     private Color color = Color.WHITE;
 
     private Material material = null;
@@ -34,7 +42,6 @@ public abstract class GameObject {
 
     private Animator animator;
 
-    // Optional mesh reference (data-driven meshes)
     private MeshData mesh = null;
 
     private final Matrix4 cachedWorld = new Matrix4();
@@ -60,20 +67,11 @@ public abstract class GameObject {
         this.childrenView = Collections.unmodifiableList(children);
     }
 
-    // ---------------------------
-    // MeshData attachment (optional)
-    // ---------------------------
-
     public MeshData getMesh() { return mesh; }
 
-    /**
-     * Attach/detach a mesh reference.
-     * This does NOT copy arrays; MeshData is shared & cached by AssetManager.
-     */
     public GameObject setMesh(MeshData mesh) {
         this.mesh = mesh;
 
-        // Mesh swap must invalidate geometry caches even if transform didn't change.
         cachedWorldStamp = Long.MIN_VALUE;
         cachedTransformedStamp = Long.MIN_VALUE;
         cachedWorldAabbStamp = Long.MIN_VALUE;
@@ -85,10 +83,6 @@ public abstract class GameObject {
 
         return this;
     }
-
-    // ---------------------------
-    // Scene graph
-    // ---------------------------
 
     public void addChild(GameObject child) {
         if (child == null || child == this) return;
@@ -129,11 +123,6 @@ public abstract class GameObject {
     public Vector3 getWorldPosition() {
         return getWorldTransform().transform(new Vector3(0,0,0));
     }
-
-    // ---------------------------
-    // Geometry (default: from MeshData if attached; else empty)
-    // Existing procedural objects can still override these.
-    // ---------------------------
 
     public double[][] getVertices() {
         MeshData m = this.mesh;
@@ -251,12 +240,7 @@ public abstract class GameObject {
         return new AABB(minX, maxX, minY, maxY, minZ, maxZ);
     }
 
-    // Behavior
     public abstract void update(double delta);
-
-    // ---------------------------
-    // Flags / render properties
-    // ---------------------------
 
     public boolean isActive()  { return active; }
     public void setActive(boolean active) { this.active = active; }
@@ -264,8 +248,19 @@ public abstract class GameObject {
     public boolean isVisible() { return visible; }
     public void setVisible(boolean visible) { this.visible = visible; }
 
-    public boolean isFull() { return full; }
-    public void setFull(boolean full) { this.full = full; }
+    // --- New: solidity (collision/occlusion) ---
+    public boolean isSolid() { return solid; }
+    public void setSolid(boolean solid) { this.solid = solid; }
+
+    // --- New: render mode (filled vs wireframe) ---
+    public boolean isWireframe() { return wireframe; }
+    public void setWireframe(boolean wireframe) { this.wireframe = wireframe; }
+    public boolean isRenderFull() { return !wireframe; }
+    public void setRenderFull(boolean full) { this.wireframe = !full; }
+
+    // Back-compat: old API used one flag. Keep it mapping to SOLID to avoid breaking existing code.
+    public boolean isFull() { return isSolid(); }
+    public void setFull(boolean full) { setSolid(full); }
 
     public Color getColor() { return color; }
 

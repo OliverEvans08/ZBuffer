@@ -23,7 +23,6 @@ public final class ItemRegistry {
         ITEMS.put(def.getId(), def);
     }
 
-    // === Example items (you can add more) ===
     static {
         register(new ItemDefinition("blue_cube", "Blue Cube") {
             @Override public GameObject createWorldModel() {
@@ -46,6 +45,9 @@ public final class ItemRegistry {
                 c.setMaterial(Material.solid(new Color(80, 140, 255)).setAmbient(0.35).setDiffuse(0.65));
                 return c;
             }
+
+            @Override public java.awt.Color getHudColor() { return new java.awt.Color(80, 140, 255); }
+            @Override public String getHudAbbrev() { return "BC"; }
         });
 
         register(new ItemDefinition("red_cube", "Red Cube") {
@@ -69,6 +71,9 @@ public final class ItemRegistry {
                 c.setMaterial(Material.solid(new Color(240, 70, 70)).setAmbient(0.35).setDiffuse(0.65));
                 return c;
             }
+
+            @Override public java.awt.Color getHudColor() { return new java.awt.Color(240, 70, 70); }
+            @Override public String getHudAbbrev() { return "RC"; }
         });
     }
 }

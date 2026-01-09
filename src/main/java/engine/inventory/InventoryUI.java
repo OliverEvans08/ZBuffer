@@ -12,23 +12,28 @@ public final class InventoryUI {
     private final InventorySystem system;
     private boolean open = false;
 
-    // Item currently held by the mouse cursor (dragging)
     private ItemInstance cursorItem = null;
 
-    // Mouse position
     private int mx = 0, my = 0;
 
-    // Cached slot rects for interaction (only meaningful when open)
     private Rectangle[] hotbarRects = new Rectangle[0];
     private Rectangle[] storageRects = new Rectangle[0];
 
-    // Layout tuning
     private static final int HUD_HOTBAR_SLOT = 46;
     private static final int HUD_HOTBAR_PAD  = 6;
 
     private static final int INV_SLOT = 44;
     private static final int INV_PAD  = 8;
     private static final int INV_COLS = 8;
+
+    private static final int HELD_LOGO_SIZE = 64;
+    private static final int HELD_LOGO_MARGIN = 18;
+
+    // Icon sizing
+    private static final int HUD_ICON_MAX = 32;
+    private static final int INV_ICON_MAX = 30;
+
+    private final ItemIconCache iconCache = new ItemIconCache();
 
     InventoryUI(GameEngine engine, InventorySystem system) {
         this.engine = engine;
@@ -38,7 +43,6 @@ public final class InventoryUI {
     public boolean isOpen() { return open; }
 
     void setOpen(boolean open) {
-        // If closing inventory while holding an item, try to return it safely
         if (this.open && !open && cursorItem != null) {
             system.returnCursorItem(cursorItem);
             cursorItem = null;
@@ -54,12 +58,13 @@ public final class InventoryUI {
         renderHotbarHUD(g, w, h);
         renderPickupPrompt(g, w, h);
 
+        // Held item logo (first-person HUD)
+        renderHeldItemLogo(g, w, h);
+
         if (open) {
             renderInventoryOverlay(g, w, h);
         }
     }
-
-    // ---------------- HUD hotbar (bottom of screen, when not necessarily open) ----------------
 
     private void renderHotbarHUD(Graphics2D g, int w, int h) {
         Inventory inv = system.getInventory();
@@ -90,11 +95,8 @@ public final class InventoryUI {
 
             ItemInstance it = inv.getHotbar(i);
             if (it != null) {
-                String name = fitText(fm, it.getDef().getDisplayName(), slotSize - 8);
-                Shape oldClip = g.getClip();
-                g.setClip(x + 2, y0 + 2, slotSize - 4, slotSize - 4);
-                g.drawString(name, x + 4, y0 + slotSize - 6);
-                g.setClip(oldClip);
+                // Draw icon (preferred), then a tiny fitted name at bottom (optional fallback)
+                drawSlotContents(g, it, x, y0, slotSize, true, fm);
             }
         }
     }
@@ -117,12 +119,70 @@ public final class InventoryUI {
         g.drawString(s, x, y);
     }
 
-    // ---------------- Inventory overlay ----------------
+    private void renderHeldItemLogo(Graphics2D g, int w, int h) {
+        if (open) return;
+        if (!engine.isFirstPerson()) return;
+
+        ItemInstance it = system.getInventory().getSelectedItem();
+        if (it == null || it.getDef() == null) return;
+
+        ItemDefinition def = it.getDef();
+
+        int size = HELD_LOGO_SIZE;
+        int x = w - size - HELD_LOGO_MARGIN;
+        int y = (h / 2) - (size / 2) + 40;
+
+        // Backplate
+        g.setColor(new Color(0, 0, 0, 160));
+        g.fillRoundRect(x, y, size, size, 14, 14);
+
+        // Outline
+        Color hud = def.getHudColor();
+        if (hud == null) hud = Color.WHITE;
+        g.setColor(new Color(hud.getRed(), hud.getGreen(), hud.getBlue(), 210));
+        g.drawRoundRect(x, y, size, size, 14, 14);
+
+        // Icon inside
+        int pad = 6;
+        int iconSize = size - pad * 2;
+        boolean drew = drawItemIcon(g, def, x + pad, y + pad, iconSize);
+
+        // Fallback: abbreviation if no icon
+        if (!drew) {
+            String abbr = def.getHudAbbrev();
+            if (abbr == null || abbr.isBlank()) abbr = makeAbbrev(def.getDisplayName());
+
+            g.setFont(new Font("Dialog", Font.BOLD, 20));
+            FontMetrics fm = g.getFontMetrics();
+            int tw = fm.stringWidth(abbr);
+            int th = fm.getAscent();
+
+            g.setColor(new Color(255, 255, 255, 235));
+            g.drawString(abbr, x + (size - tw) / 2, y + (size + th) / 2 - 4);
+        }
+
+        // Name label under
+        String name = def.getDisplayName();
+        if (name != null && !name.isBlank()) {
+            g.setFont(new Font("Dialog", Font.PLAIN, 12));
+            FontMetrics fm2 = g.getFontMetrics();
+            String shortName = fitText(fm2, name, 140);
+
+            int bx = x - 70;
+            if (bx < 10) bx = 10;
+            int by = y + size + 18;
+
+            g.setColor(new Color(0, 0, 0, 140));
+            g.fillRoundRect(bx - 8, by - 14, fm2.stringWidth(shortName) + 16, 18, 10, 10);
+
+            g.setColor(new Color(255, 255, 255, 220));
+            g.drawString(shortName, bx, by);
+        }
+    }
 
     private void renderInventoryOverlay(Graphics2D g, int w, int h) {
         Inventory inv = system.getInventory();
 
-        // Dim background
         g.setColor(new Color(0, 0, 0, 140));
         g.fillRect(0, 0, w, h);
 
@@ -130,7 +190,6 @@ public final class InventoryUI {
         g.setColor(new Color(255, 255, 255, 230));
         g.drawString("Inventory", 30, 40);
 
-        // Hotbar row at top of overlay
         int hbX = 30;
         int hbY = 60;
 
@@ -157,10 +216,10 @@ public final class InventoryUI {
             g.setColor(new Color(255, 255, 255, 220));
             g.drawString(Integer.toString(i + 1), x + 4, y + 14);
 
-            drawSlotContents(g, inv.getHotbar(i), x, y, INV_SLOT);
+            // Overlay view: prefer icon-only (fallback to text)
+            drawSlotContents(g, inv.getHotbar(i), x, y, INV_SLOT, false, null);
         }
 
-        // Backpack grid
         int gx = 30;
         int gy = hbY + INV_SLOT + 24;
 
@@ -187,11 +246,11 @@ public final class InventoryUI {
                 g.setColor(new Color(180, 180, 180, 150));
                 g.drawRect(x, y, INV_SLOT, INV_SLOT);
 
-                drawSlotContents(g, inv.getStorage(idx), x, y, INV_SLOT);
+                // Overlay view: prefer icon-only (fallback to text)
+                drawSlotContents(g, inv.getStorage(idx), x, y, INV_SLOT, false, null);
             }
         }
 
-        // Cursor item tooltip (follows mouse)
         if (cursorItem != null) {
             String name = cursorItem.getDef().getDisplayName();
 
@@ -208,7 +267,6 @@ public final class InventoryUI {
             g.setColor(new Color(255, 255, 255, 235));
             g.drawString(name, bx + 7, by + 15);
         } else {
-            // Hover tooltip (if any)
             SlotRef hover = slotAt(mx, my, inv);
             if (hover != null) {
                 ItemInstance it = getSlot(inv, hover);
@@ -231,22 +289,80 @@ public final class InventoryUI {
         }
     }
 
-    private void drawSlotContents(Graphics2D g, ItemInstance it, int x, int y, int slotSize) {
-        if (it == null) return;
+    /**
+     * Draw slot contents using icon if available.
+     * @param drawHudName if true, draws a fitted name at bottom (hotbar HUD style).
+     * @param hudFm pass FontMetrics for HUD loop to avoid extra g.getFontMetrics calls; may be null.
+     */
+    private void drawSlotContents(Graphics2D g, ItemInstance it, int x, int y, int slotSize,
+                                  boolean drawHudName, FontMetrics hudFm) {
+        if (it == null || it.getDef() == null) return;
 
-        g.setFont(new Font("Dialog", Font.PLAIN, 12));
-        FontMetrics fm = g.getFontMetrics();
+        ItemDefinition def = it.getDef();
 
-        String name = fitText(fm, it.getDef().getDisplayName(), slotSize - 8);
+        int iconMax = drawHudName ? HUD_ICON_MAX : INV_ICON_MAX;
+        int iconSize = Math.min(iconMax, Math.max(12, slotSize - 14));
 
-        // Hard clip so text never draws outside the slot (fixes overflow)
-        Shape oldClip = g.getClip();
-        g.setClip(new Rectangle2D.Double(x + 2, y + 2, slotSize - 4, slotSize - 4));
+        // Try to avoid the top-left slot number area
+        int ix = x + (slotSize - iconSize) / 2;
+        int iy = y + (slotSize - iconSize) / 2 + (drawHudName ? 2 : 0);
 
-        g.setColor(new Color(255, 255, 255, 230));
-        g.drawString(name, x + 4, y + slotSize - 6);
+        boolean drew = drawItemIcon(g, def, ix, iy, iconSize);
 
-        g.setClip(oldClip);
+        // If no icon, fallback to name (old behavior)
+        if (!drew) {
+            g.setFont(new Font("Dialog", Font.PLAIN, 12));
+            FontMetrics fm = g.getFontMetrics();
+            String name = fitText(fm, def.getDisplayName(), slotSize - 8);
+
+            Shape oldClip = g.getClip();
+            g.setClip(new Rectangle2D.Double(x + 2, y + 2, slotSize - 4, slotSize - 4));
+
+            g.setColor(new Color(255, 255, 255, 230));
+            g.drawString(name, x + 4, y + slotSize - 6);
+
+            g.setClip(oldClip);
+            return;
+        }
+
+        if (drawHudName) {
+            // Draw small name at bottom (optional)
+            FontMetrics fm = (hudFm != null) ? hudFm : g.getFontMetrics();
+            String name = fitText(fm, def.getDisplayName(), slotSize - 8);
+
+            Shape oldClip = g.getClip();
+            g.setClip(new Rectangle2D.Double(x + 2, y + 2, slotSize - 4, slotSize - 4));
+
+            g.setColor(new Color(255, 255, 255, 220));
+            g.drawString(name, x + 4, y + slotSize - 6);
+
+            g.setClip(oldClip);
+        }
+    }
+
+    private boolean drawItemIcon(Graphics2D g, ItemDefinition def, int x, int y, int size) {
+        if (def == null || size <= 0) return false;
+        Image img = iconCache.getIcon(def, size);
+        if (img == null) return false;
+
+        g.drawImage(img, x, y, size, size, null);
+        return true;
+    }
+
+    private static String makeAbbrev(String s) {
+        if (s == null) return "?";
+        s = s.trim();
+        if (s.isEmpty()) return "?";
+
+        String[] parts = s.split("\\s+");
+        if (parts.length >= 2) {
+            char a = Character.toUpperCase(parts[0].charAt(0));
+            char b = Character.toUpperCase(parts[1].charAt(0));
+            return "" + a + b;
+        }
+
+        if (s.length() >= 2) return ("" + Character.toUpperCase(s.charAt(0)) + Character.toUpperCase(s.charAt(1)));
+        return ("" + Character.toUpperCase(s.charAt(0)));
     }
 
     private static String fitText(FontMetrics fm, String s, int maxW) {
@@ -256,9 +372,8 @@ public final class InventoryUI {
 
         final String ell = "…";
         int ellW = fm.stringWidth(ell);
-        if (ellW > maxW) return ""; // nothing fits
+        if (ellW > maxW) return "";
 
-        // Binary search cut
         int lo = 0, hi = s.length();
         while (lo < hi) {
             int mid = (lo + hi + 1) >>> 1;
@@ -270,8 +385,6 @@ public final class InventoryUI {
         if (lo <= 0) return ell;
         return s.substring(0, lo) + ell;
     }
-
-    // ---------------- Input hooks (called from InputHandler) ----------------
 
     public void mouseMoved(MouseEvent e) {
         mx = e.getX();
@@ -296,23 +409,19 @@ public final class InventoryUI {
         SlotRef ref = slotAt(mx, my, inv);
         if (ref == null) return;
 
-        // Clicking hotbar slot in inventory selects it
         if (ref.type == SlotType.HOTBAR) {
             inv.setSelectedHotbar(ref.index);
         }
 
-        // Pick up / place / swap
         ItemInstance slotItem = getSlot(inv, ref);
 
         if (cursorItem == null) {
-            // Pick up
             if (slotItem != null) {
                 setSlot(inv, ref, null);
                 cursorItem = slotItem;
                 system.onSelectionOrContentsChanged();
             }
         } else {
-            // Place / swap
             setSlot(inv, ref, cursorItem);
             cursorItem = slotItem;
             system.onSelectionOrContentsChanged();
@@ -325,11 +434,7 @@ public final class InventoryUI {
     }
 
     public void mouseClicked(MouseEvent e) {
-        // IMPORTANT: keep this empty, because InputHandler already forwards both pressed & clicked.
-        // Handling logic here would double-apply swaps.
     }
-
-    // ---------------- Slot helpers ----------------
 
     private void ensureRectCaches(Inventory inv) {
         int hb = inv.getHotbarSize();
@@ -348,8 +453,6 @@ public final class InventoryUI {
     private SlotRef slotAt(int x, int y, Inventory inv) {
         if (!open) return null;
 
-        // These rects are filled during renderInventoryOverlay.
-        // If for some reason a click happens before first render, fall back by returning null.
         if (hotbarRects.length != inv.getHotbarSize() || storageRects.length != inv.getStorageSize()) return null;
 
         for (int i = 0; i < hotbarRects.length; i++) {

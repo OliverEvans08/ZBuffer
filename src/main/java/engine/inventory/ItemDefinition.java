@@ -1,6 +1,5 @@
 package engine.inventory;
 
-
 import objects.GameObject;
 
 public abstract class ItemDefinition {
@@ -15,16 +14,22 @@ public abstract class ItemDefinition {
     public final String getId() { return id; }
     public final String getDisplayName() { return displayName; }
 
-    // World (dropped on ground)
     public abstract GameObject createWorldModel();
 
-    // First-person (viewmodel)
     public abstract GameObject createFirstPersonModel();
 
-    // Third-person (attached near player hand)
     public abstract GameObject createThirdPersonModel();
 
-    // Use behavior hook (optional)
+    /**
+     * Icon key used to find PNG: inventory/icons/<iconId>.png
+     * Default: item id. Override if you want a different filename.
+     */
+    public String getIconId() { return id; }
+
+    public java.awt.Color getHudColor() { return java.awt.Color.WHITE; }
+
+    public String getHudAbbrev() { return null; }
+
     public void onUse(ItemUseContext ctx) {}
 
     public static final class ItemUseContext {

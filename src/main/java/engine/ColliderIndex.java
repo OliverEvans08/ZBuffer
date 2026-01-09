@@ -1,8 +1,5 @@
 package engine;
 
-import objects.GameObject;
-import util.AABB;
-
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
@@ -10,6 +7,9 @@ import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
+
+import objects.GameObject;
+import util.AABB;
 
 public final class ColliderIndex {
 
@@ -23,12 +23,10 @@ public final class ColliderIndex {
 
     private final ArrayList<GameObject> colliders = new ArrayList<>();
 
-    // Thread-safe read/write between update thread (sync/remove) and render thread (query)
     private final ReentrantReadWriteLock rw = new ReentrantReadWriteLock();
     private final Lock r = rw.readLock();
     private final Lock w = rw.writeLock();
 
-    // Per-thread "visited" so concurrent queries don't fight over a shared IdentityHashMap
     private final ThreadLocal<IdentityHashMap<GameObject, Boolean>> visitedTL =
             ThreadLocal.withInitial(() -> new IdentityHashMap<>(512));
 
@@ -43,7 +41,6 @@ public final class ColliderIndex {
     }
 
     public List<GameObject> getColliders() {
-        // snapshot to avoid exposing internal mutable list across threads
         r.lock();
         try {
             return Collections.unmodifiableList(new ArrayList<>(colliders));
@@ -82,7 +79,8 @@ public final class ColliderIndex {
 
         w.lock();
         try {
-            if (!obj.isFull()) {
+            // Colliders are driven by SOLID now (separate from render mode).
+            if (!obj.isSolid()) {
                 remove(obj);
                 return;
             }
