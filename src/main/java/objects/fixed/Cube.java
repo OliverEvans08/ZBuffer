@@ -60,7 +60,6 @@ public class Cube extends GameObject {
 
     @Override public double[][] getVertices() { return UNIT_VERTS; }
     @Override public double[][] getUVs() { return UVS; }
-    @Override public int[][] getEdges() { return new int[0][]; }
     @Override public int[][] getFacesArray() { return FACES; }
     @Override public void update(double delta) { }
 }

@@ -3,291 +3,335 @@ package objects;
 import engine.MeshData;
 import engine.animation.Animator;
 import engine.render.Material;
+import java.awt.Color;
+import java.util.List;
+import java.util.UUID;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicLong;
 import util.AABB;
 import util.Matrix4;
 import util.Transform;
 import util.Vector3;
 
-import java.awt.*;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.List;
-import java.util.UUID;
-
 public abstract class GameObject {
 
+    private static volatile int PUBLISHED_FRAME;
+    private static final AtomicLong HIERARCHY_VERSION = new AtomicLong();
+
+    private static final double[][] EMPTY_VERTS = new double[0][0];
+
+    private static final class FrameState {
+
+        private double wx;
+        private double wy;
+        private double wz;
+
+        private AABB aabb = new AABB(0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+        private double[][] transformedVertices = EMPTY_VERTS;
+    }
+
+    public static int getPublishedFrameIndex() {
+        return PUBLISHED_FRAME;
+    }
+
+    public static void setPublishedFrameIndex(int index) {
+        PUBLISHED_FRAME = index & 1;
+    }
+
+    public static long getHierarchyVersion() {
+        return HIERARCHY_VERSION.get();
+    }
+
+    private final FrameState[] frames = {
+            new FrameState(),
+            new FrameState(),
+    };
+
     private final String id = UUID.randomUUID().toString();
+
     private String name = "";
-    private String tag  = "";
-    private int layer   = 0;
+    private String tag = "";
+    private int layer;
 
     public final Transform transform;
 
-    private boolean active  = true;
-    private boolean visible = true;
+    private volatile boolean active = true;
+    private volatile boolean visible = true;
+    private volatile boolean solid;
+    private volatile boolean wireframe;
 
-    // Separate flags:
-    // - solid: affects collision/occlusion/physics-style "is this a solid object?"
-    // - wireframe: affects how it should be rendered (filled vs wireframe)
-    private boolean solid = false;
-    private boolean wireframe = false;
+    private volatile Color color = Color.WHITE;
+    private volatile Material material;
+    private volatile boolean ignorePlayerCollisions;
 
-    private Color color = Color.WHITE;
+    private final CopyOnWriteArrayList<GameObject> children = new CopyOnWriteArrayList<>();
 
-    private Material material = null;
-
-    private final List<GameObject> children;
-    private final List<GameObject> childrenView;
-    private GameObject parent;
-
-    private Animator animator;
-
-    private MeshData mesh = null;
-
-    private final Matrix4 cachedWorld = new Matrix4();
-    private long cachedWorldStamp = Long.MIN_VALUE;
-
-    private static final double[][] EMPTY_VERTS = new double[0][0];
-    private static final int[][] EMPTY_EDGES = new int[0][];
-
-    private double[][] cachedTransformed = null;
-    private int cachedVertCount = -1;
-    private long cachedTransformedStamp = Long.MIN_VALUE;
-
-    private AABB cachedWorldAABB = new AABB(0, 0, 0, 0, 0, 0);
-    private boolean worldAabbDirty = true;
-    private long cachedWorldAabbStamp = Long.MIN_VALUE;
-    private int cachedAabbVertCount = -1;
-
-    private final double[] tmpAabbPoint = new double[3];
+    private volatile GameObject parent;
+    private volatile Animator animator;
+    private volatile MeshData mesh;
 
     public GameObject() {
-        this.transform = new Transform();
-        this.children  = new ArrayList<>();
-        this.childrenView = Collections.unmodifiableList(children);
+        transform = new Transform();
     }
 
-    public MeshData getMesh() { return mesh; }
+    public final void publishFrameData(int frameIndex, double worldX, double worldY, double worldZ, AABB worldAabb, double[][] transformedVertices) {
+        final FrameState state = frames[frameIndex & 1];
+
+        state.wx = worldX;
+        state.wy = worldY;
+        state.wz = worldZ;
+
+        if (worldAabb != null) {
+            state.aabb = worldAabb;
+        } else {
+            state.aabb.set(worldX, worldX, worldY, worldY, worldZ, worldZ);
+        }
+
+        state.transformedVertices = transformedVertices != null ? transformedVertices : EMPTY_VERTS;
+    }
+
+    public MeshData getMesh() {
+        return mesh;
+    }
 
     public GameObject setMesh(MeshData mesh) {
         this.mesh = mesh;
-
-        cachedWorldStamp = Long.MIN_VALUE;
-        cachedTransformedStamp = Long.MIN_VALUE;
-        cachedWorldAabbStamp = Long.MIN_VALUE;
-
-        cachedTransformed = null;
-        cachedVertCount = -1;
-        cachedAabbVertCount = -1;
-        worldAabbDirty = true;
-
         return this;
     }
 
-    public void addChild(GameObject child) {
-        if (child == null || child == this) return;
-        if (child.parent == this) return;
-        if (child.parent != null) child.parent.removeChild(child);
-        child.parent = this;
-        children.add(child);
-
-        child.markWorldAABBDirty();
-    }
-
-    public void removeChild(GameObject child) {
-        if (child == null) return;
-        if (children.remove(child)) {
-            child.parent = null;
-            child.markWorldAABBDirty();
-        }
-    }
-
-    public GameObject getParent() { return parent; }
-    public List<GameObject> getChildren() { return childrenView; }
-
-    public Transform getTransform() { return transform; }
-
-    public Matrix4 getWorldTransform() {
-        Matrix4 local = transform.getTransformationMatrix();
-        if (parent == null) return local;
-
-        long stamp = computeWorldStamp();
-        if (stamp == cachedWorldStamp) return cachedWorld;
-
-        Matrix4 pw = parent.getWorldTransform();
-        pw.multiply(local, cachedWorld);
-        cachedWorldStamp = stamp;
-        return cachedWorld;
-    }
-
-    public Vector3 getWorldPosition() {
-        return getWorldTransform().transform(new Vector3(0,0,0));
-    }
-
     public double[][] getVertices() {
-        MeshData m = this.mesh;
-        return (m != null ? m.getVertices() : EMPTY_VERTS);
-    }
+        final MeshData currentMesh = mesh;
 
-    public int[][] getEdges() { return EMPTY_EDGES; }
+        return currentMesh != null ? currentMesh.getVertices() : EMPTY_VERTS;
+    }
 
     public int[][] getFacesArray() {
-        MeshData m = this.mesh;
-        return (m != null ? m.getFaces() : null);
+        final MeshData currentMesh = mesh;
+
+        return currentMesh != null ? currentMesh.getFaces() : null;
     }
 
     public double[][] getUVs() {
-        MeshData m = this.mesh;
-        return (m != null ? m.getUVs() : null);
+        final MeshData currentMesh = mesh;
+
+        return currentMesh != null ? currentMesh.getUVs() : null;
     }
 
-    public double[][] getTransformedVertices() {
-        double[][] local = getVertices();
-        int n = (local != null ? local.length : 0);
-        if (n <= 0) return EMPTY_VERTS;
-
-        if (cachedTransformed == null || cachedVertCount != n) {
-            cachedTransformed = new double[n][3];
-            cachedVertCount = n;
-            cachedTransformedStamp = Long.MIN_VALUE;
+    public void addChild(GameObject child) {
+        if (child == null || child == this || child.parent == this) {
+            return;
         }
 
-        long stamp = computeWorldStamp();
-        if (stamp == cachedTransformedStamp) {
-            return cachedTransformed;
+        final GameObject oldParent = child.parent;
+
+        if (oldParent != null) {
+            oldParent.removeChild(child);
         }
 
-        Matrix4 M = getWorldTransform();
-        for (int i = 0; i < n; i++) {
-            double[] v = local[i];
-            if (v == null || v.length < 3) continue;
-            M.transformPoint(v[0], v[1], v[2], cachedTransformed[i]);
+        child.parent = this;
+        children.add(child);
+
+        HIERARCHY_VERSION.incrementAndGet();
+    }
+
+    public void removeChild(GameObject child) {
+        if (child == null) {
+            return;
         }
 
-        cachedTransformedStamp = stamp;
-        return cachedTransformed;
+        if (children.remove(child)) {
+            child.parent = null;
+            HIERARCHY_VERSION.incrementAndGet();
+        }
+    }
+
+    public GameObject getParent() {
+        return parent;
+    }
+
+    public List<GameObject> getChildren() {
+        return children;
+    }
+
+    public Transform getTransform() {
+        return transform;
+    }
+
+    public Vector3 getWorldPosition() {
+        final FrameState state = frames[PUBLISHED_FRAME];
+
+        return new Vector3(state.wx, state.wy, state.wz);
+    }
+
+    public void getWorldPosition(double[] output) {
+        if (output == null || output.length < 3) {
+            throw new IllegalArgumentException("output must contain at least three elements");
+        }
+
+        final FrameState state = frames[PUBLISHED_FRAME];
+
+        output[0] = state.wx;
+        output[1] = state.wy;
+        output[2] = state.wz;
+    }
+
+    public double getWorldX() {
+        return frames[PUBLISHED_FRAME].wx;
+    }
+
+    public double getWorldY() {
+        return frames[PUBLISHED_FRAME].wy;
+    }
+
+    public double getWorldZ() {
+        return frames[PUBLISHED_FRAME].wz;
     }
 
     public AABB getWorldAABB() {
-        double[][] local = getVertices();
-        int n = (local != null ? local.length : 0);
-        if (n != cachedAabbVertCount) {
-            cachedAabbVertCount = n;
-            worldAabbDirty = true;
-        }
-
-        long stamp = computeWorldStamp();
-        if (stamp != cachedWorldAabbStamp) worldAabbDirty = true;
-
-        if (!worldAabbDirty) return cachedWorldAABB;
-
-        cachedWorldAABB = computeWorldAABBNow(local);
-        cachedWorldAabbStamp = stamp;
-        worldAabbDirty = false;
-        return cachedWorldAABB;
+        return frames[PUBLISHED_FRAME].aabb;
     }
 
-    protected void markWorldAABBDirty() {
-        worldAabbDirty = true;
-        cachedWorldStamp = Long.MIN_VALUE;
-        cachedTransformedStamp = Long.MIN_VALUE;
-        cachedWorldAabbStamp = Long.MIN_VALUE;
+    public double[][] getTransformedVertices() {
+        final double[][] transformed = frames[PUBLISHED_FRAME].transformedVertices;
+
+        return transformed != null ? transformed : EMPTY_VERTS;
     }
 
-    protected long computeWorldStamp() {
-        long localVer = transform.getVersion();
-        if (parent == null) return mix64(localVer);
-        long parentStamp = parent.computeWorldStamp();
-        return mix64(localVer * 31L + parentStamp);
-    }
+    public Matrix4 getWorldTransform() {
+        final Matrix4 local = transform.getTransformationMatrix();
+        final GameObject currentParent = parent;
 
-    private static long mix64(long x) {
-        x ^= (x >>> 33);
-        x *= 0xff51afd7ed558ccdL;
-        x ^= (x >>> 33);
-        x *= 0xc4ceb9fe1a85ec53L;
-        x ^= (x >>> 33);
-        return x;
-    }
-
-    private AABB computeWorldAABBNow(double[][] localVerts) {
-        if (localVerts == null || localVerts.length == 0) {
-            return new AABB(0, 0, 0, 0, 0, 0);
+        if (currentParent == null) {
+            return local;
         }
 
-        Matrix4 M = getWorldTransform();
-        double minX = Double.POSITIVE_INFINITY, maxX = Double.NEGATIVE_INFINITY;
-        double minY = Double.POSITIVE_INFINITY, maxY = Double.NEGATIVE_INFINITY;
-        double minZ = Double.POSITIVE_INFINITY, maxZ = Double.NEGATIVE_INFINITY;
+        final Matrix4 parentWorld = currentParent.getWorldTransform();
+        final Matrix4 output = new Matrix4();
 
-        for (double[] v : localVerts) {
-            if (v == null || v.length < 3) continue;
+        parentWorld.multiply(local, output);
 
-            M.transformPoint(v[0], v[1], v[2], tmpAabbPoint);
-            double x = tmpAabbPoint[0], y = tmpAabbPoint[1], z = tmpAabbPoint[2];
-
-            if (x < minX) minX = x;
-            if (x > maxX) maxX = x;
-            if (y < minY) minY = y;
-            if (y > maxY) maxY = y;
-            if (z < minZ) minZ = z;
-            if (z > maxZ) maxZ = z;
-        }
-
-        if (minX == Double.POSITIVE_INFINITY) {
-            return new AABB(0, 0, 0, 0, 0, 0);
-        }
-        return new AABB(minX, maxX, minY, maxY, minZ, maxZ);
+        return output;
     }
 
     public abstract void update(double delta);
 
-    public boolean isActive()  { return active; }
-    public void setActive(boolean active) { this.active = active; }
+    public boolean isActive() {
+        return active;
+    }
 
-    public boolean isVisible() { return visible; }
-    public void setVisible(boolean visible) { this.visible = visible; }
+    public void setActive(boolean active) {
+        this.active = active;
+    }
 
-    // --- New: solidity (collision/occlusion) ---
-    public boolean isSolid() { return solid; }
-    public void setSolid(boolean solid) { this.solid = solid; }
+    public boolean isVisible() {
+        return visible;
+    }
 
-    // --- New: render mode (filled vs wireframe) ---
-    public boolean isWireframe() { return wireframe; }
-    public void setWireframe(boolean wireframe) { this.wireframe = wireframe; }
-    public boolean isRenderFull() { return !wireframe; }
-    public void setRenderFull(boolean full) { this.wireframe = !full; }
+    public void setVisible(boolean visible) {
+        this.visible = visible;
+    }
 
-    // Back-compat: old API used one flag. Keep it mapping to SOLID to avoid breaking existing code.
-    public boolean isFull() { return isSolid(); }
-    public void setFull(boolean full) { setSolid(full); }
+    public boolean isSolid() {
+        return solid;
+    }
 
-    public Color getColor() { return color; }
+    public void setSolid(boolean solid) {
+        this.solid = solid;
+    }
+
+    public boolean isWireframe() {
+        return wireframe;
+    }
+
+    public void setWireframe(boolean wireframe) {
+        this.wireframe = wireframe;
+    }
+
+    public boolean isRenderFull() {
+        return !wireframe;
+    }
+
+    public void setRenderFull(boolean full) {
+        wireframe = !full;
+    }
+
+    public boolean isFull() {
+        return solid;
+    }
+
+    public void setFull(boolean full) {
+        solid = full;
+    }
+
+    public Color getColor() {
+        return color;
+    }
 
     public GameObject setColor(Color color) {
-        this.color = (color == null ? Color.WHITE : color);
+        this.color = color == null ? Color.WHITE : color;
         return this;
     }
 
-    public Material getMaterial() { return material; }
-    public void setMaterial(Material material) { this.material = material; }
+    public Material getMaterial() {
+        return material;
+    }
 
-    public Animator getAnimator() { return animator; }
-    public void setAnimator(Animator animator) { this.animator = animator; }
+    public void setMaterial(Material material) {
+        this.material = material;
+    }
 
-    public Animator animate() {
-        if (animator == null) animator = new Animator(this);
+    public Animator getAnimator() {
         return animator;
     }
 
-    public String getId() { return id; }
+    public void setAnimator(Animator animator) {
+        this.animator = animator;
+    }
 
-    public String getName() { return name; }
-    public void setName(String name) { this.name = (name != null ? name : ""); }
+    public Animator animate() {
+        Animator currentAnimator = animator;
 
-    public String getTag() { return tag; }
-    public void setTag(String tag) { this.tag = (tag != null ? tag : ""); }
+        if (currentAnimator == null) {
+            currentAnimator = new Animator(this);
+            animator = currentAnimator;
+        }
 
-    public int getLayer() { return layer; }
-    public void setLayer(int layer) { this.layer = layer; }
+        return currentAnimator;
+    }
+
+    public boolean isIgnorePlayerCollisions() {
+        return ignorePlayerCollisions;
+    }
+
+    public void setIgnorePlayerCollisions(boolean ignorePlayerCollisions) {
+        this.ignorePlayerCollisions = ignorePlayerCollisions;
+    }
+
+    public String getId() {
+        return id;
+    }
+
+    public String getName() {
+        return name;
+    }
+
+    public void setName(String name) {
+        this.name = name != null ? name : "";
+    }
+
+    public String getTag() {
+        return tag;
+    }
+
+    public void setTag(String tag) {
+        this.tag = tag != null ? tag : "";
+    }
+
+    public int getLayer() {
+        return layer;
+    }
+
+    public void setLayer(int layer) {
+        this.layer = layer;
+    }
 }

@@ -1,183 +1,393 @@
-// File: LightObject.java
 package objects.lighting;
 
 import engine.lighting.LightData;
 import engine.lighting.LightType;
 import objects.GameObject;
-import util.Matrix4;
+import util.Transform;
 import util.Vector3;
 
 import java.awt.Color;
 
-public class LightObject extends GameObject {
+public final class LightObject extends GameObject {
 
-    private final LightData light;
+    private static final long FNV_OFFSET =
+            1469598103934665603L;
 
-    private final double[] tmpPos = new double[3];
-    private final double[] tmpDir = new double[3];
+    private static final long FNV_PRIME =
+            1099511628211L;
 
-    private Vector3 localDirection = new Vector3(0, -1, 0);
+    private final LightData light =
+            new LightData();
 
-    private boolean autoRotateY = false;
-    private double autoRotateYSpeedRad = 0.0;
+    private final Vector3 baseDirection =
+            new Vector3(0.0, -1.0, 0.0);
 
-    private long lastSyncStamp = Long.MIN_VALUE;
+    private final double[] worldPosition =
+            new double[3];
 
-    private LightObject(LightData light) {
-        this.light = (light == null ? new LightData() : light);
-        this.light.owner = this;
+    private double autoRotateYRadiansPerSecond;
 
-        // ✅ IMPORTANT FIX:
-        // LightData.point/spot factory fills light.x/y/z, but getLight() later syncs from THIS object's transform.
-        // If we don't initialize transform.position here, point/spot lights snap to (0,0,0).
-        if (this.light.type == LightType.POINT || this.light.type == LightType.SPOT) {
-            this.transform.position = new Vector3(this.light.x, this.light.y, this.light.z);
-        }
+    private long lastWorldStamp =
+            Long.MIN_VALUE;
 
-        if (this.light.type == LightType.DIRECTIONAL || this.light.type == LightType.SPOT) {
-            this.localDirection = normalizeSafe(new Vector3(this.light.dx, this.light.dy, this.light.dz));
-        }
-
-        setFull(false);
+    private LightObject() {
+        setSolid(false);
         setVisible(false);
+        setFull(false);
+
+        light.owner = this;
     }
 
-    public static LightObject directional(Vector3 raysDirection, Color color, double strength, boolean shadows) {
-        LightData d = LightData.directional(raysDirection, color, strength, shadows, null);
-        return new LightObject(d);
+    public static LightObject directional(
+            Vector3 direction,
+            Color color,
+            double strength,
+            boolean shadows
+    ) {
+        final LightObject object =
+                new LightObject();
+
+        object.light.type =
+                LightType.DIRECTIONAL;
+
+        setNormalized(
+                object.baseDirection,
+                direction,
+                0.0,
+                -1.0,
+                0.0
+        );
+
+        object.light.setColor(
+                color != null
+                        ? color
+                        : Color.WHITE
+        );
+
+        object.light.strength =
+                Math.max(0.0, strength);
+
+        object.light.shadows = shadows;
+
+        object.refreshLightIfNeeded();
+
+        return object;
     }
 
-    public static LightObject point(Vector3 position, Color color,
-                                    double strength, double range,
-                                    double attLinear, double attQuadratic,
-                                    boolean shadows) {
-        LightData d = LightData.point(position, color, strength, range, attLinear, attQuadratic, shadows, null);
-        return new LightObject(d);
+    public static LightObject point(
+            Vector3 position,
+            Color color,
+            double strength,
+            double range,
+            boolean shadows
+    ) {
+        final LightObject object =
+                new LightObject();
+
+        object.light.type =
+                LightType.POINT;
+
+        object.light.setColor(
+                color != null
+                        ? color
+                        : Color.WHITE
+        );
+
+        object.light.strength =
+                Math.max(0.0, strength);
+
+        object.light.range =
+                Math.max(0.0, range);
+
+        object.light.attLinear = 0.0;
+        object.light.attQuadratic = 1.0;
+        object.light.shadows = shadows;
+
+        if (position != null) {
+            final Transform transform =
+                    object.getTransform();
+
+            transform.position.x = position.x;
+            transform.position.y = position.y;
+            transform.position.z = position.z;
+        }
+
+        object.refreshLightIfNeeded();
+
+        return object;
     }
 
-    public static LightObject spot(Vector3 position, Vector3 raysDirection,
-                                   double innerAngleRad, double outerAngleRad,
-                                   Color color, double strength, double range,
-                                   double attLinear, double attQuadratic,
-                                   boolean shadows) {
-        LightData d = LightData.spot(position, raysDirection, innerAngleRad, outerAngleRad,
-                color, strength, range, attLinear, attQuadratic, shadows, null);
-        return new LightObject(d);
+    public static LightObject spot(
+            Vector3 position,
+            Vector3 direction,
+            Color color,
+            double strength,
+            double range,
+            double innerAngleDegrees,
+            double outerAngleDegrees,
+            boolean shadows
+    ) {
+        final LightObject object =
+                new LightObject();
+
+        object.light.type =
+                LightType.SPOT;
+
+        setNormalized(
+                object.baseDirection,
+                direction,
+                0.0,
+                -1.0,
+                0.0
+        );
+
+        object.light.setColor(
+                color != null
+                        ? color
+                        : Color.WHITE
+        );
+
+        object.light.strength =
+                Math.max(0.0, strength);
+
+        object.light.range =
+                Math.max(0.0, range);
+
+        object.light.attLinear = 0.0;
+        object.light.attQuadratic = 1.0;
+        object.light.shadows = shadows;
+
+        double inner =
+                Math.toRadians(
+                        clamp(
+                                innerAngleDegrees,
+                                0.0,
+                                179.0
+                        )
+                );
+
+        double outer =
+                Math.toRadians(
+                        clamp(
+                                outerAngleDegrees,
+                                0.0,
+                                179.0
+                        )
+                );
+
+        if (inner > outer) {
+            final double temporary = inner;
+            inner = outer;
+            outer = temporary;
+        }
+
+        object.light.innerCos =
+                Math.cos(inner * 0.5);
+
+        object.light.outerCos =
+                Math.cos(outer * 0.5);
+
+        if (position != null) {
+            final Transform transform =
+                    object.getTransform();
+
+            transform.position.x = position.x;
+            transform.position.y = position.y;
+            transform.position.z = position.z;
+        }
+
+        object.refreshLightIfNeeded();
+
+        return object;
     }
 
     public LightData getLight() {
-        long stamp = computeWorldStamp();
-        if (stamp != lastSyncStamp) {
-            syncWorldStateNow();
-            lastSyncStamp = stamp;
-        }
+        refreshLightIfNeeded();
         return light;
     }
 
-    private void syncWorldStateNow() {
-        Matrix4 w = null;
-
-        if (light.type == LightType.POINT || light.type == LightType.SPOT) {
-            w = getWorldTransform();
-            w.transformPoint(0, 0, 0, tmpPos);
-            light.x = tmpPos[0];
-            light.y = tmpPos[1];
-            light.z = tmpPos[2];
-        }
-
-        if (light.type == LightType.DIRECTIONAL || light.type == LightType.SPOT) {
-            if (w == null) w = getWorldTransform();
-
-            w.transformDirection(localDirection.x, localDirection.y, localDirection.z, tmpDir);
-
-            double lx = tmpDir[0], ly = tmpDir[1], lz = tmpDir[2];
-            double L = Math.sqrt(lx * lx + ly * ly + lz * lz);
-
-            if (L < 1e-12) {
-                light.dx = 0.0;
-                light.dy = -1.0;
-                light.dz = 0.0;
-            } else {
-                light.dx = lx / L;
-                light.dy = ly / L;
-                light.dz = lz / L;
-            }
-        }
+    public void setAutoRotateY(
+            double radiansPerSecond
+    ) {
+        autoRotateYRadiansPerSecond =
+                Double.isFinite(radiansPerSecond)
+                        ? radiansPerSecond
+                        : 0.0;
     }
-
-    public LightObject setDirection(Vector3 raysDirection) {
-        this.localDirection = normalizeSafe(raysDirection);
-        light.setDirection(this.localDirection);
-        lastSyncStamp = Long.MIN_VALUE;
-        return this;
-    }
-
-    public LightObject setAutoRotateY(double radiansPerSecond) {
-        this.autoRotateY = true;
-        this.autoRotateYSpeedRad = radiansPerSecond;
-        return this;
-    }
-
-    public LightObject clearAutoRotateY() {
-        this.autoRotateY = false;
-        this.autoRotateYSpeedRad = 0.0;
-        return this;
-    }
-
-    private static Vector3 normalizeSafe(Vector3 v) {
-        if (v == null) return new Vector3(0, -1, 0);
-        double x = v.x, y = v.y, z = v.z;
-        double L = Math.sqrt(x * x + y * y + z * z);
-        if (L < 1e-12) return new Vector3(0, -1, 0);
-        return new Vector3(x / L, y / L, z / L);
-    }
-
-    @Override
-    public LightObject setColor(Color c) {
-        light.setColor(c);
-        return this;
-    }
-
-    public LightObject setStrength(double s) {
-        light.strength = Math.max(0.0, s);
-        return this;
-    }
-
-    public LightObject setRange(double r) {
-        light.range = Math.max(0.0, r);
-        return this;
-    }
-
-    public LightObject setAttenuation(double linear, double quadratic) {
-        light.attLinear = Math.max(0.0, linear);
-        light.attQuadratic = Math.max(0.0, quadratic);
-        return this;
-    }
-
-    public LightObject setSpotAngles(double innerRad, double outerRad) {
-        light.setSpotAngles(innerRad, outerRad);
-        return this;
-    }
-
-    public LightObject setShadows(boolean enabled) {
-        light.shadows = enabled;
-        return this;
-    }
-
-    @Override public double[][] getVertices() { return new double[0][0]; }
-    @Override public int[][] getEdges() { return new int[0][]; }
-    @Override public int[][] getFacesArray() { return null; }
 
     @Override
     public void update(double delta) {
-        if (autoRotateY && Math.abs(autoRotateYSpeedRad) > 1e-12) {
-            transform.rotation.y += autoRotateYSpeedRad * delta;
-
-            double twoPi = Math.PI * 2.0;
-            transform.rotation.y %= twoPi;
-            if (transform.rotation.y < 0) transform.rotation.y += twoPi;
-
-            lastSyncStamp = Long.MIN_VALUE;
+        if (
+                autoRotateYRadiansPerSecond == 0.0
+                        || delta == 0.0
+        ) {
+            return;
         }
+
+        getTransform().rotation.y +=
+                autoRotateYRadiansPerSecond
+                        * delta;
+    }
+
+    public long computeWorldStamp() {
+        final Transform transform =
+                getTransform();
+
+        getWorldPosition(worldPosition);
+
+        long hash = FNV_OFFSET;
+
+        hash = fnvMix(
+                hash,
+                Double.doubleToLongBits(
+                        worldPosition[0]
+                )
+        );
+
+        hash = fnvMix(
+                hash,
+                Double.doubleToLongBits(
+                        worldPosition[1]
+                )
+        );
+
+        hash = fnvMix(
+                hash,
+                Double.doubleToLongBits(
+                        worldPosition[2]
+                )
+        );
+
+        hash = fnvMix(
+                hash,
+                Double.doubleToLongBits(
+                        transform.rotation.x
+                )
+        );
+
+        hash = fnvMix(
+                hash,
+                Double.doubleToLongBits(
+                        transform.rotation.y
+                )
+        );
+
+        hash = fnvMix(
+                hash,
+                Double.doubleToLongBits(
+                        transform.rotation.z
+                )
+        );
+
+        return hash;
+    }
+
+    private void refreshLightIfNeeded() {
+        final long stamp =
+                computeWorldStamp();
+
+        if (stamp == lastWorldStamp) {
+            return;
+        }
+
+        lastWorldStamp = stamp;
+
+        light.x = worldPosition[0];
+        light.y = worldPosition[1];
+        light.z = worldPosition[2];
+
+        if (
+                light.type != LightType.DIRECTIONAL
+                        && light.type != LightType.SPOT
+        ) {
+            return;
+        }
+
+        final double yaw =
+                getTransform().rotation.y;
+
+        final double cosine =
+                Math.cos(yaw);
+
+        final double sine =
+                Math.sin(yaw);
+
+        light.dx =
+                baseDirection.x * cosine
+                        + baseDirection.z * sine;
+
+        light.dy =
+                baseDirection.y;
+
+        light.dz =
+                -baseDirection.x * sine
+                        + baseDirection.z * cosine;
+    }
+
+    private static long fnvMix(
+            long hash,
+            long value
+    ) {
+        return (hash ^ value) * FNV_PRIME;
+    }
+
+    private static double clamp(
+            double value,
+            double minimum,
+            double maximum
+    ) {
+        if (value < minimum) {
+            return minimum;
+        }
+
+        if (value > maximum) {
+            return maximum;
+        }
+
+        return value;
+    }
+
+    private static void setNormalized(
+            Vector3 output,
+            Vector3 input,
+            double fallbackX,
+            double fallbackY,
+            double fallbackZ
+    ) {
+        if (input == null) {
+            output.x = fallbackX;
+            output.y = fallbackY;
+            output.z = fallbackZ;
+            return;
+        }
+
+        final double lengthSquared =
+                input.x * input.x
+                        + input.y * input.y
+                        + input.z * input.z;
+
+        if (
+                lengthSquared <= 1.0e-18
+                        || !Double.isFinite(
+                        lengthSquared
+                )
+        ) {
+            output.x = fallbackX;
+            output.y = fallbackY;
+            output.z = fallbackZ;
+            return;
+        }
+
+        final double inverseLength =
+                1.0 / Math.sqrt(lengthSquared);
+
+        output.x =
+                input.x * inverseLength;
+
+        output.y =
+                input.y * inverseLength;
+
+        output.z =
+                input.z * inverseLength;
     }
 }

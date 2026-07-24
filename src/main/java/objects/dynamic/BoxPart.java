@@ -42,7 +42,6 @@ public class BoxPart extends GameObject {
     }
 
     @Override public double[][] getVertices() { return verts; }
-    @Override public int[][] getEdges() { return new int[0][]; }
     @Override public int[][] getFacesArray() { return FACES; }
 
     @Override public void update(double delta) { /* no-op */ }

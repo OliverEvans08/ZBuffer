@@ -1,62 +1,82 @@
 package util;
 
 public class Transform {
+
     public Vector3 position;
     public Vector3 rotation;
     public Vector3 scale;
 
-    // Cached local TRS matrix
     private final Matrix4 cached = new Matrix4();
-    private boolean cachedValid = false;
+    private boolean cachedValid;
 
-    // Last values used to build cached matrix
-    private double lpX, lpY, lpZ;
-    private double lrX, lrY, lrZ;
-    private double lsX, lsY, lsZ;
+    private double lastPositionX;
+    private double lastPositionY;
+    private double lastPositionZ;
 
-    // Bumps when TRS changes (local-space)
-    private long version = 0L;
+    private double lastRotationX;
+    private double lastRotationY;
+    private double lastRotationZ;
+
+    private double lastScaleX;
+    private double lastScaleY;
+    private double lastScaleZ;
+
+    private long version;
 
     public Transform() {
-        this.position = new Vector3(0, 0, 0);
-        this.rotation = new Vector3(0, 0, 0);
-        this.scale = new Vector3(1, 1, 1);
+        position = new Vector3(0, 0, 0);
+        rotation = new Vector3(0, 0, 0);
+        scale = new Vector3(1, 1, 1);
     }
 
-    private void syncIfNeeded() {
-        if (!cachedValid ||
-                position.x != lpX || position.y != lpY || position.z != lpZ ||
-                rotation.x != lrX || rotation.y != lrY || rotation.z != lrZ ||
-                scale.x != lsX || scale.y != lsY || scale.z != lsZ) {
-
+    private void synchronizeIfNeeded() {
+        if (
+                !cachedValid ||
+                        position.x != lastPositionX ||
+                        position.y != lastPositionY ||
+                        position.z != lastPositionZ ||
+                        rotation.x != lastRotationX ||
+                        rotation.y != lastRotationY ||
+                        rotation.z != lastRotationZ ||
+                        scale.x != lastScaleX ||
+                        scale.y != lastScaleY ||
+                        scale.z != lastScaleZ
+        ) {
             cached.setTRS(position, rotation, scale);
 
-            lpX = position.x; lpY = position.y; lpZ = position.z;
-            lrX = rotation.x; lrY = rotation.y; lrZ = rotation.z;
-            lsX = scale.x;    lsY = scale.y;    lsZ = scale.z;
+            lastPositionX = position.x;
+            lastPositionY = position.y;
+            lastPositionZ = position.z;
+
+            lastRotationX = rotation.x;
+            lastRotationY = rotation.y;
+            lastRotationZ = rotation.z;
+
+            lastScaleX = scale.x;
+            lastScaleY = scale.y;
+            lastScaleZ = scale.z;
 
             cachedValid = true;
-            version++; // transform changed (or first build)
+            version++;
         }
     }
 
     public Matrix4 getTransformationMatrix() {
-        syncIfNeeded();
+        synchronizeIfNeeded();
+
         return cached;
     }
 
-    /**
-     * Returns a monotonically increasing value that changes whenever
-     * position/rotation/scale changes (local-space).
-     */
     public long getVersion() {
-        syncIfNeeded();
+        synchronizeIfNeeded();
+
         return version;
     }
 
-    /**
-     * Optional helper if you ever want to force a recompute next query.
-     */
+    public long getCachedVersion() {
+        return version;
+    }
+
     public void invalidate() {
         cachedValid = false;
     }

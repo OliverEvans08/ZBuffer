@@ -5,151 +5,376 @@ import java.awt.Graphics2D;
 import java.awt.Image;
 import java.awt.RenderingHints;
 import java.awt.image.BufferedImage;
+import java.io.IOException;
 import java.io.InputStream;
-import java.lang.ref.SoftReference;
 import java.nio.file.Files;
+import java.nio.file.InvalidPathException;
 import java.nio.file.Path;
 import java.nio.file.Paths;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.LinkedHashMap;
+import java.util.Map;
 
+/** Bounded, deterministic cache for source and scaled inventory icons. */
 public final class ItemIconCache {
 
     public static final int SOURCE_ICON_SIZE = 64;
 
-    /**
-     * Resolution order (no guessing):
-     *  1) JVM property: -Dzbuffer.iconRoot="C:\...\ZBuffer\icons"
-     *  2) Env var:      ZBUFFER_ICON_ROOT
-     *  3) Search upwards from user.dir for a folder named "icons"
-     */
-    private final Path iconRoot;
+    private static final System.Logger LOGGER =
+            System.getLogger(ItemIconCache.class.getName());
 
-    private final ConcurrentHashMap<String, SoftReference<BufferedImage>> originals = new ConcurrentHashMap<>();
-    private final ConcurrentHashMap<String, SoftReference<Image>> scaled = new ConcurrentHashMap<>();
+    private static final int MAX_ORIGINALS = 128;
+    private static final int MAX_SCALED_ICONS = 512;
+    private static final int MAX_REQUESTED_SIZE = 512;
+
+    private final Path iconRoot;
+    private final Map<String, BufferedImage> originals =
+            lruMap(MAX_ORIGINALS);
+    private final Map<ScaledKey, BufferedImage> scaled =
+            lruMap(MAX_SCALED_ICONS);
 
     public ItemIconCache() {
         this(resolveDefaultRoot());
     }
 
     public ItemIconCache(Path iconRoot) {
-        this.iconRoot = (iconRoot == null ? resolveDefaultRoot() : iconRoot.toAbsolutePath().normalize());
+        this.iconRoot = (
+                iconRoot == null
+                        ? resolveDefaultRoot()
+                        : iconRoot
+        ).toAbsolutePath().normalize();
     }
 
-    public Path getIconRoot() { return iconRoot; }
-
-    public Image getIcon(ItemDefinition def, int size) {
-        if (def == null) return null;
-        return getIcon(def.getIconId(), size);
+    public Path getIconRoot() {
+        return iconRoot;
     }
 
-    public Image getIcon(String iconId, int size) {
-        if (iconId == null || iconId.isBlank()) return null;
-        if (size <= 0) return null;
+    public Image getIcon(
+            ItemDefinition definition,
+            int size
+    ) {
+        return definition == null
+                ? null
+                : getIcon(definition.getIconId(), size);
+    }
 
-        final String key = iconId + "@" + size;
+    public synchronized Image getIcon(
+            String iconId,
+            int size
+    ) {
+        final String normalizedId =
+                normalizeIconId(iconId);
 
-        SoftReference<Image> ref = scaled.get(key);
-        Image cached = (ref != null) ? ref.get() : null;
-        if (cached != null) return cached;
-
-        BufferedImage src = getOriginal(iconId);
-        if (src == null) return null;
-
-        BufferedImage dst = new BufferedImage(size, size, BufferedImage.TYPE_INT_ARGB);
-        Graphics2D g = dst.createGraphics();
-        try {
-            g.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BILINEAR);
-            g.setRenderingHint(RenderingHints.KEY_RENDERING, RenderingHints.VALUE_RENDER_QUALITY);
-
-            int sw = src.getWidth();
-            int sh = src.getHeight();
-            if (sw <= 0 || sh <= 0) return null;
-
-            // keep aspect ratio + center
-            double s = Math.min(size / (double) sw, size / (double) sh);
-            int dw = Math.max(1, (int) Math.round(sw * s));
-            int dh = Math.max(1, (int) Math.round(sh * s));
-            int dx = (size - dw) / 2;
-            int dy = (size - dh) / 2;
-
-            g.drawImage(src, dx, dy, dw, dh, null);
-        } finally {
-            g.dispose();
+        if (normalizedId == null
+                || size <= 0
+                || size > MAX_REQUESTED_SIZE) {
+            return null;
         }
 
-        scaled.put(key, new SoftReference<>(dst));
-        return dst;
+        final ScaledKey key =
+                new ScaledKey(normalizedId, size);
+
+        final BufferedImage cached = scaled.get(key);
+
+        if (cached != null) {
+            return cached;
+        }
+
+        final BufferedImage source =
+                getOriginal(normalizedId);
+
+        if (source == null) {
+            return null;
+        }
+
+        final BufferedImage resized =
+                scaleToSquare(source, size);
+
+        scaled.put(key, resized);
+        return resized;
     }
 
-    public void clear() {
+    public synchronized void clear() {
         originals.clear();
         scaled.clear();
     }
 
     private BufferedImage getOriginal(String iconId) {
-        SoftReference<BufferedImage> ref = originals.get(iconId);
-        BufferedImage img = (ref != null) ? ref.get() : null;
-        if (img != null) return img;
+        final BufferedImage cached =
+                originals.get(iconId);
 
-        img = loadOriginal(iconId);
-        if (img != null) originals.put(iconId, new SoftReference<>(img));
-        return img;
+        if (cached != null) {
+            return cached;
+        }
+
+        final BufferedImage loaded =
+                loadOriginal(iconId);
+
+        if (loaded != null) {
+            originals.put(iconId, loaded);
+        }
+
+        return loaded;
     }
 
     private BufferedImage loadOriginal(String iconId) {
-        // 1) Filesystem: <iconRoot>/<iconId>.png
-        try {
-            Path p = iconRoot.resolve(iconId + ".png");
-            if (Files.exists(p) && Files.isRegularFile(p)) {
-                return ImageIO.read(p.toFile());
+        final Path file = iconRoot
+                .resolve(iconId + ".png")
+                .normalize();
+
+        if (file.startsWith(iconRoot)
+                && Files.isRegularFile(file)) {
+            try {
+                final BufferedImage image =
+                        ImageIO.read(file.toFile());
+
+                if (image != null) {
+                    return image;
+                }
+
+                LOGGER.log(
+                        System.Logger.Level.WARNING,
+                        "Unsupported icon image: " + file
+                );
+            } catch (IOException exception) {
+                LOGGER.log(
+                        System.Logger.Level.WARNING,
+                        "Failed to read icon: " + file,
+                        exception
+                );
             }
-        } catch (Exception ignored) {}
+        }
 
-        // 2) Optional classpath fallback (only if you later put icons into resources)
-        // These are just fallbacks and won't be used for your current setup.
-        try (InputStream in = Thread.currentThread().getContextClassLoader()
-                .getResourceAsStream("engine/inventory/icons/" + iconId + ".png")) {
-            if (in != null) return ImageIO.read(in);
-        } catch (Exception ignored) {}
+        final String resourceName =
+                "engine/inventory/icons/"
+                        + iconId
+                        + ".png";
 
-        try (InputStream in = ItemIconCache.class.getResourceAsStream("/engine/inventory/icons/" + iconId + ".png")) {
-            if (in != null) return ImageIO.read(in);
-        } catch (Exception ignored) {}
+        final ClassLoader contextLoader =
+                Thread.currentThread()
+                        .getContextClassLoader();
+
+        if (contextLoader != null) {
+            final BufferedImage image =
+                    readClasspathResource(
+                            contextLoader,
+                            resourceName
+                    );
+
+            if (image != null) {
+                return image;
+            }
+        }
+
+        try (InputStream input =
+                     ItemIconCache.class.getResourceAsStream(
+                             '/' + resourceName
+                     )) {
+            if (input != null) {
+                return ImageIO.read(input);
+            }
+        } catch (IOException exception) {
+            LOGGER.log(
+                    System.Logger.Level.WARNING,
+                    "Failed to read classpath icon: "
+                            + resourceName,
+                    exception
+            );
+        }
 
         return null;
+    }
+
+    private static BufferedImage readClasspathResource(
+            ClassLoader loader,
+            String resourceName
+    ) {
+        try (InputStream input =
+                     loader.getResourceAsStream(resourceName)) {
+            return input == null
+                    ? null
+                    : ImageIO.read(input);
+        } catch (IOException exception) {
+            LOGGER.log(
+                    System.Logger.Level.WARNING,
+                    "Failed to read classpath icon: "
+                            + resourceName,
+                    exception
+            );
+            return null;
+        }
+    }
+
+    private static BufferedImage scaleToSquare(
+            BufferedImage source,
+            int size
+    ) {
+        final BufferedImage destination =
+                new BufferedImage(
+                        size,
+                        size,
+                        BufferedImage.TYPE_INT_ARGB
+                );
+
+        final Graphics2D graphics =
+                destination.createGraphics();
+
+        try {
+            graphics.setRenderingHint(
+                    RenderingHints.KEY_INTERPOLATION,
+                    RenderingHints.VALUE_INTERPOLATION_BILINEAR
+            );
+
+            graphics.setRenderingHint(
+                    RenderingHints.KEY_RENDERING,
+                    RenderingHints.VALUE_RENDER_QUALITY
+            );
+
+            final int sourceWidth = source.getWidth();
+            final int sourceHeight = source.getHeight();
+
+            final double scale = Math.min(
+                    size / (double) sourceWidth,
+                    size / (double) sourceHeight
+            );
+
+            final int width = Math.max(
+                    1,
+                    (int) Math.round(sourceWidth * scale)
+            );
+
+            final int height = Math.max(
+                    1,
+                    (int) Math.round(sourceHeight * scale)
+            );
+
+            graphics.drawImage(
+                    source,
+                    (size - width) / 2,
+                    (size - height) / 2,
+                    width,
+                    height,
+                    null
+            );
+        } finally {
+            graphics.dispose();
+        }
+
+        return destination;
+    }
+
+    private static String normalizeIconId(String iconId) {
+        if (iconId == null) {
+            return null;
+        }
+
+        final String normalized =
+                iconId.trim().replace('\\', '/');
+
+        if (normalized.isEmpty()
+                || normalized.startsWith("/")
+                || normalized.endsWith("/")
+                || normalized.contains("//")) {
+            return null;
+        }
+
+        for (String segment : normalized.split("/")) {
+            if (segment.isEmpty()
+                    || segment.equals(".")
+                    || segment.equals("..")) {
+                return null;
+            }
+        }
+
+        return normalized;
     }
 
     private static Path resolveDefaultRoot() {
-        // 1) JVM property override
-        String prop = System.getProperty("zbuffer.iconRoot");
-        Path p = validateDir(prop);
-        if (p != null) return p;
+        final Path propertyRoot =
+                validateDirectory(
+                        System.getProperty(
+                                "zbuffer.iconRoot"
+                        )
+                );
 
-        // 2) Environment variable override
-        String env = System.getenv("ZBUFFER_ICON_ROOT");
-        p = validateDir(env);
-        if (p != null) return p;
-
-        // 3) Deterministic search up from user.dir for "icons" directory
-        Path base = Paths.get(System.getProperty("user.dir", ".")).toAbsolutePath().normalize();
-        for (int i = 0; i < 8 && base != null; i++) {
-            Path cand = base.resolve("icons");
-            if (Files.exists(cand) && Files.isDirectory(cand)) return cand;
-            base = base.getParent();
+        if (propertyRoot != null) {
+            return propertyRoot;
         }
 
-        // Final fallback (won't work unless it exists)
-        return Paths.get("icons").toAbsolutePath().normalize();
+        final Path environmentRoot =
+                validateDirectory(
+                        System.getenv(
+                                "ZBUFFER_ICON_ROOT"
+                        )
+                );
+
+        if (environmentRoot != null) {
+            return environmentRoot;
+        }
+
+        Path current = Paths.get(
+                System.getProperty("user.dir", ".")
+        ).toAbsolutePath().normalize();
+
+        for (int i = 0; i < 8 && current != null; i++) {
+            final Path candidate =
+                    current.resolve("icons");
+
+            if (Files.isDirectory(candidate)) {
+                return candidate;
+            }
+
+            current = current.getParent();
+        }
+
+        return Paths.get("icons")
+                .toAbsolutePath()
+                .normalize();
     }
 
-    private static Path validateDir(String s) {
-        if (s == null) return null;
-        s = s.trim();
-        if (s.isEmpty()) return null;
+    private static Path validateDirectory(String value) {
+        if (value == null || value.isBlank()) {
+            return null;
+        }
+
         try {
-            Path p = Paths.get(s).toAbsolutePath().normalize();
-            if (Files.exists(p) && Files.isDirectory(p)) return p;
-        } catch (Exception ignored) {}
-        return null;
+            final Path path = Paths
+                    .get(value.trim())
+                    .toAbsolutePath()
+                    .normalize();
+
+            return Files.isDirectory(path)
+                    ? path
+                    : null;
+        } catch (InvalidPathException | SecurityException exception) {
+            LOGGER.log(
+                    System.Logger.Level.WARNING,
+                    "Ignoring invalid icon directory: " + value,
+                    exception
+            );
+            return null;
+        }
+    }
+
+    private static <K, V> Map<K, V> lruMap(
+            int maximumSize
+    ) {
+        return new LinkedHashMap<>(
+                16,
+                0.75f,
+                true
+        ) {
+            @Override
+            protected boolean removeEldestEntry(
+                    Map.Entry<K, V> eldest
+            ) {
+                return size() > maximumSize;
+            }
+        };
+    }
+
+    private record ScaledKey(
+            String iconId,
+            int size
+    ) {
     }
 }

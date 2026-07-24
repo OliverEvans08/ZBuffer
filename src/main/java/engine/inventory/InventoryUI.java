@@ -1,487 +1,596 @@
 package engine.inventory;
 
 import engine.GameEngine;
-
-import java.awt.*;
+import java.awt.Color;
+import java.awt.Font;
+import java.awt.FontMetrics;
+import java.awt.Graphics2D;
+import java.awt.Image;
+import java.awt.Rectangle;
+import java.awt.Shape;
 import java.awt.event.MouseEvent;
 import java.awt.geom.Rectangle2D;
+import java.util.IdentityHashMap;
+import javax.swing.SwingUtilities;
 
 public final class InventoryUI {
 
-    private final GameEngine engine;
-    private final InventorySystem system;
-    private boolean open = false;
-
-    private ItemInstance cursorItem = null;
-
-    private int mx = 0, my = 0;
-
-    private Rectangle[] hotbarRects = new Rectangle[0];
-    private Rectangle[] storageRects = new Rectangle[0];
-
     private static final int HUD_HOTBAR_SLOT = 46;
-    private static final int HUD_HOTBAR_PAD  = 6;
+    private static final int HUD_HOTBAR_PADDING = 6;
 
-    private static final int INV_SLOT = 44;
-    private static final int INV_PAD  = 8;
-    private static final int INV_COLS = 8;
+    private static final int INVENTORY_SLOT = 44;
+    private static final int INVENTORY_PADDING = 8;
+    private static final int INVENTORY_COLUMNS = 8;
 
     private static final int HELD_LOGO_SIZE = 64;
     private static final int HELD_LOGO_MARGIN = 18;
 
-    // Icon sizing
-    private static final int HUD_ICON_MAX = 32;
-    private static final int INV_ICON_MAX = 30;
+    private static final int HUD_ICON_MAXIMUM = 32;
+    private static final int INVENTORY_ICON_MAXIMUM = 30;
 
+    private static final Color BLACK_140 = new Color(0, 0, 0, 140);
+    private static final Color BLACK_160 = new Color(0, 0, 0, 160);
+    private static final Color BLACK_170 = new Color(0, 0, 0, 170);
+    private static final Color GRAY_140 = new Color(180, 180, 180, 140);
+    private static final Color GRAY_150 = new Color(180, 180, 180, 150);
+    private static final Color WHITE_200 = new Color(255, 255, 255, 200);
+    private static final Color WHITE_220 = new Color(255, 255, 255, 220);
+    private static final Color WHITE_230 = new Color(255, 255, 255, 230);
+    private static final Color WHITE_235 = new Color(255, 255, 255, 235);
+    private static final Color WHITE_240 = new Color(255, 255, 255, 240);
+
+    private static final Font SMALL_FONT = new Font("Dialog", Font.PLAIN, 12);
+    private static final Font PROMPT_FONT = new Font("Dialog", Font.BOLD, 14);
+    private static final Font TITLE_FONT = new Font("Dialog", Font.BOLD, 16);
+    private static final Font LOGO_FONT = new Font("Dialog", Font.BOLD, 20);
+    private static final Font TOOLTIP_FONT = new Font("Dialog", Font.BOLD, 12);
+
+    private final GameEngine engine;
+    private final InventorySystem system;
     private final ItemIconCache iconCache = new ItemIconCache();
+    private final IdentityHashMap<ItemDefinition, Color> hudColorCache = new IdentityHashMap<>();
+    private final SlotReference slotReference = new SlotReference();
+
+    private volatile boolean open;
+
+    private ItemInstance cursorItem;
+    private int mouseX;
+    private int mouseY;
+
+    private Rectangle[] hotbarRectangles = new Rectangle[0];
+    private Rectangle[] storageRectangles = new Rectangle[0];
 
     InventoryUI(GameEngine engine, InventorySystem system) {
         this.engine = engine;
         this.system = system;
     }
 
-    public boolean isOpen() { return open; }
+    public boolean isOpen() {
+        return open;
+    }
 
     void setOpen(boolean open) {
-        if (this.open && !open && cursorItem != null) {
-            system.returnCursorItem(cursorItem);
-            cursorItem = null;
-        }
+        final boolean wasOpen = this.open;
+
         this.open = open;
+
+        if (wasOpen && !open) {
+            final Runnable returnCursorItem = () -> {
+                if (cursorItem != null) {
+                    system.returnCursorItem(cursorItem);
+                    cursorItem = null;
+                }
+            };
+
+            if (SwingUtilities.isEventDispatchThread()) {
+                returnCursorItem.run();
+            } else {
+                SwingUtilities.invokeLater(returnCursorItem);
+            }
+        }
     }
 
     public void toggle() {
         setOpen(!open);
     }
 
-    public void render(Graphics2D g, int w, int h) {
-        renderHotbarHUD(g, w, h);
-        renderPickupPrompt(g, w, h);
-
-        // Held item logo (first-person HUD)
-        renderHeldItemLogo(g, w, h);
+    public void render(Graphics2D graphics, int width, int height) {
+        renderHotbarHud(graphics, width, height);
+        renderPickupPrompt(graphics, width, height);
+        renderHeldItemLogo(graphics, width, height);
 
         if (open) {
-            renderInventoryOverlay(g, w, h);
+            renderInventoryOverlay(graphics, width, height);
         }
     }
 
-    private void renderHotbarHUD(Graphics2D g, int w, int h) {
-        Inventory inv = system.getInventory();
+    private void renderHotbarHud(Graphics2D graphics, int width, int height) {
+        final Inventory inventory = system.getInventory();
+        final int slots = inventory.getHotbarSize();
+        final int totalWidth = slots * HUD_HOTBAR_SLOT + (slots - 1) * HUD_HOTBAR_PADDING;
+        final int startX = (width - totalWidth) / 2;
+        final int startY = height - 70;
 
-        int slots = inv.getHotbarSize();
-        int slotSize = HUD_HOTBAR_SLOT;
-        int pad = HUD_HOTBAR_PAD;
+        graphics.setFont(SMALL_FONT);
 
-        int totalW = slots * slotSize + (slots - 1) * pad;
-        int x0 = (w - totalW) / 2;
-        int y0 = h - 70;
-
-        g.setFont(new Font("Dialog", Font.PLAIN, 12));
-        FontMetrics fm = g.getFontMetrics();
+        final FontMetrics fontMetrics = graphics.getFontMetrics();
 
         for (int i = 0; i < slots; i++) {
-            int x = x0 + i * (slotSize + pad);
-            boolean sel = (i == inv.getSelectedHotbar());
+            final int x = startX + i * (HUD_HOTBAR_SLOT + HUD_HOTBAR_PADDING);
+            final boolean selected = i == inventory.getSelectedHotbar();
 
-            g.setColor(new Color(0, 0, 0, 160));
-            g.fillRect(x, y0, slotSize, slotSize);
+            graphics.setColor(BLACK_160);
+            graphics.fillRect(x, startY, HUD_HOTBAR_SLOT, HUD_HOTBAR_SLOT);
 
-            g.setColor(sel ? new Color(255, 255, 255, 220) : new Color(180, 180, 180, 140));
-            g.drawRect(x, y0, slotSize, slotSize);
+            graphics.setColor(selected ? WHITE_220 : GRAY_140);
+            graphics.drawRect(x, startY, HUD_HOTBAR_SLOT, HUD_HOTBAR_SLOT);
 
-            g.setColor(new Color(255, 255, 255, 220));
-            g.drawString(Integer.toString(i + 1), x + 4, y0 + 14);
+            graphics.setColor(WHITE_220);
+            graphics.drawString(Integer.toString(i + 1), x + 4, startY + 14);
 
-            ItemInstance it = inv.getHotbar(i);
-            if (it != null) {
-                // Draw icon (preferred), then a tiny fitted name at bottom (optional fallback)
-                drawSlotContents(g, it, x, y0, slotSize, true, fm);
+            final ItemInstance item = inventory.getHotbar(i);
+
+            if (item != null) {
+                drawSlotContents(graphics, item, x, startY, HUD_HOTBAR_SLOT, true, fontMetrics);
             }
         }
     }
 
-    private void renderPickupPrompt(Graphics2D g, int w, int h) {
-        String s = system.getPickupPromptText();
-        if (s == null) return;
+    private void renderPickupPrompt(Graphics2D graphics, int width, int height) {
+        final String prompt = system.getPickupPromptText();
 
-        g.setFont(new Font("Dialog", Font.BOLD, 14));
-        FontMetrics fm = g.getFontMetrics();
-        int sw = fm.stringWidth(s);
+        if (prompt == null) {
+            return;
+        }
 
-        int x = (w - sw) / 2;
-        int y = (h / 2) + 32;
+        graphics.setFont(PROMPT_FONT);
 
-        g.setColor(new Color(0, 0, 0, 160));
-        g.fillRoundRect(x - 10, y - 18, sw + 20, 26, 10, 10);
+        final FontMetrics fontMetrics = graphics.getFontMetrics();
+        final int textWidth = fontMetrics.stringWidth(prompt);
+        final int x = (width - textWidth) / 2;
+        final int y = height / 2 + 32;
 
-        g.setColor(new Color(255, 255, 255, 230));
-        g.drawString(s, x, y);
+        graphics.setColor(BLACK_160);
+        graphics.fillRoundRect(x - 10, y - 18, textWidth + 20, 26, 10, 10);
+
+        graphics.setColor(WHITE_230);
+        graphics.drawString(prompt, x, y);
     }
 
-    private void renderHeldItemLogo(Graphics2D g, int w, int h) {
-        if (open) return;
-        if (!engine.isFirstPerson()) return;
-
-        ItemInstance it = system.getInventory().getSelectedItem();
-        if (it == null || it.getDef() == null) return;
-
-        ItemDefinition def = it.getDef();
-
-        int size = HELD_LOGO_SIZE;
-        int x = w - size - HELD_LOGO_MARGIN;
-        int y = (h / 2) - (size / 2) + 40;
-
-        // Backplate
-        g.setColor(new Color(0, 0, 0, 160));
-        g.fillRoundRect(x, y, size, size, 14, 14);
-
-        // Outline
-        Color hud = def.getHudColor();
-        if (hud == null) hud = Color.WHITE;
-        g.setColor(new Color(hud.getRed(), hud.getGreen(), hud.getBlue(), 210));
-        g.drawRoundRect(x, y, size, size, 14, 14);
-
-        // Icon inside
-        int pad = 6;
-        int iconSize = size - pad * 2;
-        boolean drew = drawItemIcon(g, def, x + pad, y + pad, iconSize);
-
-        // Fallback: abbreviation if no icon
-        if (!drew) {
-            String abbr = def.getHudAbbrev();
-            if (abbr == null || abbr.isBlank()) abbr = makeAbbrev(def.getDisplayName());
-
-            g.setFont(new Font("Dialog", Font.BOLD, 20));
-            FontMetrics fm = g.getFontMetrics();
-            int tw = fm.stringWidth(abbr);
-            int th = fm.getAscent();
-
-            g.setColor(new Color(255, 255, 255, 235));
-            g.drawString(abbr, x + (size - tw) / 2, y + (size + th) / 2 - 4);
+    private void renderHeldItemLogo(Graphics2D graphics, int width, int height) {
+        if (open || !engine.isFirstPerson()) {
+            return;
         }
 
-        // Name label under
-        String name = def.getDisplayName();
-        if (name != null && !name.isBlank()) {
-            g.setFont(new Font("Dialog", Font.PLAIN, 12));
-            FontMetrics fm2 = g.getFontMetrics();
-            String shortName = fitText(fm2, name, 140);
+        final ItemInstance item = system.getInventory().getSelectedItem();
 
-            int bx = x - 70;
-            if (bx < 10) bx = 10;
-            int by = y + size + 18;
-
-            g.setColor(new Color(0, 0, 0, 140));
-            g.fillRoundRect(bx - 8, by - 14, fm2.stringWidth(shortName) + 16, 18, 10, 10);
-
-            g.setColor(new Color(255, 255, 255, 220));
-            g.drawString(shortName, bx, by);
+        if (item == null || item.getDef() == null) {
+            return;
         }
+
+        final ItemDefinition definition = item.getDef();
+        final int x = width - HELD_LOGO_SIZE - HELD_LOGO_MARGIN;
+        final int y = height / 2 - HELD_LOGO_SIZE / 2 + 40;
+
+        graphics.setColor(BLACK_160);
+        graphics.fillRoundRect(x, y, HELD_LOGO_SIZE, HELD_LOGO_SIZE, 14, 14);
+
+        graphics.setColor(getHudOutlineColor(definition));
+        graphics.drawRoundRect(x, y, HELD_LOGO_SIZE, HELD_LOGO_SIZE, 14, 14);
+
+        final int padding = 6;
+        final int iconSize = HELD_LOGO_SIZE - padding * 2;
+        final boolean drewIcon = drawItemIcon(graphics, definition, x + padding, y + padding, iconSize);
+
+        if (!drewIcon) {
+            String abbreviation = definition.getHudAbbrev();
+
+            if (abbreviation == null || abbreviation.isBlank()) {
+                abbreviation = makeAbbreviation(definition.getDisplayName());
+            }
+
+            graphics.setFont(LOGO_FONT);
+
+            final FontMetrics fontMetrics = graphics.getFontMetrics();
+            final int textWidth = fontMetrics.stringWidth(abbreviation);
+            final int textHeight = fontMetrics.getAscent();
+
+            graphics.setColor(WHITE_235);
+            graphics.drawString(abbreviation, x + (HELD_LOGO_SIZE - textWidth) / 2, y + (HELD_LOGO_SIZE + textHeight) / 2 - 4);
+        }
+
+        final String name = definition.getDisplayName();
+
+        if (name == null || name.isBlank()) {
+            return;
+        }
+
+        graphics.setFont(SMALL_FONT);
+
+        final FontMetrics fontMetrics = graphics.getFontMetrics();
+        final String shortened = fitText(fontMetrics, name, 140);
+
+        int boxX = x - 70;
+
+        if (boxX < 10) {
+            boxX = 10;
+        }
+
+        final int boxY = y + HELD_LOGO_SIZE + 18;
+
+        graphics.setColor(BLACK_140);
+        graphics.fillRoundRect(boxX - 8, boxY - 14, fontMetrics.stringWidth(shortened) + 16, 18, 10, 10);
+
+        graphics.setColor(WHITE_220);
+        graphics.drawString(shortened, boxX, boxY);
     }
 
-    private void renderInventoryOverlay(Graphics2D g, int w, int h) {
-        Inventory inv = system.getInventory();
+    private void renderInventoryOverlay(Graphics2D graphics, int width, int height) {
+        final Inventory inventory = system.getInventory();
 
-        g.setColor(new Color(0, 0, 0, 140));
-        g.fillRect(0, 0, w, h);
+        graphics.setColor(BLACK_140);
+        graphics.fillRect(0, 0, width, height);
 
-        g.setFont(new Font("Dialog", Font.BOLD, 16));
-        g.setColor(new Color(255, 255, 255, 230));
-        g.drawString("Inventory", 30, 40);
+        graphics.setFont(TITLE_FONT);
+        graphics.setColor(WHITE_230);
+        graphics.drawString("Inventory", 30, 40);
 
-        int hbX = 30;
-        int hbY = 60;
+        final int hotbarX = 30;
+        final int hotbarY = 60;
 
-        g.setFont(new Font("Dialog", Font.PLAIN, 12));
-        g.setColor(new Color(255, 255, 255, 200));
-        g.drawString("Hotbar", hbX, hbY - 8);
+        graphics.setFont(SMALL_FONT);
+        graphics.setColor(WHITE_200);
+        graphics.drawString("Hotbar", hotbarX, hotbarY - 8);
 
-        ensureRectCaches(inv);
+        ensureRectangleCaches(inventory);
 
-        for (int i = 0; i < inv.getHotbarSize(); i++) {
-            int x = hbX + i * (INV_SLOT + INV_PAD);
-            int y = hbY;
+        for (int i = 0; i < inventory.getHotbarSize(); i++) {
+            final int x = hotbarX + i * (INVENTORY_SLOT + INVENTORY_PADDING);
 
-            hotbarRects[i].setBounds(x, y, INV_SLOT, INV_SLOT);
+            hotbarRectangles[i].setBounds(x, hotbarY, INVENTORY_SLOT, INVENTORY_SLOT);
 
-            boolean sel = (i == inv.getSelectedHotbar());
+            final boolean selected = i == inventory.getSelectedHotbar();
 
-            g.setColor(new Color(0, 0, 0, 160));
-            g.fillRect(x, y, INV_SLOT, INV_SLOT);
+            graphics.setColor(BLACK_160);
+            graphics.fillRect(x, hotbarY, INVENTORY_SLOT, INVENTORY_SLOT);
 
-            g.setColor(sel ? new Color(255, 255, 255, 240) : new Color(180, 180, 180, 150));
-            g.drawRect(x, y, INV_SLOT, INV_SLOT);
+            graphics.setColor(selected ? WHITE_240 : GRAY_150);
+            graphics.drawRect(x, hotbarY, INVENTORY_SLOT, INVENTORY_SLOT);
 
-            g.setColor(new Color(255, 255, 255, 220));
-            g.drawString(Integer.toString(i + 1), x + 4, y + 14);
+            graphics.setColor(WHITE_220);
+            graphics.drawString(Integer.toString(i + 1), x + 4, hotbarY + 14);
 
-            // Overlay view: prefer icon-only (fallback to text)
-            drawSlotContents(g, inv.getHotbar(i), x, y, INV_SLOT, false, null);
+            drawSlotContents(graphics, inventory.getHotbar(i), x, hotbarY, INVENTORY_SLOT, false, null);
         }
 
-        int gx = 30;
-        int gy = hbY + INV_SLOT + 24;
+        final int gridX = 30;
+        final int gridY = hotbarY + INVENTORY_SLOT + 24;
 
-        g.setFont(new Font("Dialog", Font.PLAIN, 12));
-        g.setColor(new Color(255, 255, 255, 200));
-        g.drawString("Backpack", gx, gy - 8);
+        graphics.setFont(SMALL_FONT);
+        graphics.setColor(WHITE_200);
+        graphics.drawString("Backpack", gridX, gridY - 8);
 
-        int storage = inv.getStorageSize();
-        int rows = (int) Math.ceil(storage / (double) INV_COLS);
+        final int storageSize = inventory.getStorageSize();
+        final int rows = (int) Math.ceil(storageSize / (double) INVENTORY_COLUMNS);
 
-        for (int r = 0; r < rows; r++) {
-            for (int c = 0; c < INV_COLS; c++) {
-                int idx = r * INV_COLS + c;
-                if (idx >= storage) break;
+        for (int row = 0; row < rows; row++) {
+            for (int column = 0; column < INVENTORY_COLUMNS; column++) {
+                final int index = row * INVENTORY_COLUMNS + column;
 
-                int x = gx + c * (INV_SLOT + INV_PAD);
-                int y = gy + r * (INV_SLOT + INV_PAD);
+                if (index >= storageSize) {
+                    break;
+                }
 
-                storageRects[idx].setBounds(x, y, INV_SLOT, INV_SLOT);
+                final int x = gridX + column * (INVENTORY_SLOT + INVENTORY_PADDING);
+                final int y = gridY + row * (INVENTORY_SLOT + INVENTORY_PADDING);
 
-                g.setColor(new Color(0, 0, 0, 160));
-                g.fillRect(x, y, INV_SLOT, INV_SLOT);
+                storageRectangles[index].setBounds(x, y, INVENTORY_SLOT, INVENTORY_SLOT);
 
-                g.setColor(new Color(180, 180, 180, 150));
-                g.drawRect(x, y, INV_SLOT, INV_SLOT);
+                graphics.setColor(BLACK_160);
+                graphics.fillRect(x, y, INVENTORY_SLOT, INVENTORY_SLOT);
 
-                // Overlay view: prefer icon-only (fallback to text)
-                drawSlotContents(g, inv.getStorage(idx), x, y, INV_SLOT, false, null);
+                graphics.setColor(GRAY_150);
+                graphics.drawRect(x, y, INVENTORY_SLOT, INVENTORY_SLOT);
+
+                drawSlotContents(graphics, inventory.getStorage(index), x, y, INVENTORY_SLOT, false, null);
             }
         }
 
         if (cursorItem != null) {
-            String name = cursorItem.getDef().getDisplayName();
-
-            g.setFont(new Font("Dialog", Font.BOLD, 12));
-            FontMetrics fm = g.getFontMetrics();
-            int sw = fm.stringWidth(name);
-
-            int bx = mx + 12;
-            int by = my + 12;
-
-            g.setColor(new Color(0, 0, 0, 170));
-            g.fillRoundRect(bx, by, sw + 14, 22, 10, 10);
-
-            g.setColor(new Color(255, 255, 255, 235));
-            g.drawString(name, bx + 7, by + 15);
-        } else {
-            SlotRef hover = slotAt(mx, my, inv);
-            if (hover != null) {
-                ItemInstance it = getSlot(inv, hover);
-                if (it != null) {
-                    String name = it.getDef().getDisplayName();
-                    g.setFont(new Font("Dialog", Font.BOLD, 12));
-                    FontMetrics fm = g.getFontMetrics();
-                    int sw = fm.stringWidth(name);
-
-                    int bx = mx + 12;
-                    int by = my + 12;
-
-                    g.setColor(new Color(0, 0, 0, 170));
-                    g.fillRoundRect(bx, by, sw + 14, 22, 10, 10);
-
-                    g.setColor(new Color(255, 255, 255, 235));
-                    g.drawString(name, bx + 7, by + 15);
-                }
-            }
-        }
-    }
-
-    /**
-     * Draw slot contents using icon if available.
-     * @param drawHudName if true, draws a fitted name at bottom (hotbar HUD style).
-     * @param hudFm pass FontMetrics for HUD loop to avoid extra g.getFontMetrics calls; may be null.
-     */
-    private void drawSlotContents(Graphics2D g, ItemInstance it, int x, int y, int slotSize,
-                                  boolean drawHudName, FontMetrics hudFm) {
-        if (it == null || it.getDef() == null) return;
-
-        ItemDefinition def = it.getDef();
-
-        int iconMax = drawHudName ? HUD_ICON_MAX : INV_ICON_MAX;
-        int iconSize = Math.min(iconMax, Math.max(12, slotSize - 14));
-
-        // Try to avoid the top-left slot number area
-        int ix = x + (slotSize - iconSize) / 2;
-        int iy = y + (slotSize - iconSize) / 2 + (drawHudName ? 2 : 0);
-
-        boolean drew = drawItemIcon(g, def, ix, iy, iconSize);
-
-        // If no icon, fallback to name (old behavior)
-        if (!drew) {
-            g.setFont(new Font("Dialog", Font.PLAIN, 12));
-            FontMetrics fm = g.getFontMetrics();
-            String name = fitText(fm, def.getDisplayName(), slotSize - 8);
-
-            Shape oldClip = g.getClip();
-            g.setClip(new Rectangle2D.Double(x + 2, y + 2, slotSize - 4, slotSize - 4));
-
-            g.setColor(new Color(255, 255, 255, 230));
-            g.drawString(name, x + 4, y + slotSize - 6);
-
-            g.setClip(oldClip);
+            renderTooltip(graphics, cursorItem.getDef().getDisplayName());
             return;
         }
 
-        if (drawHudName) {
-            // Draw small name at bottom (optional)
-            FontMetrics fm = (hudFm != null) ? hudFm : g.getFontMetrics();
-            String name = fitText(fm, def.getDisplayName(), slotSize - 8);
+        final SlotReference hovered = slotAt(mouseX, mouseY, inventory);
 
-            Shape oldClip = g.getClip();
-            g.setClip(new Rectangle2D.Double(x + 2, y + 2, slotSize - 4, slotSize - 4));
+        if (hovered == null) {
+            return;
+        }
 
-            g.setColor(new Color(255, 255, 255, 220));
-            g.drawString(name, x + 4, y + slotSize - 6);
+        final ItemInstance hoveredItem = getSlot(inventory, hovered);
 
-            g.setClip(oldClip);
+        if (hoveredItem != null) {
+            renderTooltip(graphics, hoveredItem.getDef().getDisplayName());
         }
     }
 
-    private boolean drawItemIcon(Graphics2D g, ItemDefinition def, int x, int y, int size) {
-        if (def == null || size <= 0) return false;
-        Image img = iconCache.getIcon(def, size);
-        if (img == null) return false;
+    private void renderTooltip(Graphics2D graphics, String name) {
+        if (name == null) {
+            return;
+        }
 
-        g.drawImage(img, x, y, size, size, null);
+        graphics.setFont(TOOLTIP_FONT);
+
+        final FontMetrics fontMetrics = graphics.getFontMetrics();
+        final int textWidth = fontMetrics.stringWidth(name);
+        final int boxX = mouseX + 12;
+        final int boxY = mouseY + 12;
+
+        graphics.setColor(BLACK_170);
+        graphics.fillRoundRect(boxX, boxY, textWidth + 14, 22, 10, 10);
+
+        graphics.setColor(WHITE_235);
+        graphics.drawString(name, boxX + 7, boxY + 15);
+    }
+
+    private void drawSlotContents(Graphics2D graphics, ItemInstance item, int x, int y, int slotSize, boolean drawHudName, FontMetrics suppliedFontMetrics) {
+        if (item == null || item.getDef() == null) {
+            return;
+        }
+
+        final ItemDefinition definition = item.getDef();
+        final int iconMaximum = drawHudName ? HUD_ICON_MAXIMUM : INVENTORY_ICON_MAXIMUM;
+        final int iconSize = Math.min(iconMaximum, Math.max(12, slotSize - 14));
+        final int iconX = x + (slotSize - iconSize) / 2;
+        final int iconY = y + (slotSize - iconSize) / 2 + (drawHudName ? 2 : 0);
+        final boolean drewIcon = drawItemIcon(graphics, definition, iconX, iconY, iconSize);
+
+        if (!drewIcon) {
+            graphics.setFont(SMALL_FONT);
+
+            final FontMetrics fontMetrics = graphics.getFontMetrics();
+            final String name = fitText(fontMetrics, definition.getDisplayName(), slotSize - 8);
+            final Shape oldClip = graphics.getClip();
+
+            graphics.setClip(new Rectangle2D.Double(x + 2, y + 2, slotSize - 4, slotSize - 4));
+            graphics.setColor(WHITE_230);
+            graphics.drawString(name, x + 4, y + slotSize - 6);
+            graphics.setClip(oldClip);
+
+            return;
+        }
+
+        if (!drawHudName) {
+            return;
+        }
+
+        final FontMetrics fontMetrics = suppliedFontMetrics != null ? suppliedFontMetrics : graphics.getFontMetrics();
+        final String name = fitText(fontMetrics, definition.getDisplayName(), slotSize - 8);
+        final Shape oldClip = graphics.getClip();
+
+        graphics.setClip(new Rectangle2D.Double(x + 2, y + 2, slotSize - 4, slotSize - 4));
+        graphics.setColor(WHITE_220);
+        graphics.drawString(name, x + 4, y + slotSize - 6);
+        graphics.setClip(oldClip);
+    }
+
+    private boolean drawItemIcon(Graphics2D graphics, ItemDefinition definition, int x, int y, int size) {
+        if (definition == null || size <= 0) {
+            return false;
+        }
+
+        final Image image = iconCache.getIcon(definition, size);
+
+        if (image == null) {
+            return false;
+        }
+
+        graphics.drawImage(image, x, y, size, size, null);
+
         return true;
     }
 
-    private static String makeAbbrev(String s) {
-        if (s == null) return "?";
-        s = s.trim();
-        if (s.isEmpty()) return "?";
+    private Color getHudOutlineColor(ItemDefinition definition) {
+        Color cached = hudColorCache.get(definition);
 
-        String[] parts = s.split("\\s+");
+        if (cached != null) {
+            return cached;
+        }
+
+        Color base = definition.getHudColor();
+
+        if (base == null) {
+            base = Color.WHITE;
+        }
+
+        cached = new Color(base.getRed(), base.getGreen(), base.getBlue(), 210);
+
+        hudColorCache.put(definition, cached);
+
+        return cached;
+    }
+
+    private static String makeAbbreviation(String value) {
+        if (value == null) {
+            return "?";
+        }
+
+        final String normalized = value.trim();
+
+        if (normalized.isEmpty()) {
+            return "?";
+        }
+
+        final String[] parts = normalized.split("\\s+");
+
         if (parts.length >= 2) {
-            char a = Character.toUpperCase(parts[0].charAt(0));
-            char b = Character.toUpperCase(parts[1].charAt(0));
-            return "" + a + b;
+            return "" + Character.toUpperCase(parts[0].charAt(0)) + Character.toUpperCase(parts[1].charAt(0));
         }
 
-        if (s.length() >= 2) return ("" + Character.toUpperCase(s.charAt(0)) + Character.toUpperCase(s.charAt(1)));
-        return ("" + Character.toUpperCase(s.charAt(0)));
-    }
-
-    private static String fitText(FontMetrics fm, String s, int maxW) {
-        if (s == null) return "";
-        if (maxW <= 0) return "";
-        if (fm.stringWidth(s) <= maxW) return s;
-
-        final String ell = "…";
-        int ellW = fm.stringWidth(ell);
-        if (ellW > maxW) return "";
-
-        int lo = 0, hi = s.length();
-        while (lo < hi) {
-            int mid = (lo + hi + 1) >>> 1;
-            String sub = s.substring(0, mid);
-            if (fm.stringWidth(sub) + ellW <= maxW) lo = mid;
-            else hi = mid - 1;
+        if (normalized.length() >= 2) {
+            return "" + Character.toUpperCase(normalized.charAt(0)) + Character.toUpperCase(normalized.charAt(1));
         }
 
-        if (lo <= 0) return ell;
-        return s.substring(0, lo) + ell;
+        return Character.toString(Character.toUpperCase(normalized.charAt(0)));
     }
 
-    public void mouseMoved(MouseEvent e) {
-        mx = e.getX();
-        my = e.getY();
-    }
-
-    public void mouseDragged(MouseEvent e) {
-        mx = e.getX();
-        my = e.getY();
-    }
-
-    public void mousePressed(MouseEvent e) {
-        mx = e.getX();
-        my = e.getY();
-
-        if (!open) return;
-        if (e.getButton() != MouseEvent.BUTTON1) return;
-
-        Inventory inv = system.getInventory();
-        ensureRectCaches(inv);
-
-        SlotRef ref = slotAt(mx, my, inv);
-        if (ref == null) return;
-
-        if (ref.type == SlotType.HOTBAR) {
-            inv.setSelectedHotbar(ref.index);
+    private static String fitText(FontMetrics fontMetrics, String value, int maximumWidth) {
+        if (value == null || maximumWidth <= 0) {
+            return "";
         }
 
-        ItemInstance slotItem = getSlot(inv, ref);
+        if (fontMetrics.stringWidth(value) <= maximumWidth) {
+            return value;
+        }
+
+        final String ellipsis = "…";
+        final int ellipsisWidth = fontMetrics.stringWidth(ellipsis);
+
+        if (ellipsisWidth > maximumWidth) {
+            return "";
+        }
+
+        int low = 0;
+        int high = value.length();
+
+        while (low < high) {
+            final int middle = (low + high + 1) >>> 1;
+            final String candidate = value.substring(0, middle);
+
+            if (fontMetrics.stringWidth(candidate) + ellipsisWidth <= maximumWidth) {
+                low = middle;
+            } else {
+                high = middle - 1;
+            }
+        }
+
+        return low <= 0 ? ellipsis : value.substring(0, low) + ellipsis;
+    }
+
+    public void mouseMoved(MouseEvent event) {
+        mouseX = event.getX();
+        mouseY = event.getY();
+    }
+
+    public void mouseDragged(MouseEvent event) {
+        mouseX = event.getX();
+        mouseY = event.getY();
+    }
+
+    public void mousePressed(MouseEvent event) {
+        mouseX = event.getX();
+        mouseY = event.getY();
+
+        if (!open || event.getButton() != MouseEvent.BUTTON1) {
+            return;
+        }
+
+        final Inventory inventory = system.getInventory();
+
+        ensureRectangleCaches(inventory);
+
+        final SlotReference reference = slotAt(mouseX, mouseY, inventory);
+
+        if (reference == null) {
+            return;
+        }
+
+        if (reference.type == SlotType.HOTBAR) {
+            inventory.setSelectedHotbar(reference.index);
+        }
+
+        final ItemInstance slotItem = getSlot(inventory, reference);
 
         if (cursorItem == null) {
             if (slotItem != null) {
-                setSlot(inv, ref, null);
+                setSlot(inventory, reference, null);
                 cursorItem = slotItem;
                 system.onSelectionOrContentsChanged();
             }
-        } else {
-            setSlot(inv, ref, cursorItem);
-            cursorItem = slotItem;
-            system.onSelectionOrContentsChanged();
+
+            return;
+        }
+
+        setSlot(inventory, reference, cursorItem);
+        cursorItem = slotItem;
+
+        system.onSelectionOrContentsChanged();
+    }
+
+    public void mouseReleased(MouseEvent event) {
+        mouseX = event.getX();
+        mouseY = event.getY();
+    }
+
+    public void mouseClicked(MouseEvent event) {}
+
+    private void ensureRectangleCaches(Inventory inventory) {
+        final int hotbarSize = inventory.getHotbarSize();
+        final int storageSize = inventory.getStorageSize();
+
+        if (hotbarRectangles.length != hotbarSize) {
+            hotbarRectangles = new Rectangle[hotbarSize];
+
+            for (int i = 0; i < hotbarSize; i++) {
+                hotbarRectangles[i] = new Rectangle();
+            }
+        }
+
+        if (storageRectangles.length != storageSize) {
+            storageRectangles = new Rectangle[storageSize];
+
+            for (int i = 0; i < storageSize; i++) {
+                storageRectangles[i] = new Rectangle();
+            }
         }
     }
 
-    public void mouseReleased(MouseEvent e) {
-        mx = e.getX();
-        my = e.getY();
-    }
-
-    public void mouseClicked(MouseEvent e) {
-    }
-
-    private void ensureRectCaches(Inventory inv) {
-        int hb = inv.getHotbarSize();
-        int st = inv.getStorageSize();
-
-        if (hotbarRects.length != hb) {
-            hotbarRects = new Rectangle[hb];
-            for (int i = 0; i < hb; i++) hotbarRects[i] = new Rectangle();
+    private SlotReference slotAt(int x, int y, Inventory inventory) {
+        if (!open || hotbarRectangles.length != inventory.getHotbarSize() || storageRectangles.length != inventory.getStorageSize()) {
+            return null;
         }
-        if (storageRects.length != st) {
-            storageRects = new Rectangle[st];
-            for (int i = 0; i < st; i++) storageRects[i] = new Rectangle();
-        }
-    }
 
-    private SlotRef slotAt(int x, int y, Inventory inv) {
-        if (!open) return null;
+        for (int i = 0; i < hotbarRectangles.length; i++) {
+            if (hotbarRectangles[i].contains(x, y)) {
+                slotReference.type = SlotType.HOTBAR;
+                slotReference.index = i;
 
-        if (hotbarRects.length != inv.getHotbarSize() || storageRects.length != inv.getStorageSize()) return null;
+                return slotReference;
+            }
+        }
 
-        for (int i = 0; i < hotbarRects.length; i++) {
-            if (hotbarRects[i].contains(x, y)) return new SlotRef(SlotType.HOTBAR, i);
+        for (int i = 0; i < storageRectangles.length; i++) {
+            if (storageRectangles[i].contains(x, y)) {
+                slotReference.type = SlotType.STORAGE;
+                slotReference.index = i;
+
+                return slotReference;
+            }
         }
-        for (int i = 0; i < storageRects.length; i++) {
-            if (storageRects[i].contains(x, y)) return new SlotRef(SlotType.STORAGE, i);
-        }
+
         return null;
     }
 
-    private static ItemInstance getSlot(Inventory inv, SlotRef ref) {
-        if (ref.type == SlotType.HOTBAR) return inv.getHotbar(ref.index);
-        return inv.getStorage(ref.index);
+    private static ItemInstance getSlot(Inventory inventory, SlotReference reference) {
+        return reference.type == SlotType.HOTBAR ? inventory.getHotbar(reference.index) : inventory.getStorage(reference.index);
     }
 
-    private static void setSlot(Inventory inv, SlotRef ref, ItemInstance it) {
-        if (ref.type == SlotType.HOTBAR) inv.setHotbar(ref.index, it);
-        else inv.setStorage(ref.index, it);
-    }
-
-    private enum SlotType { HOTBAR, STORAGE }
-
-    private static final class SlotRef {
-        final SlotType type;
-        final int index;
-        SlotRef(SlotType type, int index) {
-            this.type = type;
-            this.index = index;
+    private static void setSlot(Inventory inventory, SlotReference reference, ItemInstance item) {
+        if (reference.type == SlotType.HOTBAR) {
+            inventory.setHotbar(reference.index, item);
+        } else {
+            inventory.setStorage(reference.index, item);
         }
+    }
+
+    private enum SlotType {
+        HOTBAR,
+        STORAGE,
+    }
+
+    private static final class SlotReference {
+
+        private SlotType type;
+        private int index;
     }
 }

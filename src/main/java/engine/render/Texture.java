@@ -1,116 +1,193 @@
 package engine.render;
 
+import java.awt.Graphics2D;
 import java.awt.image.BufferedImage;
 import java.awt.image.DataBufferInt;
+import java.util.Arrays;
+import java.util.Objects;
 
 public final class Texture {
 
-    public enum Wrap { CLAMP, REPEAT }
+    public enum Wrap {
+        CLAMP,
+        REPEAT,
+    }
 
     public final int width;
     public final int height;
     public final int[] argb;
 
+    private final int maximumX;
+    private final int maximumY;
+
     public Texture(int width, int height, int[] argb) {
-        this.width = Math.max(1, width);
-        this.height = Math.max(1, height);
-        if (argb == null || argb.length != this.width * this.height) {
-            throw new IllegalArgumentException("Texture pixel array must be width*height");
+        if (width <= 0 || height <= 0) {
+            throw new IllegalArgumentException("Texture dimensions must be positive");
         }
-        this.argb = argb;
+
+        final int expectedLength;
+
+        try {
+            expectedLength = Math.multiplyExact(width, height);
+        } catch (ArithmeticException exception) {
+            throw new IllegalArgumentException("Texture dimensions are too large", exception);
+        }
+
+        if (argb == null || argb.length != expectedLength) {
+            throw new IllegalArgumentException("Texture pixel array must contain width * height pixels");
+        }
+
+        this.width = width;
+        this.height = height;
+        this.maximumX = width - 1;
+        this.maximumY = height - 1;
+        this.argb = Arrays.copyOf(argb, argb.length);
     }
 
-    public static Texture fromBufferedImage(BufferedImage img) {
-        if (img == null) throw new IllegalArgumentException("img == null");
-        BufferedImage src = img;
-        if (src.getType() != BufferedImage.TYPE_INT_ARGB) {
-            BufferedImage converted = new BufferedImage(src.getWidth(), src.getHeight(), BufferedImage.TYPE_INT_ARGB);
-            converted.getGraphics().drawImage(src, 0, 0, null);
-            src = converted;
+    public static Texture fromBufferedImage(BufferedImage image) {
+        Objects.requireNonNull(image, "image");
+
+        final BufferedImage argbImage;
+
+        if (image.getType() == BufferedImage.TYPE_INT_ARGB && image.getRaster().getDataBuffer() instanceof DataBufferInt) {
+            argbImage = image;
+        } else {
+            argbImage = new BufferedImage(image.getWidth(), image.getHeight(), BufferedImage.TYPE_INT_ARGB);
+
+            final Graphics2D graphics = argbImage.createGraphics();
+
+            try {
+                graphics.drawImage(image, 0, 0, null);
+            } finally {
+                graphics.dispose();
+            }
         }
-        int[] px = ((DataBufferInt) src.getRaster().getDataBuffer()).getData();
-        int[] copy = new int[px.length];
-        System.arraycopy(px, 0, copy, 0, px.length);
-        return new Texture(src.getWidth(), src.getHeight(), copy);
+
+        final int[] pixels = ((DataBufferInt) argbImage.getRaster().getDataBuffer()).getData();
+
+        return new Texture(argbImage.getWidth(), argbImage.getHeight(), pixels);
     }
 
     public int sampleNearest(double u, double v, Wrap wrap) {
-        double uu = wrapCoord(u, wrap);
-        double vv = wrapCoord(v, wrap);
+        return sampleNearestFast(u, v, wrap == Wrap.REPEAT);
+    }
 
-        int x = (int) (uu * width);
-        int y = (int) (vv * height);
+    public int sampleNearestFast(double u, double v, boolean repeat) {
+        if (!Double.isFinite(u) || !Double.isFinite(v)) {
+            return argb[0];
+        }
 
-        if (x < 0) x = 0;
-        if (x >= width) x = width - 1;
-        if (y < 0) y = 0;
-        if (y >= height) y = height - 1;
+        final int x;
+        final int y;
+
+        if (repeat) {
+            if (u < 0.0 || u >= 1.0) {
+                u -= Math.floor(u);
+            }
+
+            if (v < 0.0 || v >= 1.0) {
+                v -= Math.floor(v);
+            }
+
+            x = (int) (u * width);
+            y = (int) (v * height);
+        } else {
+            x = u <= 0.0 ? 0 : u >= 1.0 ? maximumX : (int) (u * width);
+            y = v <= 0.0 ? 0 : v >= 1.0 ? maximumY : (int) (v * height);
+        }
 
         return argb[y * width + x];
     }
 
-    // Kept for compatibility, but simplified (no gamma-correct blending).
     public int sampleBilinear(double u, double v, Wrap wrap) {
-        double uu = wrapCoord(u, wrap);
-        double vv = wrapCoord(v, wrap);
+        final Wrap effectiveWrap = wrap == null ? Wrap.CLAMP : wrap;
 
-        double fx = uu * (width - 1);
-        double fy = vv * (height - 1);
+        final double wrappedU = wrapCoordinate(u, effectiveWrap);
+        final double wrappedV = wrapCoordinate(v, effectiveWrap);
 
-        int x0 = (int) Math.floor(fx);
-        int y0 = (int) Math.floor(fy);
-        int x1 = Math.min(width - 1, x0 + 1);
-        int y1 = Math.min(height - 1, y0 + 1);
+        final double sampleX = wrappedU * maximumX;
+        final double sampleY = wrappedV * maximumY;
 
-        float tx = (float) (fx - x0);
-        float ty = (float) (fy - y0);
+        final int x0 = (int) sampleX;
+        final int y0 = (int) sampleY;
+        final int x1 = Math.min(maximumX, x0 + 1);
+        final int y1 = Math.min(maximumY, y0 + 1);
+        final float blendX = (float) (sampleX - x0);
+        final float blendY = (float) (sampleY - y0);
 
-        int c00 = argb[y0 * width + x0];
-        int c10 = argb[y0 * width + x1];
-        int c01 = argb[y1 * width + x0];
-        int c11 = argb[y1 * width + x1];
-
-        return bilerpARGB(c00, c10, c01, c11, tx, ty);
+        return bilerpArgb(
+                argb[y0 * width + x0],
+                argb[y0 * width + x1],
+                argb[y1 * width + x0],
+                argb[y1 * width + x1],
+                blendX,
+                blendY
+        );
     }
 
-    private static int bilerpARGB(int c00, int c10, int c01, int c11, float tx, float ty) {
-        int a00 = (c00 >>> 24) & 255, r00 = (c00 >>> 16) & 255, g00 = (c00 >>> 8) & 255, b00 = c00 & 255;
-        int a10 = (c10 >>> 24) & 255, r10 = (c10 >>> 16) & 255, g10 = (c10 >>> 8) & 255, b10 = c10 & 255;
-        int a01 = (c01 >>> 24) & 255, r01 = (c01 >>> 16) & 255, g01 = (c01 >>> 8) & 255, b01 = c01 & 255;
-        int a11 = (c11 >>> 24) & 255, r11 = (c11 >>> 16) & 255, g11 = (c11 >>> 8) & 255, b11 = c11 & 255;
+    private static int bilerpArgb(
+            int topLeft,
+            int topRight,
+            int bottomLeft,
+            int bottomRight,
+            float blendX,
+            float blendY
+    ) {
+        final int alpha = interpolateChannel(
+                topLeft >>> 24,
+                topRight >>> 24,
+                bottomLeft >>> 24,
+                bottomRight >>> 24,
+                blendX,
+                blendY
+        );
 
-        float a0 = a00 + (a10 - a00) * tx;
-        float r0 = r00 + (r10 - r00) * tx;
-        float g0 = g00 + (g10 - g00) * tx;
-        float b0 = b00 + (b10 - b00) * tx;
+        final int red = interpolateChannel(
+                topLeft >>> 16,
+                topRight >>> 16,
+                bottomLeft >>> 16,
+                bottomRight >>> 16,
+                blendX,
+                blendY
+        );
 
-        float a1 = a01 + (a11 - a01) * tx;
-        float r1 = r01 + (r11 - r01) * tx;
-        float g1 = g01 + (g11 - g01) * tx;
-        float b1 = b01 + (b11 - b01) * tx;
+        final int green = interpolateChannel(
+                topLeft >>> 8,
+                topRight >>> 8,
+                bottomLeft >>> 8,
+                bottomRight >>> 8,
+                blendX,
+                blendY
+        );
 
-        int a = clamp255(Math.round(a0 + (a1 - a0) * ty));
-        int r = clamp255(Math.round(r0 + (r1 - r0) * ty));
-        int g = clamp255(Math.round(g0 + (g1 - g0) * ty));
-        int b = clamp255(Math.round(b0 + (b1 - b0) * ty));
+        final int blue = interpolateChannel(topLeft, topRight, bottomLeft, bottomRight, blendX, blendY);
 
-        return (a << 24) | (r << 16) | (g << 8) | b;
+        return (alpha << 24) | (red << 16) | (green << 8) | blue;
     }
 
-    private static int clamp255(int v) {
-        if (v < 0) return 0;
-        if (v > 255) return 255;
-        return v;
+    private static int interpolateChannel(
+            int topLeft,
+            int topRight,
+            int bottomLeft,
+            int bottomRight,
+            float blendX,
+            float blendY
+    ) {
+        final float top = (topLeft & 255) + ((topRight & 255) - (topLeft & 255)) * blendX;
+        final float bottom = (bottomLeft & 255) + ((bottomRight & 255) - (bottomLeft & 255)) * blendX;
+
+        return Math.max(0, Math.min(255, Math.round(top + (bottom - top) * blendY)));
     }
 
-    private static double wrapCoord(double t, Wrap wrap) {
-        if (wrap == Wrap.REPEAT) {
-            t = t - Math.floor(t);
-            if (t < 0) t += 1.0;
-            return t;
+    private static double wrapCoordinate(double coordinate, Wrap wrap) {
+        if (!Double.isFinite(coordinate)) {
+            return 0.0;
         }
-        if (t < 0) return 0.0;
-        if (t > 1) return 1.0;
-        return t;
+
+        if (wrap == Wrap.REPEAT) {
+            return coordinate - Math.floor(coordinate);
+        }
+
+        return Math.max(0.0, Math.min(1.0, coordinate));
     }
 }

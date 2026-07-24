@@ -1,66 +1,139 @@
 package engine.inventory;
 
+/**
+ * Small thread-safe inventory.
+ *
+ * <p>The game thread changes inventory contents while Swing may render or drag
+ * slots on the EDT. Synchronized methods provide a consistent memory boundary
+ * without exposing the backing arrays.</p>
+ */
 public final class Inventory {
+
     private final ItemInstance[] hotbar;
     private final ItemInstance[] storage;
-    private int selectedHotbar = 0;
+    private int selectedHotbar;
 
-    public Inventory(int hotbarSlots, int inventorySlots) {
-        hotbarSlots = Math.max(1, hotbarSlots);
-        inventorySlots = Math.max(0, inventorySlots);
-        this.hotbar = new ItemInstance[hotbarSlots];
-        this.storage = new ItemInstance[inventorySlots];
+    public Inventory(
+            int hotbarSlots,
+            int inventorySlots
+    ) {
+        this.hotbar =
+                new ItemInstance[Math.max(1, hotbarSlots)];
+        this.storage =
+                new ItemInstance[Math.max(0, inventorySlots)];
     }
 
-    public int getHotbarSize() { return hotbar.length; }
-    public int getStorageSize() { return storage.length; }
-
-    public int getSelectedHotbar() { return selectedHotbar; }
-    public void setSelectedHotbar(int idx) {
-        if (idx < 0) idx = 0;
-        if (idx >= hotbar.length) idx = hotbar.length - 1;
-        selectedHotbar = idx;
+    public int getHotbarSize() {
+        return hotbar.length;
     }
 
-    public ItemInstance getHotbar(int i) { return (i < 0 || i >= hotbar.length) ? null : hotbar[i]; }
-    public void setHotbar(int i, ItemInstance it) { if (i >= 0 && i < hotbar.length) hotbar[i] = it; }
-
-    public ItemInstance getStorage(int i) { return (i < 0 || i >= storage.length) ? null : storage[i]; }
-    public void setStorage(int i, ItemInstance it) { if (i >= 0 && i < storage.length) storage[i] = it; }
-
-    public ItemInstance getSelectedItem() {
-        return getHotbar(selectedHotbar);
+    public int getStorageSize() {
+        return storage.length;
     }
 
-    public ItemInstance removeSelectedItem() {
-        ItemInstance it = getHotbar(selectedHotbar);
+    public synchronized int getSelectedHotbar() {
+        return selectedHotbar;
+    }
+
+    public synchronized void setSelectedHotbar(int index) {
+        if (index < 0) {
+            index = 0;
+        }
+
+        if (index >= hotbar.length) {
+            index = hotbar.length - 1;
+        }
+
+        selectedHotbar = index;
+    }
+
+    public synchronized ItemInstance getHotbar(int index) {
+        return validIndex(index, hotbar.length)
+                ? hotbar[index]
+                : null;
+    }
+
+    public synchronized void setHotbar(
+            int index,
+            ItemInstance item
+    ) {
+        if (validIndex(index, hotbar.length)) {
+            hotbar[index] = item;
+        }
+    }
+
+    public synchronized ItemInstance getStorage(int index) {
+        return validIndex(index, storage.length)
+                ? storage[index]
+                : null;
+    }
+
+    public synchronized void setStorage(
+            int index,
+            ItemInstance item
+    ) {
+        if (validIndex(index, storage.length)) {
+            storage[index] = item;
+        }
+    }
+
+    public synchronized ItemInstance getSelectedItem() {
+        return hotbar[selectedHotbar];
+    }
+
+    public synchronized ItemInstance removeSelectedItem() {
+        final ItemInstance item =
+                hotbar[selectedHotbar];
+
         hotbar[selectedHotbar] = null;
-        return it;
+        return item;
     }
 
-    public boolean addItem(ItemInstance it) {
-        if (it == null) return false;
+    public synchronized boolean addItem(ItemInstance item) {
+        if (item == null) {
+            return false;
+        }
 
-        // fill hotbar first
-        for (int i = 0; i < hotbar.length; i++) {
-            if (hotbar[i] == null) {
-                hotbar[i] = it;
-                return true;
-            }
+        final int hotbarSlot =
+                firstEmptySlot(hotbar);
+
+        if (hotbarSlot >= 0) {
+            hotbar[hotbarSlot] = item;
+            return true;
         }
-        // then storage
-        for (int i = 0; i < storage.length; i++) {
-            if (storage[i] == null) {
-                storage[i] = it;
-                return true;
-            }
+
+        final int storageSlot =
+                firstEmptySlot(storage);
+
+        if (storageSlot >= 0) {
+            storage[storageSlot] = item;
+            return true;
         }
+
         return false;
     }
 
-    public boolean hasSpace() {
-        for (ItemInstance x : hotbar) if (x == null) return true;
-        for (ItemInstance x : storage) if (x == null) return true;
-        return false;
+    public synchronized boolean hasSpace() {
+        return firstEmptySlot(hotbar) >= 0
+                || firstEmptySlot(storage) >= 0;
+    }
+
+    private static int firstEmptySlot(
+            ItemInstance[] slots
+    ) {
+        for (int i = 0; i < slots.length; i++) {
+            if (slots[i] == null) {
+                return i;
+            }
+        }
+
+        return -1;
+    }
+
+    private static boolean validIndex(
+            int index,
+            int length
+    ) {
+        return index >= 0 && index < length;
     }
 }

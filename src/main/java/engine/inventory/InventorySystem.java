@@ -3,95 +3,111 @@ package engine.inventory;
 import engine.Camera;
 import engine.GameEngine;
 import engine.event.EventBus;
-import engine.event.events.*;
+import engine.event.events.DropHeldItemRequestedEvent;
+import engine.event.events.HotbarSelectRequestedEvent;
+import engine.event.events.InventoryOpenChangedEvent;
+import engine.event.events.InventoryToggleRequestedEvent;
+import engine.event.events.PickupRequestedEvent;
+import engine.event.events.ToggleViewRequestedEvent;
+import engine.event.events.UseHeldItemRequestedEvent;
 import engine.render.Material;
-
+import java.awt.Color;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.IdentityHashMap;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.concurrent.ThreadLocalRandom;
 import objects.GameObject;
 import util.AABB;
-import util.Vector3;
 
-import java.util.ArrayDeque;
-import java.util.Deque;
-import java.util.IdentityHashMap;
-import java.util.Map;
-import java.util.Objects;
+public final class InventorySystem implements AutoCloseable {
 
-public final class InventorySystem {
+    private static final double SWING_DURATION = 0.18;
+
+    private static final double PICKUP_RANGE = 2.2;
+    private static final double LOOK_DOT_MINIMUM = 0.965;
+
+    private static final double HELD_GRIP_FORWARD = 0.10;
+    private static final double HELD_GRIP_UP = 0.02;
+    private static final double HELD_GRIP_RIGHT = 0.00;
+
+    private static final double DROP_GRAVITY = -30.0;
+    private static final double DROP_BOB_AMPLITUDE = 0.030;
+    private static final double DROP_BOB_FREQUENCY = 2.0;
+    private static final double DROP_SPIN_SPEED = 1.8;
+    private static final double DROP_EPSILON = 1.0e-6;
+    private static final double DROP_XZ_PADDING = 0.03;
+
+    private static final double WORLD_GROUND_Y = 0.0;
+    private static final double DROP_TRIANGLE_PADDING = 0.02;
+    private static final double DROP_FLOOR_NORMAL_Y = 0.65;
+    private static final double DROP_SUPPORT_EPSILON = 0.06;
 
     private final GameEngine engine;
-    private final EventBus bus;
-
+    private final EventBus eventBus;
     private final Inventory inventory;
     private final InventoryUI ui;
 
-    private final Map<GameObject, DropState> drops =
-            java.util.Collections.synchronizedMap(new IdentityHashMap<>());
+    private final Map<GameObject, DropState> drops = Collections.synchronizedMap(new IdentityHashMap<>());
+    private final ArrayDeque<GameObject> retireQueue = new ArrayDeque<>();
+    private final ArrayList<GameObject> temporaryColliders = new ArrayList<>(256);
+    private final List<EventBus.Subscription> subscriptions = new ArrayList<>(6);
 
-    private DropState lookedAt = null;
+    private volatile DropState lookedAt;
+    private volatile String pickupPromptText;
+    private volatile boolean heldDirty = true;
 
     private GameObject held;
-    private GameObject handSocketCached;
+    private GameObject cachedHandSocket;
+    private String cachedHeldId;
 
-    private String cachedHeldId = null;
-    private boolean heldDirty = true;
+    private double swingTime;
+    private double dropTimeSeconds;
 
-    private double swingT = 0.0;
-    private static final double SWING_DUR = 0.18;
-
-    private static final double PICKUP_RANGE = 2.2;
-    private static final double LOOK_DOT_MIN = 0.965;
-
-    private static final double HELD_GRIP_FORWARD = 0.08;
-    private static final double HELD_GRIP_UP      = 0.00;
-    private static final double HELD_GRIP_RIGHT   = 0.00;
-
-    private static final double DROP_GRAVITY = -30.0;
-    private static final double DROP_BOB_AMP = 0.030;
-    private static final double DROP_BOB_FREQ = 2.0;
-    private static final double DROP_SPIN_SPEED = 1.8;
-    private static final double DROP_EPS = 1e-6;
-    private static final double DROP_XZ_PAD = 0.03;
-
-    private static final double WORLD_GROUND_Y = 0.0;
-
-    // --- NEW: mesh-floor support for drops (mirrors camera/player "empty space within AABB" logic)
-    private static final double DROP_TRI_PAD = 0.02;
-    private static final double DROP_FLOOR_NY = 0.65;
-    private static final double DROP_SUPPORT_EPS = 0.06;
-
-    private final java.util.ArrayList<GameObject> tmpColliders = new java.util.ArrayList<>(256);
-
-    public InventorySystem(GameEngine engine, EventBus bus) {
+    public InventorySystem(GameEngine engine, EventBus eventBus) {
         this.engine = engine;
-        this.bus = bus;
-
+        this.eventBus = eventBus;
         this.inventory = new Inventory(9, 32);
         this.ui = new InventoryUI(engine, this);
 
-        this.handSocketCached = resolveBestHandSocket();
+        cachedHandSocket = resolveBestHandSocket();
 
-        bus.subscribe(InventoryToggleRequestedEvent.class, e -> {
-            ui.toggle();
-            bus.publish(new InventoryOpenChangedEvent(ui.isOpen()));
-        });
+        subscriptions.add(
+                eventBus.subscribe(InventoryToggleRequestedEvent.class, event -> {
+                    ui.toggle();
+                    eventBus.publish(new InventoryOpenChangedEvent(ui.isOpen()));
+                })
+        );
 
-        bus.subscribe(HotbarSelectRequestedEvent.class, e -> {
-            inventory.setSelectedHotbar(e.index);
-            onSelectionOrContentsChanged();
-        });
+        subscriptions.add(
+                eventBus.subscribe(HotbarSelectRequestedEvent.class, event -> {
+                    inventory.setSelectedHotbar(event.index);
+                    onSelectionOrContentsChanged();
+                })
+        );
 
-        bus.subscribe(DropHeldItemRequestedEvent.class, e -> dropSelected());
-        bus.subscribe(PickupRequestedEvent.class, e -> pickupLookedAt());
-        bus.subscribe(UseHeldItemRequestedEvent.class, e -> useSelected());
+        subscriptions.add(eventBus.subscribe(DropHeldItemRequestedEvent.class, event -> dropSelected()));
+        subscriptions.add(eventBus.subscribe(PickupRequestedEvent.class, event -> pickupLookedAt()));
+        subscriptions.add(eventBus.subscribe(UseHeldItemRequestedEvent.class, event -> useSelected()));
+        subscriptions.add(eventBus.subscribe(ToggleViewRequestedEvent.class, event -> onSelectionOrContentsChanged()));
     }
 
-    public InventoryUI getUI() { return ui; }
-    public Inventory getInventory() { return inventory; }
+    public InventoryUI getUI() {
+        return ui;
+    }
+
+    public Inventory getInventory() {
+        return inventory;
+    }
 
     public void seedStartingInventory() {
         inventory.setHotbar(0, new ItemInstance(ItemRegistry.get("blue_cube")));
         inventory.setHotbar(1, new ItemInstance(ItemRegistry.get("red_cube")));
         inventory.setSelectedHotbar(0);
+
         onSelectionOrContentsChanged();
     }
 
@@ -100,11 +116,14 @@ public final class InventorySystem {
         spawnWorldItem(ItemRegistry.get("red_cube"), -0.8, 1.2, 2.0);
     }
 
-    public void update(double dt) {
-        updateUseSwing(dt);
-        updateWorldDrops(dt);
+    public void update(double deltaSeconds) {
+        dropTimeSeconds += deltaSeconds;
+
+        flushRetiredHeld();
+        updateUseSwing(deltaSeconds);
+        updateWorldDrops(deltaSeconds);
         updateLookedAt();
-        updateHeldModel(dt);
+        updateHeldModel();
     }
 
     public void onSelectionOrContentsChanged() {
@@ -112,7 +131,9 @@ public final class InventorySystem {
     }
 
     public void returnCursorItem(ItemInstance cursor) {
-        if (cursor == null) return;
+        if (cursor == null) {
+            return;
+        }
 
         if (inventory.addItem(cursor)) {
             onSelectionOrContentsChanged();
@@ -124,477 +145,575 @@ public final class InventorySystem {
     }
 
     public String getPickupPromptText() {
-        if (ui.isOpen()) return null;
-        if (lookedAt == null) return null;
-        return "F: Pick up " + lookedAt.item.getDef().getDisplayName();
-    }
-
-    private static final class DropState {
-        final ItemInstance item;
-        final GameObject model;
-
-        double baseY;
-        double yVel;
-        boolean onGround;
-
-        double bottomOffset;
-
-        double t0;
-
-        // --- NEW: track previous Y so we can choose the correct supporting surface (not roof/AABB top)
-        double prevY;
-
-        DropState(ItemInstance item, GameObject model) {
-            this.item = item;
-            this.model = model;
+        if (ui.isOpen()) {
+            return null;
         }
+
+        return pickupPromptText;
     }
 
-    private DropState spawnWorldItem(ItemDefinition def, double x, double y, double z) {
-        if (def == null) return null;
+    private DropState spawnWorldItem(ItemDefinition definition, double x, double y, double z) {
+        if (definition == null) {
+            return null;
+        }
 
-        GameObject model = def.createWorldModel();
-        if (model == null) return null;
+        final GameObject model = definition.createWorldModel();
+
+        if (model == null) {
+            return null;
+        }
 
         model.setFull(false);
+        model.setIgnorePlayerCollisions(true);
+
         if (model.getMaterial() == null) {
-            model.setMaterial(Material.solid(new java.awt.Color(200, 200, 200)));
+            model.setMaterial(Material.solid(new Color(200, 200, 200)));
         }
 
         model.getTransform().position.x = x;
         model.getTransform().position.y = y;
         model.getTransform().position.z = z;
 
-        AABB a = model.getWorldAABB();
-        double posY = model.getWorldPosition().y;
-        double bottomOffset = a.minY - posY;
+        final AABB bounds = model.getWorldAABB();
+        final double positionY = model.getWorldY();
+        final double bottomOffset = bounds.minY - positionY;
+        final double minimumBaseY = WORLD_GROUND_Y - bottomOffset;
 
-        double minBaseY = WORLD_GROUND_Y - bottomOffset;
-        if (y < minBaseY) {
-            y = minBaseY;
+        if (y < minimumBaseY) {
+            y = minimumBaseY;
             model.getTransform().position.y = y;
         }
 
         engine.addRootObject(model);
 
-        DropState st = new DropState(new ItemInstance(def), model);
-        st.baseY = y;
-        st.yVel = 0.0;
-        st.bottomOffset = bottomOffset;
-        st.t0 = Math.random() * 10.0;
-        st.prevY = y;
+        final DropState state = new DropState(new ItemInstance(definition), model);
 
-        settleDropAgainstWorld(st);
+        state.baseY = y;
+        state.yVelocity = 0.0;
+        state.bottomOffset = bottomOffset;
+        state.timeOffset = ThreadLocalRandom.current().nextDouble(10.0);
+        state.previousY = y;
 
-        drops.put(model, st);
-        return st;
+        settleDropAgainstWorld(state);
+        drops.put(model, state);
+
+        return state;
     }
 
-    private void dropItemInstanceNearPlayer(ItemInstance it, double tossUpVel) {
-        if (it == null) return;
+    private void dropItemInstanceNearPlayer(ItemInstance item, double upwardVelocity) {
+        if (item == null) {
+            return;
+        }
 
-        Camera cam = engine.camera;
+        final Camera camera = engine.camera;
 
-        double fx = cam.getForwardX();
-        double fy = cam.getForwardY();
-        double fz = cam.getForwardZ();
+        final double forwardX = camera.getForwardX();
+        final double forwardY = camera.getForwardY();
+        final double forwardZ = camera.getForwardZ();
 
-        double sx = cam.x + fx * 0.95;
-        double sy = cam.y + Camera.EYE_HEIGHT - 0.25;
-        double sz = cam.z + fz * 0.95;
+        final double spawnX = camera.x + forwardX * 0.95;
+        final double spawnY = camera.y + Camera.EYE_HEIGHT - 0.25;
+        final double spawnZ = camera.z + forwardZ * 0.95;
 
-        DropState st = spawnWorldItem(it.getDef(), sx, sy, sz);
-        if (st != null) {
-            st.yVel = tossUpVel;
-            st.onGround = false;
-            settleDropAgainstWorld(st);
+        final DropState state = spawnWorldItem(item.getDef(), spawnX, spawnY, spawnZ);
+
+        if (state != null) {
+            state.yVelocity = upwardVelocity;
+            state.onGround = false;
+            settleDropAgainstWorld(state);
         }
     }
 
     private void dropSelected() {
-        if (ui.isOpen()) return;
+        if (ui.isOpen()) {
+            return;
+        }
 
-        ItemInstance sel = inventory.getSelectedItem();
-        if (sel == null) return;
+        final ItemInstance selected = inventory.getSelectedItem();
+
+        if (selected == null) {
+            return;
+        }
 
         inventory.removeSelectedItem();
         onSelectionOrContentsChanged();
-
-        dropItemInstanceNearPlayer(sel, 2.0);
+        dropItemInstanceNearPlayer(selected, 2.0);
     }
 
     private void pickupLookedAt() {
-        if (ui.isOpen()) return;
+        if (ui.isOpen()) {
+            return;
+        }
 
-        DropState target = lookedAt;
-        if (target == null || target.model == null) return;
+        final DropState target = lookedAt;
 
-        double ex = engine.camera.getAimX();
-        double ey = engine.camera.getAimY();
-        double ez = engine.camera.getAimZ();
+        if (target == null || target.model == null) {
+            return;
+        }
 
-        Vector3 wp = target.model.getWorldPosition();
-        double dx = wp.x - ex;
-        double dy = wp.y - ey;
-        double dz = wp.z - ez;
-        double d2 = dx*dx + dy*dy + dz*dz;
-        if (d2 > PICKUP_RANGE * PICKUP_RANGE) return;
+        final double eyeX = engine.camera.getAimX();
+        final double eyeY = engine.camera.getAimY();
+        final double eyeZ = engine.camera.getAimZ();
 
-        if (!inventory.hasSpace()) return;
-        if (!inventory.addItem(target.item)) return;
+        final double deltaX = target.model.getWorldX() - eyeX;
+        final double deltaY = target.model.getWorldY() - eyeY;
+        final double deltaZ = target.model.getWorldZ() - eyeZ;
+        final double distanceSquared = deltaX * deltaX + deltaY * deltaY + deltaZ * deltaZ;
+
+        if (distanceSquared > PICKUP_RANGE * PICKUP_RANGE) {
+            return;
+        }
+
+        if (!inventory.hasSpace() || !inventory.addItem(target.item)) {
+            return;
+        }
 
         engine.removeRootObject(target.model);
         drops.remove(target.model);
+
         lookedAt = null;
+        pickupPromptText = null;
 
         onSelectionOrContentsChanged();
     }
 
-    private void updateWorldDrops(double dt) {
-        if (drops.isEmpty()) return;
+    private void updateWorldDrops(double deltaSeconds) {
+        if (drops.isEmpty()) {
+            return;
+        }
+
+        final double timeBase = dropTimeSeconds;
 
         synchronized (drops) {
-            for (DropState st : drops.values()) {
-                if (st == null || st.model == null) continue;
-
-                // record prev Y (used by settling logic)
-                st.prevY = st.model.getTransform().position.y;
-
-                double t = st.t0 + (System.nanoTime() / 1_000_000_000.0);
-                st.model.getTransform().rotation.y += DROP_SPIN_SPEED * dt;
-
-                double bob = Math.sin(t * DROP_BOB_FREQ) * DROP_BOB_AMP;
-
-                if (st.onGround) {
-                    st.model.getTransform().position.y = st.baseY + bob;
+            for (DropState state : drops.values()) {
+                if (state == null || state.model == null) {
                     continue;
                 }
 
-                st.yVel += DROP_GRAVITY * dt;
-                st.model.getTransform().position.y += st.yVel * dt;
+                state.previousY = state.model.getTransform().position.y;
 
-                settleDropAgainstWorld(st);
+                final double time = state.timeOffset + timeBase;
+
+                state.model.getTransform().rotation.y += DROP_SPIN_SPEED * deltaSeconds;
+
+                final double bob = Math.sin(time * DROP_BOB_FREQUENCY) * DROP_BOB_AMPLITUDE;
+
+                if (state.onGround) {
+                    state.model.getTransform().position.y = state.baseY + bob;
+                    continue;
+                }
+
+                state.yVelocity += DROP_GRAVITY * deltaSeconds;
+                state.model.getTransform().position.y += state.yVelocity * deltaSeconds;
+
+                settleDropAgainstWorld(state);
             }
         }
     }
 
-    // --- CHANGED: drops now settle using mesh-floor triangles (and only floors below them),
-    //              not the outer AABB top of a hollow object.
-    private void settleDropAgainstWorld(DropState st) {
-        if (st == null || st.model == null) return;
+    private void settleDropAgainstWorld(DropState state) {
+        if (state == null || state.model == null) {
+            return;
+        }
 
-        AABB a = st.model.getWorldAABB();
+        final AABB bounds = state.model.getWorldAABB();
 
-        double dropMinX = a.minX - DROP_XZ_PAD;
-        double dropMaxX = a.maxX + DROP_XZ_PAD;
-        double dropMinZ = a.minZ - DROP_XZ_PAD;
-        double dropMaxZ = a.maxZ + DROP_XZ_PAD;
+        final double dropMinX = bounds.minX - DROP_XZ_PADDING;
+        final double dropMaxX = bounds.maxX + DROP_XZ_PADDING;
+        final double dropMinZ = bounds.minZ - DROP_XZ_PADDING;
+        final double dropMaxZ = bounds.maxZ + DROP_XZ_PADDING;
 
-        engine.queryNearbyCollidersXZ(dropMinX, dropMaxX, dropMinZ, dropMaxZ, tmpColliders);
+        engine.queryNearbyCollidersXZ(dropMinX, dropMaxX, dropMinZ, dropMaxZ, temporaryColliders);
 
-        // We only allow support surfaces up to this height, which prevents snapping to roofs / AABB tops above the item.
-        double prevBottomApprox = st.prevY + st.bottomOffset;
-        double supportMaxY = Math.max(prevBottomApprox, a.minY) + DROP_SUPPORT_EPS;
+        final double previousBottom = state.previousY + state.bottomOffset;
+        final double supportMaximumY = Math.max(previousBottom, bounds.minY) + DROP_SUPPORT_EPSILON;
 
         double bestFloorY = WORLD_GROUND_Y;
 
-        for (GameObject g : tmpColliders) {
-            if (g == null) continue;
-            if (!g.isFull()) continue;
-            if (g == engine.getPlayerBody()) continue;
+        for (GameObject object : temporaryColliders) {
+            if (object == null || !object.isFull() || object == engine.getPlayerBody()) {
+                continue;
+            }
 
-            AABB b = g.getWorldAABB();
+            final AABB colliderBounds = object.getWorldAABB();
 
-            if (dropMaxX <= b.minX || dropMinX >= b.maxX) continue;
-            if (dropMaxZ <= b.minZ || dropMinZ >= b.maxZ) continue;
+            if (dropMaxX <= colliderBounds.minX || dropMinX >= colliderBounds.maxX || dropMaxZ <= colliderBounds.minZ || dropMinZ >= colliderBounds.maxZ) {
+                continue;
+            }
 
-            int[][] faces = g.getFacesArray();
-            double[][] wverts = g.getTransformedVertices();
+            final int[][] faces = object.getFacesArray();
+            final double[][] worldVertices = object.getTransformedVertices();
 
-            if (faces != null && wverts != null && faces.length > 0 && wverts.length > 0) {
-                double floor = findBestMeshFloorYForDrop(
-                        faces, wverts,
-                        dropMinX, dropMaxX,
-                        dropMinZ, dropMaxZ,
-                        supportMaxY
-                );
-                if (floor > bestFloorY) bestFloorY = floor;
+            if (faces != null && worldVertices != null && faces.length > 0 && worldVertices.length > 0) {
+                final double floor = findBestMeshFloorYForDrop(faces, worldVertices, dropMinX, dropMaxX, dropMinZ, dropMaxZ, supportMaximumY);
+
+                if (floor > bestFloorY) {
+                    bestFloorY = floor;
+                }
             } else {
-                double top = b.maxY;
-                if (top <= supportMaxY && top > bestFloorY) {
+                final double top = colliderBounds.maxY;
+
+                if (top <= supportMaximumY && top > bestFloorY) {
                     bestFloorY = top;
                 }
             }
         }
 
-        double desiredBaseY = bestFloorY - st.bottomOffset;
+        double desiredBaseY = bestFloorY - state.bottomOffset;
 
-        double minBaseY = WORLD_GROUND_Y - st.bottomOffset;
-        if (desiredBaseY < minBaseY) desiredBaseY = minBaseY;
+        final double minimumBaseY = WORLD_GROUND_Y - state.bottomOffset;
 
-        // land if the item bottom is at/below the best floor
-        if (a.minY <= bestFloorY + DROP_EPS) {
-            st.baseY = desiredBaseY;
-            st.model.getTransform().position.y = st.baseY;
-            st.yVel = 0.0;
-            st.onGround = true;
+        if (desiredBaseY < minimumBaseY) {
+            desiredBaseY = minimumBaseY;
+        }
+
+        if (bounds.minY <= bestFloorY + DROP_EPSILON) {
+            state.baseY = desiredBaseY;
+            state.model.getTransform().position.y = state.baseY;
+            state.yVelocity = 0.0;
+            state.onGround = true;
         } else {
-            st.onGround = false;
+            state.onGround = false;
         }
     }
 
-    // --- NEW: floor search inside a mesh (horizontal-ish triangles only), restricted to floors below the drop
     private static double findBestMeshFloorYForDrop(
-            int[][] faces, double[][] wverts,
-            double dropMinX, double dropMaxX,
-            double dropMinZ, double dropMaxZ,
-            double supportMaxY
+            int[][] faces,
+            double[][] worldVertices,
+            double dropMinX,
+            double dropMaxX,
+            double dropMinZ,
+            double dropMaxZ,
+            double supportMaximumY
     ) {
         double best = Double.NEGATIVE_INFINITY;
 
-        for (int fi = 0; fi < faces.length; fi++) {
-            int[] f = faces[fi];
-            if (f == null || f.length != 3) continue;
+        for (int[] face : faces) {
+            if (face == null || face.length != 3) {
+                continue;
+            }
 
-            int i0 = f[0], i1 = f[1], i2 = f[2];
-            if (i0 < 0 || i1 < 0 || i2 < 0 || i0 >= wverts.length || i1 >= wverts.length || i2 >= wverts.length) continue;
+            final int index0 = face[0];
+            final int index1 = face[1];
+            final int index2 = face[2];
 
-            double[] a = wverts[i0];
-            double[] b = wverts[i1];
-            double[] c = wverts[i2];
-            if (a == null || b == null || c == null) continue;
+            if (index0 < 0 || index1 < 0 || index2 < 0 || index0 >= worldVertices.length || index1 >= worldVertices.length || index2 >= worldVertices.length) {
+                continue;
+            }
 
-            double ax = a[0], ay = a[1], az = a[2];
-            double bx = b[0], by = b[1], bz = b[2];
-            double cx = c[0], cy = c[1], cz = c[2];
+            final double[] a = worldVertices[index0];
+            final double[] b = worldVertices[index1];
+            final double[] c = worldVertices[index2];
 
-            // normal for "floor-ish" test
-            double ux = bx - ax, uy = by - ay, uz = bz - az;
-            double vx = cx - ax, vy = cy - ay, vz = cz - az;
+            if (a == null || b == null || c == null) {
+                continue;
+            }
 
-            double nx = uy * vz - uz * vy;
-            double ny = uz * vx - ux * vz;
-            double nz = ux * vy - uy * vx;
+            final double ax = a[0];
+            final double ay = a[1];
+            final double az = a[2];
 
-            double nlen = Math.sqrt(nx*nx + ny*ny + nz*nz);
-            if (nlen < 1e-12) continue;
+            final double bx = b[0];
+            final double by = b[1];
+            final double bz = b[2];
 
-            double absNy = Math.abs(ny) / nlen;
-            if (absNy < DROP_FLOOR_NY) continue;
+            final double cx = c[0];
+            final double cy = c[1];
+            final double cz = c[2];
 
-            double triMaxY = max3(ay, by, cy);
-            if (triMaxY > supportMaxY) continue;
+            final double edge1X = bx - ax;
+            final double edge1Y = by - ay;
+            final double edge1Z = bz - az;
 
-            double minX = min3(ax, bx, cx) - DROP_TRI_PAD;
-            double maxX = max3(ax, bx, cx) + DROP_TRI_PAD;
-            double minZ = min3(az, bz, cz) - DROP_TRI_PAD;
-            double maxZ = max3(az, bz, cz) + DROP_TRI_PAD;
+            final double edge2X = cx - ax;
+            final double edge2Y = cy - ay;
+            final double edge2Z = cz - az;
 
-            if (dropMaxX <= minX || dropMinX >= maxX) continue;
-            if (dropMaxZ <= minZ || dropMinZ >= maxZ) continue;
+            final double normalX = edge1Y * edge2Z - edge1Z * edge2Y;
+            final double normalY = edge1Z * edge2X - edge1X * edge2Z;
+            final double normalZ = edge1X * edge2Y - edge1Y * edge2X;
+            final double normalLengthSquared = normalX * normalX + normalY * normalY + normalZ * normalZ;
 
-            if (triMaxY > best) best = triMaxY;
+            if (normalLengthSquared < 1.0e-24) {
+                continue;
+            }
+
+            if (normalY * normalY < DROP_FLOOR_NORMAL_Y * DROP_FLOOR_NORMAL_Y * normalLengthSquared) {
+                continue;
+            }
+
+            final double triangleMaximumY = max3(ay, by, cy);
+
+            if (triangleMaximumY > supportMaximumY) {
+                continue;
+            }
+
+            final double triangleMinX = min3(ax, bx, cx) - DROP_TRIANGLE_PADDING;
+            final double triangleMaxX = max3(ax, bx, cx) + DROP_TRIANGLE_PADDING;
+            final double triangleMinZ = min3(az, bz, cz) - DROP_TRIANGLE_PADDING;
+            final double triangleMaxZ = max3(az, bz, cz) + DROP_TRIANGLE_PADDING;
+
+            if (dropMaxX <= triangleMinX || dropMinX >= triangleMaxX || dropMaxZ <= triangleMinZ || dropMinZ >= triangleMaxZ) {
+                continue;
+            }
+
+            if (triangleMaximumY > best) {
+                best = triangleMaximumY;
+            }
         }
 
-        return best;
+        return best == Double.NEGATIVE_INFINITY ? WORLD_GROUND_Y : best;
     }
 
     private void updateLookedAt() {
-        lookedAt = null;
-        if (ui.isOpen()) return;
-        if (drops.isEmpty()) return;
+        if (ui.isOpen()) {
+            lookedAt = null;
+            pickupPromptText = null;
+            return;
+        }
 
-        double ex = engine.camera.getAimX();
-        double ey = engine.camera.getAimY();
-        double ez = engine.camera.getAimZ();
+        final Camera camera = engine.camera;
 
-        double fx = engine.camera.getForwardX();
-        double fy = engine.camera.getForwardY();
-        double fz = engine.camera.getForwardZ();
+        final double eyeX = camera.getAimX();
+        final double eyeY = camera.getAimY();
+        final double eyeZ = camera.getAimZ();
 
-        double bestDot = LOOK_DOT_MIN;
+        final double forwardX = camera.getForwardX();
+        final double forwardY = camera.getForwardY();
+        final double forwardZ = camera.getForwardZ();
+
+        final double maximumDistanceSquared = PICKUP_RANGE * PICKUP_RANGE;
+
         DropState best = null;
+        double bestDistanceSquared = Double.POSITIVE_INFINITY;
 
         synchronized (drops) {
-            for (DropState st : drops.values()) {
-                if (st == null || st.model == null) continue;
+            for (DropState state : drops.values()) {
+                if (state == null || state.model == null) {
+                    continue;
+                }
 
-                Vector3 p = st.model.getWorldPosition();
-                double dx = p.x - ex;
-                double dy = p.y - ey;
-                double dz = p.z - ez;
+                final double vectorX = state.model.getWorldX() - eyeX;
+                final double vectorY = state.model.getWorldY() - eyeY;
+                final double vectorZ = state.model.getWorldZ() - eyeZ;
 
-                double d2 = dx*dx + dy*dy + dz*dz;
-                if (d2 > PICKUP_RANGE * PICKUP_RANGE) continue;
+                double distanceSquared = vectorX * vectorX + vectorY * vectorY + vectorZ * vectorZ;
 
-                double d = Math.sqrt(Math.max(1e-12, d2));
-                double inv = 1.0 / d;
-                double nx = dx * inv, ny = dy * inv, nz = dz * inv;
+                if (distanceSquared > maximumDistanceSquared) {
+                    continue;
+                }
 
-                double dot = nx*fx + ny*fy + nz*fz;
-                if (dot > bestDot) {
-                    bestDot = dot;
-                    best = st;
+                if (distanceSquared < 1.0e-12) {
+                    distanceSquared = 1.0e-12;
+                }
+
+                final double inverseDistance = 1.0 / Math.sqrt(distanceSquared);
+                final double dot = (vectorX * forwardX + vectorY * forwardY + vectorZ * forwardZ) * inverseDistance;
+
+                if (dot < LOOK_DOT_MINIMUM) {
+                    continue;
+                }
+
+                if (distanceSquared < bestDistanceSquared) {
+                    bestDistanceSquared = distanceSquared;
+                    best = state;
                 }
             }
         }
 
-        lookedAt = best;
+        if (lookedAt != best) {
+            lookedAt = best;
+            pickupPromptText = best == null ? null : "F: Pickup " + best.item.getDef().getDisplayName();
+        }
     }
 
     private void useSelected() {
-        if (ui.isOpen()) return;
-
-        ItemInstance sel = inventory.getSelectedItem();
-        if (sel != null) {
-            sel.getDef().onUse(new ItemDefinition.ItemUseContext(this));
+        if (ui.isOpen()) {
+            return;
         }
 
-        swingT = SWING_DUR;
+        final ItemInstance selected = inventory.getSelectedItem();
+
+        if (selected == null || selected.getDef() == null) {
+            return;
+        }
+
+        selected.getDef().onUse(new ItemDefinition.ItemUseContext(this));
+        swingTime = SWING_DURATION;
     }
 
-    private void updateUseSwing(double dt) {
-        if (swingT > 0.0) {
-            swingT -= dt;
-            if (swingT < 0.0) swingT = 0.0;
+    private void updateUseSwing(double deltaSeconds) {
+        if (swingTime <= 0.0) {
+            return;
+        }
+
+        swingTime -= deltaSeconds;
+
+        if (swingTime < 0.0) {
+            swingTime = 0.0;
         }
     }
 
-    private void updateHeldModel(double dt) {
-        ItemInstance sel = inventory.getSelectedItem();
-        String wantId = (sel == null ? null : sel.getDef().getId());
+    private void updateHeldModel() {
+        final ItemInstance selected = inventory.getSelectedItem();
+        final String wantedId = selected == null || selected.getDef() == null ? null : selected.getDef().getId();
+        final boolean firstPerson = engine.isFirstPerson();
 
-        if (heldDirty || !Objects.equals(wantId, cachedHeldId)) {
-            detach(held);
-            held = null;
-
-            cachedHeldId = wantId;
+        if (heldDirty || (wantedId == null ? cachedHeldId != null : !wantedId.equals(cachedHeldId))) {
+            rebuildHeldModel(selected, wantedId, firstPerson);
             heldDirty = false;
-
-            if (sel != null) {
-                held = sel.getDef().createThirdPersonModel();
-                if (held != null) {
-                    held.setFull(false);
-
-                    GameObject socket = resolveBestHandSocket();
-                    if (socket == null) socket = engine.getPlayerBody();
-                    safeAddChild(socket, held);
-
-                    applyDefaultGripToHeld(held);
-
-                    held.setVisible(true);
-                }
-            }
         }
 
-        if (held != null) {
-            held.setVisible(true);
+        if (held == null) {
+            return;
+        }
 
-            if (swingT > 0.0) {
-                double u = swingT / SWING_DUR;
-                double s = Math.sin((1.0 - u) * Math.PI);
-                held.getTransform().rotation.x = -0.55 * s;
-            } else {
-                held.getTransform().rotation.x = 0.0;
-            }
+        held.getTransform().position.x = HELD_GRIP_RIGHT;
+        held.getTransform().position.y = HELD_GRIP_UP;
+        held.getTransform().position.z = HELD_GRIP_FORWARD;
+
+        if (swingTime > 0.0) {
+            final double progress = swingTime / SWING_DURATION;
+            final double swing = Math.sin(progress * Math.PI);
+
+            held.getTransform().rotation.x = -0.55 * swing;
+        } else {
+            held.getTransform().rotation.x = 0.0;
         }
     }
 
-    private void applyDefaultGripToHeld(GameObject h) {
-        if (h == null) return;
+    private void rebuildHeldModel(ItemInstance selected, String wantedId, boolean firstPerson) {
+        if (held != null) {
+            retireHeld(held);
+            held = null;
+        }
 
-        h.getTransform().position.x = HELD_GRIP_RIGHT;
-        h.getTransform().position.y = HELD_GRIP_UP;
-        h.getTransform().position.z = HELD_GRIP_FORWARD;
+        cachedHeldId = wantedId;
 
-        h.getTransform().rotation.x = 0.0;
-        h.getTransform().rotation.y = 0.0;
-        h.getTransform().rotation.z = 0.0;
+        if (selected == null || selected.getDef() == null || firstPerson) {
+            return;
+        }
+
+        if (cachedHandSocket == null) {
+            cachedHandSocket = resolveBestHandSocket();
+        }
+
+        final GameObject socket = cachedHandSocket != null ? cachedHandSocket : engine.getPlayerBody();
+
+        if (socket == null) {
+            return;
+        }
+
+        final ItemDefinition definition = selected.getDef();
+
+        GameObject model = definition.createThirdPersonModel();
+
+        if (model == null) {
+            model = definition.createWorldModel();
+        }
+
+        if (model == null) {
+            return;
+        }
+
+        model.setFull(false);
+        model.setSolid(false);
+        model.setIgnorePlayerCollisions(true);
+
+        socket.addChild(model);
+        held = model;
+    }
+
+    private void retireHeld(GameObject object) {
+        if (object == null) {
+            return;
+        }
+
+        object.setSolid(false);
+        object.setFull(false);
+        object.setIgnorePlayerCollisions(true);
+        object.setVisible(false);
+        object.setActive(false);
+
+        retireQueue.add(object);
+    }
+
+    private void flushRetiredHeld() {
+        while (!retireQueue.isEmpty()) {
+            final GameObject object = retireQueue.poll();
+
+            if (object == null) {
+                continue;
+            }
+
+            final GameObject parent = object.getParent();
+
+            if (parent != null) {
+                parent.removeChild(object);
+            }
+        }
     }
 
     private GameObject resolveBestHandSocket() {
-        GameObject pb = engine.getPlayerBody();
-        if (pb == null) return null;
+        final GameObject playerBody = engine.getPlayerBody();
 
-        if (handSocketCached != null && isDescendantOrSelf(handSocketCached, pb)) {
-            return handSocketCached;
+        if (playerBody == null) {
+            return null;
         }
 
-        Camera cam = engine.camera;
+        final ArrayDeque<GameObject> queue = new ArrayDeque<>();
 
-        double baseX = cam.x;
-        double baseY = cam.y + Camera.EYE_HEIGHT * 0.62;
-        double baseZ = cam.z;
+        queue.add(playerBody);
 
-        double rx = cam.getRightX(), ry = cam.getRightY(), rz = cam.getRightZ();
-        double fx = cam.getForwardX(), fy = cam.getForwardY(), fz = cam.getForwardZ();
+        while (!queue.isEmpty()) {
+            final GameObject object = queue.poll();
 
-        double tx = baseX + rx * 0.35 + fx * 0.10;
-        double ty = baseY + ry * 0.35 + fy * 0.10;
-        double tz = baseZ + rz * 0.35 + fz * 0.10;
+            if (object == null) {
+                continue;
+            }
 
-        GameObject best = null;
-        double bestD2 = Double.POSITIVE_INFINITY;
+            final String name = object.getName();
 
-        Deque<GameObject> q = new ArrayDeque<>();
-        q.add(pb);
+            if (name != null) {
+                final String normalized = name.toLowerCase(Locale.ROOT);
 
-        while (!q.isEmpty()) {
-            GameObject g = q.removeFirst();
-            if (g == null) continue;
-
-            if (g != pb) {
-                Vector3 wp = g.getWorldPosition();
-                double dx = wp.x - tx;
-                double dy = wp.y - ty;
-                double dz = wp.z - tz;
-                double d2 = dx*dx + dy*dy + dz*dz;
-
-                if (d2 < bestD2) {
-                    bestD2 = d2;
-                    best = g;
+                if (normalized.contains("hand_socket") || normalized.contains("handsocket") || normalized.equals("hand")) {
+                    return object;
                 }
             }
 
-            java.util.List<GameObject> kids = g.getChildren();
-            if (kids != null && !kids.isEmpty()) {
-                for (int i = 0; i < kids.size(); i++) q.addLast(kids.get(i));
+            final List<GameObject> children = object.getChildren();
+
+            if (children != null) {
+                for (GameObject child : children) {
+                    if (child != null) {
+                        queue.add(child);
+                    }
+                }
             }
         }
 
-        handSocketCached = best;
-        return handSocketCached;
+        return playerBody;
     }
 
-    private static boolean isDescendantOrSelf(GameObject node, GameObject root) {
-        if (node == null || root == null) return false;
-        for (GameObject p = node; p != null; p = p.getParent()) {
-            if (p == root) return true;
-        }
-        return false;
-    }
-
-    private static void safeAddChild(GameObject parent, GameObject child) {
-        if (parent == null || child == null) return;
-
-        GameObject p = child.getParent();
-        if (p != null && p != parent) {
-            try { p.removeChild(child); } catch (Throwable ignored) {}
+    @Override
+    public void close() {
+        for (EventBus.Subscription subscription : subscriptions) {
+            subscription.close();
         }
 
-        try {
-            parent.addChild(child);
-        } catch (Throwable t) {
-            throw new RuntimeException("GameObject.addChild/removeChild not available or failed.", t);
-        }
-    }
+        subscriptions.clear();
 
-    private static void detach(GameObject child) {
-        if (child == null) return;
-        GameObject p = child.getParent();
-        if (p != null) {
-            try { p.removeChild(child); } catch (Throwable ignored) {}
+        lookedAt = null;
+        pickupPromptText = null;
+
+        if (held != null) {
+            retireHeld(held);
+            held = null;
         }
+
+        flushRetiredHeld();
+        drops.clear();
     }
 
     private static double min3(double a, double b, double c) {
@@ -603,5 +722,24 @@ public final class InventorySystem {
 
     private static double max3(double a, double b, double c) {
         return Math.max(a, Math.max(b, c));
+    }
+
+    private static final class DropState {
+
+        private final ItemInstance item;
+        private final GameObject model;
+
+        private double baseY;
+        private double yVelocity;
+        private boolean onGround;
+
+        private double bottomOffset;
+        private double timeOffset;
+        private double previousY;
+
+        private DropState(ItemInstance item, GameObject model) {
+            this.item = item;
+            this.model = model;
+        }
     }
 }

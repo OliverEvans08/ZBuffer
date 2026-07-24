@@ -55,7 +55,6 @@ public class Ground extends GameObject {
 
     @Override public double[][] getVertices() { return verts; }
     @Override public double[][] getUVs() { return uvs; }
-    @Override public int[][] getEdges() { return new int[0][]; }
     @Override public int[][] getFacesArray() { return FACES; }
     @Override public void update(double delta) {}
 }

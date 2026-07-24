@@ -6,197 +6,414 @@ import util.Vector3;
 
 import java.awt.Color;
 
-/**
- * Player body rig with “rounded” parts + procedural locomotion.
- *
- * Fixes:
- *  - Arms intersecting torso: shoulders placed outside torso radius + base outward splay rotations.
- *  - Animation “super slow / hardly moves”: if GameEngine doesn't provide intent vectors yet,
- *    we derive forward/strafe/speed from this object's world velocity each tick.
- *  - Human-like lean: moving forward leans forward; moving backward stays mostly upright (at most a slight forward lean),
- *    never leaning back.
- */
 public class Body extends GameObject {
 
-    // Rig parts
+    private static final double[][] EMPTY_VERTICES =
+            new double[0][0];
+
     private final BoxPart pelvis;
     private final CapsulePart torso;
     private final CapsulePart neck;
     private final SpherePart head;
 
-    private final CapsulePart lUpperArm, lForeArm;
-    private final SpherePart  lHand;
-    private final CapsulePart rUpperArm, rForeArm;
-    private final SpherePart  rHand;
+    private final CapsulePart lUpperArm;
+    private final CapsulePart lForeArm;
+    private final SpherePart lHand;
 
-    private final CapsulePart lThigh, lShin;
-    private final BoxPart     lFoot;
-    private final CapsulePart rThigh, rShin;
-    private final BoxPart     rFoot;
+    private final CapsulePart rUpperArm;
+    private final CapsulePart rForeArm;
+    private final SpherePart rHand;
 
-    // Base transforms (so animation offsets never “drift”)
-    private final PoseBase pPelvis, pTorso, pNeck, pHead;
-    private final PoseBase pLUA, pLFA, pLH, pRUA, pRFA, pRH;
-    private final PoseBase pLT, pLS, pLF, pRT, pRS, pRF;
+    private final CapsulePart lThigh;
+    private final CapsulePart lShin;
+    private final BoxPart lFoot;
 
-    // Motion state (fed from GameEngine)
+    private final CapsulePart rThigh;
+    private final CapsulePart rShin;
+    private final BoxPart rFoot;
+
+    private final GameObject rightHandSocket;
+
+    private final PoseBase pPelvis;
+    private final PoseBase pTorso;
+    private final PoseBase pNeck;
+    private final PoseBase pHead;
+
+    private final PoseBase pLUA;
+    private final PoseBase pLFA;
+    private final PoseBase pLH;
+    private final PoseBase pRUA;
+    private final PoseBase pRFA;
+    private final PoseBase pRH;
+
+    private final PoseBase pLT;
+    private final PoseBase pLS;
+    private final PoseBase pLF;
+    private final PoseBase pRT;
+    private final PoseBase pRS;
+    private final PoseBase pRF;
+
     private boolean movingIntent;
     private boolean onGround;
     private boolean prevOnGround = true;
     private boolean flightMode;
-    private double yVel;
+    private boolean modelVisible = true;
 
-    // Optional external intent (if GameEngine is updated to pass it)
+    private double yVel;
     private double intentForward;
     private double intentStrafe;
     private double intentSpeed;
     private double viewPitch;
 
-    // Derived intent from velocity (works even if GameEngine calls old setMotionState)
-    private boolean velInit = false;
-    private double lastX, lastZ;
+    private boolean velInit;
+    private double lastX;
+    private double lastZ;
 
-    private double vFwdSm = 0.0;
-    private double vStrSm = 0.0;
-    private double vSpdSm = 0.0;
-    private double pitchSm = 0.0;
+    private double vFwdSm;
+    private double vStrSm;
+    private double vSpdSm;
+    private double pitchSm;
 
-    // Animation clocks
-    private double t = 0.0;
-    private double gait = 0.0;
-    private double landTimer = 0.0;
+    private double t;
+    private double gait;
+    private double landTimer;
 
     public Body(double width, double height) {
         setFull(false);
 
-        final double H = Math.max(1.2, height);
-        final double W = Math.max(0.35, width);
+        final double h =
+                Math.max(1.2, height);
 
-        // --- proportions (tuned to feel “human-ish”) ---
-        double legH    = H * 0.52;
-        double pelvisH = H * 0.10;
-        double torsoH  = H * 0.28;
-        double neckH   = H * 0.05;
+        final double w =
+                Math.max(0.35, width);
 
-        double headR   = H * 0.10;
+        final double legH = h * 0.52;
+        final double pelvisH = h * 0.10;
+        final double torsoH = h * 0.28;
+        final double neckH = h * 0.05;
+        final double headR = h * 0.10;
 
-        double thighL  = legH * 0.48;
-        double shinL   = legH * 0.40;
-        double footH   = Math.max(0.06, legH - thighL - shinL);
+        final double thighL = legH * 0.48;
+        final double shinL = legH * 0.40;
 
-        double armH    = torsoH * 0.92;
-        double uArmL   = armH * 0.52;
-        double fArmL   = armH * 0.48;
-        double handR   = W * 0.12;
+        final double footH =
+                Math.max(
+                        0.06,
+                        legH - thighL - shinL
+                );
 
-        double legR    = W * 0.12;
-        double armR    = W * 0.10;
-        double torsoR  = W * 0.22;
-        double neckR   = W * 0.11;
+        final double armH = torsoH * 0.92;
+        final double uArmL = armH * 0.52;
+        final double fArmL = armH * 0.48;
 
-        // Materials
-        var skin  = Material.solid(new Color(255, 196, 160)).setAmbient(0.22).setDiffuse(0.90);
-        var shirt = Material.solid(new Color(70, 170, 255)).setAmbient(0.22).setDiffuse(0.90);
-        var pants = Material.solid(new Color(50, 70, 95)).setAmbient(0.22).setDiffuse(0.90);
-        var shoes = Material.solid(new Color(35, 35, 35)).setAmbient(0.20).setDiffuse(0.95);
+        final double handR = w * 0.12;
+        final double legR = w * 0.12;
+        final double armR = w * 0.10;
+        final double torsoR = w * 0.22;
+        final double neckR = w * 0.11;
 
-        // Root is at feet (y=0)
-        double legTotal = thighL + shinL + footH;
+        final Material skin =
+                Material.solid(
+                                new Color(255, 196, 160)
+                        )
+                        .setAmbient(0.22)
+                        .setDiffuse(0.90);
 
-        // Pelvis
-        pelvis = new BoxPart(W * 0.55, pelvisH, W * 0.30, BoxPart.Anchor.BOTTOM);
+        final Material shirt =
+                Material.solid(
+                                new Color(70, 170, 255)
+                        )
+                        .setAmbient(0.22)
+                        .setDiffuse(0.90);
+
+        final Material pants =
+                Material.solid(
+                                new Color(50, 70, 95)
+                        )
+                        .setAmbient(0.22)
+                        .setDiffuse(0.90);
+
+        final Material shoes =
+                Material.solid(
+                                new Color(35, 35, 35)
+                        )
+                        .setAmbient(0.20)
+                        .setDiffuse(0.95);
+
+        final double legTotal =
+                thighL + shinL + footH;
+
+        pelvis = new BoxPart(
+                w * 0.55,
+                pelvisH,
+                w * 0.30,
+                BoxPart.Anchor.BOTTOM
+        );
+
         pelvis.setMaterial(pants);
-        pelvis.getTransform().position = new Vector3(0, legTotal, 0);
+        pelvis.getTransform().position =
+                new Vector3(0.0, legTotal, 0.0);
 
-        // Torso (capsule = rounded) — place at top of pelvis (avoid overlap)
-        torso = new CapsulePart(torsoR, torsoH, 12, 4, 2, CapsulePart.Anchor.BOTTOM);
+        torso = new CapsulePart(
+                torsoR,
+                torsoH,
+                12,
+                4,
+                2,
+                CapsulePart.Anchor.BOTTOM
+        );
+
         torso.setMaterial(shirt);
-        torso.getTransform().position = new Vector3(0, pelvisH * 0.98, 0);
+        torso.getTransform().position =
+                new Vector3(
+                        0.0,
+                        pelvisH * 0.98,
+                        0.0
+                );
 
-        // Neck — near top of torso
-        neck = new CapsulePart(neckR, neckH, 12, 3, 1, CapsulePart.Anchor.BOTTOM);
+        neck = new CapsulePart(
+                neckR,
+                neckH,
+                12,
+                3,
+                1,
+                CapsulePart.Anchor.BOTTOM
+        );
+
         neck.setMaterial(skin);
-        neck.getTransform().position = new Vector3(0, torsoH * 0.985, 0);
+        neck.getTransform().position =
+                new Vector3(
+                        0.0,
+                        torsoH * 0.985,
+                        0.0
+                );
 
-        // Head (sphere) — above neck
-        head = new SpherePart(headR, 16, 10, SpherePart.Anchor.BOTTOM);
+        head = new SpherePart(
+                headR,
+                16,
+                10,
+                SpherePart.Anchor.BOTTOM
+        );
+
         head.setMaterial(skin);
-        head.getTransform().position = new Vector3(0, neckH * 0.98, 0);
+        head.getTransform().position =
+                new Vector3(
+                        0.0,
+                        neckH * 0.98,
+                        0.0
+                );
 
-        // Arms (shoulders outside torso radius)
-        double shoulderY = torsoH * 0.82;
-        double shoulderX = torsoR + armR * 1.75;
-        double shoulderZ = torsoR * 0.16;
+        final double shoulderY =
+                torsoH * 0.82;
 
-        lUpperArm = new CapsulePart(armR, uArmL, 12, 3, 2, CapsulePart.Anchor.TOP);
+        final double shoulderX =
+                torsoR + armR * 1.75;
+
+        final double shoulderZ =
+                torsoR * 0.16;
+
+        lUpperArm = new CapsulePart(
+                armR,
+                uArmL,
+                12,
+                3,
+                2,
+                CapsulePart.Anchor.TOP
+        );
+
         lUpperArm.setMaterial(skin);
-        lUpperArm.getTransform().position = new Vector3(-shoulderX, shoulderY, shoulderZ);
+        lUpperArm.getTransform().position =
+                new Vector3(
+                        -shoulderX,
+                        shoulderY,
+                        shoulderZ
+                );
 
-        lForeArm = new CapsulePart(armR * 0.92, fArmL, 12, 3, 2, CapsulePart.Anchor.TOP);
+        lForeArm = new CapsulePart(
+                armR * 0.92,
+                fArmL,
+                12,
+                3,
+                2,
+                CapsulePart.Anchor.TOP
+        );
+
         lForeArm.setMaterial(skin);
-        lForeArm.getTransform().position = new Vector3(0, -uArmL, 0);
+        lForeArm.getTransform().position =
+                new Vector3(
+                        0.0,
+                        -uArmL,
+                        0.0
+                );
 
-        lHand = new SpherePart(handR, 14, 8, SpherePart.Anchor.TOP);
+        lHand = new SpherePart(
+                handR,
+                14,
+                8,
+                SpherePart.Anchor.TOP
+        );
+
         lHand.setMaterial(skin);
-        lHand.getTransform().position = new Vector3(0, -fArmL, 0);
+        lHand.getTransform().position =
+                new Vector3(
+                        0.0,
+                        -fArmL,
+                        0.0
+                );
 
-        rUpperArm = new CapsulePart(armR, uArmL, 12, 3, 2, CapsulePart.Anchor.TOP);
+        rUpperArm = new CapsulePart(
+                armR,
+                uArmL,
+                12,
+                3,
+                2,
+                CapsulePart.Anchor.TOP
+        );
+
         rUpperArm.setMaterial(skin);
-        rUpperArm.getTransform().position = new Vector3(+shoulderX, shoulderY, shoulderZ);
+        rUpperArm.getTransform().position =
+                new Vector3(
+                        shoulderX,
+                        shoulderY,
+                        shoulderZ
+                );
 
-        rForeArm = new CapsulePart(armR * 0.92, fArmL, 12, 3, 2, CapsulePart.Anchor.TOP);
+        rForeArm = new CapsulePart(
+                armR * 0.92,
+                fArmL,
+                12,
+                3,
+                2,
+                CapsulePart.Anchor.TOP
+        );
+
         rForeArm.setMaterial(skin);
-        rForeArm.getTransform().position = new Vector3(0, -uArmL, 0);
+        rForeArm.getTransform().position =
+                new Vector3(
+                        0.0,
+                        -uArmL,
+                        0.0
+                );
 
-        rHand = new SpherePart(handR, 14, 8, SpherePart.Anchor.TOP);
+        rHand = new SpherePart(
+                handR,
+                14,
+                8,
+                SpherePart.Anchor.TOP
+        );
+
         rHand.setMaterial(skin);
-        rHand.getTransform().position = new Vector3(0, -fArmL, 0);
+        rHand.getTransform().position =
+                new Vector3(
+                        0.0,
+                        -fArmL,
+                        0.0
+                );
 
-        // Base arm splay so they sit OUTWARD from the torso (fixed sign)
-        // If your engine's handedness differs, swap these signs.
-        lUpperArm.getTransform().rotation.z = -0.40; // outward
-        rUpperArm.getTransform().rotation.z = +0.40; // outward
-        lUpperArm.getTransform().rotation.y = +0.10;
+        lUpperArm.getTransform().rotation.z = -0.40;
+        rUpperArm.getTransform().rotation.z = 0.40;
+
+        lUpperArm.getTransform().rotation.y = 0.10;
         rUpperArm.getTransform().rotation.y = -0.10;
 
-        // Slight natural bend so hands don't clip torso at rest
         lForeArm.getTransform().rotation.x = 0.12;
         rForeArm.getTransform().rotation.x = 0.12;
+
         lHand.getTransform().rotation.x = 0.05;
         rHand.getTransform().rotation.x = 0.05;
 
-        // Legs
-        double hipY = pelvisH * 0.10;
-        double hipX = W * 0.18;
+        final double hipY =
+                pelvisH * 0.10;
 
-        lThigh = new CapsulePart(legR, thighL, 12, 3, 2, CapsulePart.Anchor.TOP);
+        final double hipX =
+                w * 0.18;
+
+        lThigh = new CapsulePart(
+                legR,
+                thighL,
+                12,
+                3,
+                2,
+                CapsulePart.Anchor.TOP
+        );
+
         lThigh.setMaterial(pants);
-        lThigh.getTransform().position = new Vector3(-hipX, hipY, 0);
+        lThigh.getTransform().position =
+                new Vector3(-hipX, hipY, 0.0);
 
-        lShin = new CapsulePart(legR * 0.92, shinL, 12, 3, 2, CapsulePart.Anchor.TOP);
+        lShin = new CapsulePart(
+                legR * 0.92,
+                shinL,
+                12,
+                3,
+                2,
+                CapsulePart.Anchor.TOP
+        );
+
         lShin.setMaterial(pants);
-        lShin.getTransform().position = new Vector3(0, -thighL, 0);
+        lShin.getTransform().position =
+                new Vector3(0.0, -thighL, 0.0);
 
-        lFoot = new BoxPart(W * 0.22, footH, W * 0.38, BoxPart.Anchor.TOP);
+        lFoot = new BoxPart(
+                w * 0.22,
+                footH,
+                w * 0.38,
+                BoxPart.Anchor.TOP
+        );
+
         lFoot.setMaterial(shoes);
-        lFoot.getTransform().position = new Vector3(0, -shinL, W * 0.10);
+        lFoot.getTransform().position =
+                new Vector3(
+                        0.0,
+                        -shinL,
+                        w * 0.10
+                );
 
-        rThigh = new CapsulePart(legR, thighL, 12, 3, 2, CapsulePart.Anchor.TOP);
+        rThigh = new CapsulePart(
+                legR,
+                thighL,
+                12,
+                3,
+                2,
+                CapsulePart.Anchor.TOP
+        );
+
         rThigh.setMaterial(pants);
-        rThigh.getTransform().position = new Vector3(+hipX, hipY, 0);
+        rThigh.getTransform().position =
+                new Vector3(hipX, hipY, 0.0);
 
-        rShin = new CapsulePart(legR * 0.92, shinL, 12, 3, 2, CapsulePart.Anchor.TOP);
+        rShin = new CapsulePart(
+                legR * 0.92,
+                shinL,
+                12,
+                3,
+                2,
+                CapsulePart.Anchor.TOP
+        );
+
         rShin.setMaterial(pants);
-        rShin.getTransform().position = new Vector3(0, -thighL, 0);
+        rShin.getTransform().position =
+                new Vector3(0.0, -thighL, 0.0);
 
-        rFoot = new BoxPart(W * 0.22, footH, W * 0.38, BoxPart.Anchor.TOP);
+        rFoot = new BoxPart(
+                w * 0.22,
+                footH,
+                w * 0.38,
+                BoxPart.Anchor.TOP
+        );
+
         rFoot.setMaterial(shoes);
-        rFoot.getTransform().position = new Vector3(0, -shinL, W * 0.10);
+        rFoot.getTransform().position =
+                new Vector3(
+                        0.0,
+                        -shinL,
+                        w * 0.10
+                );
 
-        // Build hierarchy (real joints)
         addChild(pelvis);
 
         pelvis.addChild(torso);
+
         torso.addChild(neck);
         neck.addChild(head);
 
@@ -216,19 +433,38 @@ public class Body extends GameObject {
         rThigh.addChild(rShin);
         rShin.addChild(rFoot);
 
-        // Cache base pose
+        rightHandSocket =
+                new HandSocketNode();
+
+        rightHandSocket.setName("hand_socket");
+        rightHandSocket.setVisible(false);
+        rightHandSocket.setActive(true);
+        rightHandSocket.setSolid(false);
+        rightHandSocket.setIgnorePlayerCollisions(
+                true
+        );
+
+        rightHandSocket.getTransform().position =
+                new Vector3(
+                        0.0,
+                        -handR * 0.95,
+                        handR * 0.65
+                );
+
+        rHand.addChild(rightHandSocket);
+
         pPelvis = new PoseBase(pelvis);
-        pTorso  = new PoseBase(torso);
-        pNeck   = new PoseBase(neck);
-        pHead   = new PoseBase(head);
+        pTorso = new PoseBase(torso);
+        pNeck = new PoseBase(neck);
+        pHead = new PoseBase(head);
 
         pLUA = new PoseBase(lUpperArm);
         pLFA = new PoseBase(lForeArm);
-        pLH  = new PoseBase(lHand);
+        pLH = new PoseBase(lHand);
 
         pRUA = new PoseBase(rUpperArm);
         pRFA = new PoseBase(rForeArm);
-        pRH  = new PoseBase(rHand);
+        pRH = new PoseBase(rHand);
 
         pLT = new PoseBase(lThigh);
         pLS = new PoseBase(lShin);
@@ -239,9 +475,16 @@ public class Body extends GameObject {
         pRF = new PoseBase(rFoot);
     }
 
-    // NEW signature used by GameEngine (kept minimal but enough for realistic motion)
-    public void setMotionState(boolean movingIntent, boolean onGround, double yVelocity, boolean flightMode,
-                               double intentForward, double intentStrafe, double intentSpeed, double viewPitch) {
+    public void setMotionState(
+            boolean movingIntent,
+            boolean onGround,
+            double yVelocity,
+            boolean flightMode,
+            double intentForward,
+            double intentStrafe,
+            double intentSpeed,
+            double viewPitch
+    ) {
         this.movingIntent = movingIntent;
         this.onGround = onGround;
         this.yVel = yVelocity;
@@ -252,36 +495,103 @@ public class Body extends GameObject {
         this.viewPitch = viewPitch;
     }
 
-    // Keep old call sites safe
-    public void setMotionState(boolean movingIntent, boolean onGround, double yVelocity, boolean flightMode) {
-        // NOTE: old call sites don't provide direction, so we will derive it from velocity in update().
-        setMotionState(movingIntent, onGround, yVelocity, flightMode, 0, 0, 0, 0);
+    public void setMotionState(
+            boolean movingIntent,
+            boolean onGround,
+            double yVelocity,
+            boolean flightMode
+    ) {
+        setMotionState(
+                movingIntent,
+                onGround,
+                yVelocity,
+                flightMode,
+                0.0,
+                0.0,
+                0.0,
+                0.0
+        );
     }
 
-    @Override public double[][] getVertices() { return new double[0][0]; }
-    @Override public int[][] getEdges() { return new int[0][]; }
-    @Override public int[][] getFacesArray() { return null; }
+    public void setModelVisible(
+            boolean visible
+    ) {
+        if (modelVisible == visible) {
+            return;
+        }
+
+        modelVisible = visible;
+
+        setVisible(visible);
+
+        pelvis.setVisible(visible);
+        torso.setVisible(visible);
+        neck.setVisible(visible);
+        head.setVisible(visible);
+
+        lUpperArm.setVisible(visible);
+        lForeArm.setVisible(visible);
+        lHand.setVisible(visible);
+
+        rUpperArm.setVisible(visible);
+        rForeArm.setVisible(visible);
+        rHand.setVisible(visible);
+
+        lThigh.setVisible(visible);
+        lShin.setVisible(visible);
+        lFoot.setVisible(visible);
+
+        rThigh.setVisible(visible);
+        rShin.setVisible(visible);
+        rFoot.setVisible(visible);
+
+        if (!visible) {
+            velInit = false;
+        }
+    }
+
+    @Override
+    public double[][] getVertices() {
+        return EMPTY_VERTICES;
+    }
+
+    @Override
+    public int[][] getFacesArray() {
+        return null;
+    }
 
     @Override
     public void update(double dt) {
+        if (!modelVisible) {
+            return;
+        }
+
         t += dt;
 
-        // Landing detect
         if (!prevOnGround && onGround) {
             landTimer = 0.12;
         }
-        prevOnGround = onGround;
-        if (landTimer > 0.0) landTimer = Math.max(0.0, landTimer - dt);
 
-        // --- derive intent from velocity (fixes "slow / hardly moves" when engine doesn't pass intent) ---
+        prevOnGround = onGround;
+
+        if (landTimer > 0.0) {
+            landTimer =
+                    Math.max(0.0, landTimer - dt);
+        }
+
         double fwd = intentForward;
         double str = intentStrafe;
         double spd = intentSpeed;
 
-        boolean hasDirectionalIntent = (Math.abs(fwd) + Math.abs(str)) > 1e-4;
+        final boolean hasDirectionalIntent =
+                Math.abs(fwd) + Math.abs(str)
+                        > 1.0e-4;
 
-        double px = transform.position.x;
-        double pz = transform.position.z;
+        final double px =
+                transform.position.x;
+
+        final double pz =
+                transform.position.z;
 
         if (!velInit) {
             velInit = true;
@@ -289,23 +599,39 @@ public class Body extends GameObject {
             lastZ = pz;
         }
 
-        double vFwd = 0.0, vStr = 0.0, vSpd = 0.0;
+        double vFwd = 0.0;
+        double vStr = 0.0;
+        double vSpd = 0.0;
 
-        if (dt > 1e-6) {
-            double vx = (px - lastX) / dt;
-            double vz = (pz - lastZ) / dt;
+        if (dt > 1.0e-6) {
+            final double vx =
+                    (px - lastX) / dt;
 
-            double yaw = transform.rotation.y;
-            double sy = Math.sin(yaw);
-            double cy = Math.cos(yaw);
+            final double vz =
+                    (pz - lastZ) / dt;
 
-            // local +Z forward => (sy, cy), local +X right => (cy, -sy)
-            double fwdX = sy, fwdZ = cy;
-            double rightX = cy, rightZ = -sy;
+            final double yaw =
+                    transform.rotation.y;
 
-            vFwd = vx * fwdX + vz * fwdZ;
-            vStr = vx * rightX + vz * rightZ;
-            vSpd = Math.sqrt(vFwd * vFwd + vStr * vStr);
+            final double sineYaw =
+                    Math.sin(yaw);
+
+            final double cosineYaw =
+                    Math.cos(yaw);
+
+            vFwd =
+                    vx * sineYaw
+                            + vz * cosineYaw;
+
+            vStr =
+                    vx * cosineYaw
+                            - vz * sineYaw;
+
+            vSpd =
+                    Math.sqrt(
+                            vFwd * vFwd
+                                    + vStr * vStr
+                    );
         }
 
         lastX = px;
@@ -315,213 +641,479 @@ public class Body extends GameObject {
             fwd = vFwd;
             str = vStr;
             spd = vSpd;
-        } else {
-            if (spd <= 1e-6) spd = Math.sqrt(fwd * fwd + str * str);
+        } else if (spd <= 1.0e-6) {
+            spd =
+                    Math.sqrt(
+                            fwd * fwd
+                                    + str * str
+                    );
         }
 
-        // Smooth the intent a bit for stable animation
-        double intentA = 1.0 - Math.exp(-dt * 10.0);
-        vFwdSm += (fwd - vFwdSm) * intentA;
-        vStrSm += (str - vStrSm) * intentA;
-        vSpdSm += (spd - vSpdSm) * intentA;
+        final double intentA =
+                1.0 - Math.exp(-dt * 10.0);
 
-        double pitchA = 1.0 - Math.exp(-dt * 12.0);
-        pitchSm += (viewPitch - pitchSm) * pitchA;
+        vFwdSm +=
+                (fwd - vFwdSm) * intentA;
 
-        // Main smoothing factor
-        double a = 1.0 - Math.exp(-dt * 22.0);
+        vStrSm +=
+                (str - vStrSm) * intentA;
 
-        // Normalize intent
-        double speed01 = clamp01(vSpdSm / 5.5);
-        double fwd01 = (vSpdSm > 1e-6) ? (vFwdSm / vSpdSm) : 0.0;
-        double str01 = (vSpdSm > 1e-6) ? (vStrSm / vSpdSm) : 0.0;
+        vSpdSm +=
+                (spd - vSpdSm) * intentA;
 
-        // Update gait phase only while grounded & moving
-        if (!flightMode && onGround && speed01 > 0.02) {
-            double freq = vSpdSm / 1.35;
-            freq = clamp(freq, 1.5, 3.8);
-            gait += dt * freq * (Math.PI * 2.0);
+        final double pitchA =
+                1.0 - Math.exp(-dt * 12.0);
+
+        pitchSm +=
+                (viewPitch - pitchSm) * pitchA;
+
+        final double interpolation =
+                1.0 - Math.exp(-dt * 22.0);
+
+        final double speed01 =
+                clamp01(vSpdSm / 5.5);
+
+        final double fwd01 =
+                vSpdSm > 1.0e-6
+                        ? vFwdSm / vSpdSm
+                        : 0.0;
+
+        final double str01 =
+                vSpdSm > 1.0e-6
+                        ? vStrSm / vSpdSm
+                        : 0.0;
+
+        if (
+                !flightMode
+                        && onGround
+                        && speed01 > 0.02
+        ) {
+            double frequency =
+                    vSpdSm / 1.35;
+
+            frequency =
+                    clamp(
+                            frequency,
+                            1.5,
+                            3.8
+                    );
+
+            gait +=
+                    dt
+                            * frequency
+                            * Math.PI
+                            * 2.0;
         } else {
-            gait += dt * 1.0;
+            gait += dt;
         }
 
-        double s = Math.sin(gait);
-        double c = Math.cos(gait);
+        final double sineGait =
+                Math.sin(gait);
 
-        // Breathing / idle micro-movement
-        double breath = Math.sin(t * 1.4) * 0.035;
-        double idleSway = Math.sin(t * 0.9) * 0.025;
+        final double cosineGait =
+                Math.cos(gait);
 
-        // Landing squash
-        double landK = (landTimer > 0.0) ? (landTimer / 0.12) : 0.0;
-        landK = landK * landK;
+        final double breath =
+                Math.sin(t * 1.4) * 0.035;
 
-        // Torso/pelvis motion
-        double pelvisBob = (onGround ? Math.abs(s) : 0.0) * (0.030 * speed01);
-        double torsoBob  = (onGround ? Math.abs(s) : 0.0) * (0.060 * speed01);
+        final double idleSway =
+                Math.sin(t * 0.9) * 0.025;
 
-        // Human-ish: forward gait leans forward; backward gait stays mostly upright (at most slight forward lean).
-        double fwdComp = Math.max(0.0, fwd01);
-        double backComp = Math.max(0.0, -fwd01);
+        double landK =
+                landTimer > 0.0
+                        ? landTimer / 0.12
+                        : 0.0;
 
-        double forwardLean  = fwdComp  * (0.26 * speed01);
-        double backwardLean = backComp * (0.08 * speed01); // small forward lean, not backward
+        landK *= landK;
 
-        double torsoLeanF = -(forwardLean + backwardLean);
-        double torsoLeanS = -str01 * (0.20 * speed01);
+        final double absoluteSine =
+                Math.abs(sineGait);
 
-        boolean inAir = (!flightMode && !onGround);
-        double fall01 = clamp01((-yVel) / 18.0);
-        double jump01 = clamp01(( yVel) / 12.0);
+        final double pelvisBob =
+                onGround
+                        ? absoluteSine
+                        * 0.030
+                        * speed01
+                        : 0.0;
 
-        // Arm/leg amplitudes scale with speed (walk -> run)
-        double hipSwing  = 0.30 + 0.55 * speed01;
-        double kneeBend  = 0.35 + 0.95 * speed01;
-        double armSwing  = 0.25 + 0.70 * speed01;
-        double elbowBend = 0.15 + 0.55 * speed01;
+        final double torsoBob =
+                onGround
+                        ? absoluteSine
+                        * 0.060
+                        * speed01
+                        : 0.0;
 
-        // Phase offsets
-        double sL = Math.sin(gait);
-        double sR = Math.sin(gait + Math.PI);
+        final double fwdComp =
+                Math.max(0.0, fwd01);
 
-        // Legs: bend on lift
-        double kneeLiftL = Math.max(0.0, -sL);
-        double kneeLiftR = Math.max(0.0, -sR);
+        final double backComp =
+                Math.max(0.0, -fwd01);
 
-        double hipLx = sL * hipSwing;
-        double hipRx = sR * hipSwing;
+        final double forwardLean =
+                fwdComp * 0.26 * speed01;
 
-        double kneeLx = kneeLiftL * kneeBend;
-        double kneeRx = kneeLiftR * kneeBend;
+        final double backwardLean =
+                backComp * 0.08 * speed01;
 
-        double ankleLx = -Math.max(0.0, sL) * (0.40 * speed01);
-        double ankleRx = -Math.max(0.0, sR) * (0.40 * speed01);
+        final double torsoLeanF =
+                -(forwardLean + backwardLean);
 
-        // Arms opposite legs
-        double armLx = -sL * armSwing;
-        double armRx = -sR * armSwing;
+        final double torsoLeanS =
+                -str01 * 0.20 * speed01;
 
-        double elbowL = Math.max(0.0, sL) * elbowBend;
-        double elbowR = Math.max(0.0, sR) * elbowBend;
+        final boolean inAir =
+                !flightMode && !onGround;
 
-        // Backwards movement: soften
+        final double fall01 =
+                clamp01(-yVel / 18.0);
+
+        final double jump01 =
+                clamp01(yVel / 12.0);
+
+        final double hipSwing =
+                0.30 + 0.55 * speed01;
+
+        final double kneeBend =
+                0.35 + 0.95 * speed01;
+
+        final double armSwing =
+                0.25 + 0.70 * speed01;
+
+        final double elbowBend =
+                0.15 + 0.55 * speed01;
+
+        final double leftSine =
+                sineGait;
+
+        final double rightSine =
+                -sineGait;
+
+        final double kneeLiftL =
+                Math.max(0.0, -leftSine);
+
+        final double kneeLiftR =
+                Math.max(0.0, -rightSine);
+
+        double hipLx =
+                leftSine * hipSwing;
+
+        double hipRx =
+                rightSine * hipSwing;
+
+        double kneeLx =
+                kneeLiftL * kneeBend;
+
+        double kneeRx =
+                kneeLiftR * kneeBend;
+
+        double ankleLx =
+                -Math.max(0.0, leftSine)
+                        * 0.40
+                        * speed01;
+
+        double ankleRx =
+                -Math.max(0.0, rightSine)
+                        * 0.40
+                        * speed01;
+
+        double armLx =
+                -leftSine * armSwing;
+
+        double armRx =
+                -rightSine * armSwing;
+
+        double elbowL =
+                Math.max(0.0, leftSine)
+                        * elbowBend;
+
+        double elbowR =
+                Math.max(0.0, rightSine)
+                        * elbowBend;
+
         if (fwd01 < -0.2) {
-            hipLx *= 0.75; hipRx *= 0.75;
-            armLx *= 0.65; armRx *= 0.65;
+            hipLx *= 0.75;
+            hipRx *= 0.75;
+            armLx *= 0.65;
+            armRx *= 0.65;
         }
 
-        // Air pose override
         if (flightMode) {
-            hipLx = hipRx = 0.10;
-            kneeLx = kneeRx = 0.25;
-            ankleLx = ankleRx = 0.0;
+            hipLx = 0.10;
+            hipRx = 0.10;
 
-            armLx = armRx = -0.35;
-            elbowL = elbowR = 0.25;
+            kneeLx = 0.25;
+            kneeRx = 0.25;
+
+            ankleLx = 0.0;
+            ankleRx = 0.0;
+
+            armLx = -0.35;
+            armRx = -0.35;
+
+            elbowL = 0.25;
+            elbowR = 0.25;
         } else if (inAir) {
-            double tuck = 0.55 + 0.35 * fall01;
-            hipLx = hipRx = 0.25;
-            kneeLx = kneeRx = tuck;
-            ankleLx = ankleRx = 0.10;
+            final double tuck =
+                    0.55 + 0.35 * fall01;
 
-            armLx = armRx = -0.55 + 0.20 * jump01;
-            elbowL = elbowR = 0.25 + 0.25 * fall01;
+            hipLx = 0.25;
+            hipRx = 0.25;
+
+            kneeLx = tuck;
+            kneeRx = tuck;
+
+            ankleLx = 0.10;
+            ankleRx = 0.10;
+
+            armLx =
+                    -0.55 + 0.20 * jump01;
+
+            armRx =
+                    -0.55 + 0.20 * jump01;
+
+            elbowL =
+                    0.25 + 0.25 * fall01;
+
+            elbowR =
+                    0.25 + 0.25 * fall01;
         }
 
-        // --- Apply base pose + offsets (smoothed) ---
-        // Pelvis
-        pPelvis.posY(a, pPelvis.by + pelvisBob - landK * 0.05);
-        pPelvis.rotX(a, -torsoLeanF * 0.35 - landK * 0.10);
-        pPelvis.rotZ(a, idleSway * 0.50 + torsoLeanS * 0.55);
+        pPelvis.posY(
+                interpolation,
+                pPelvis.by
+                        + pelvisBob
+                        - landK * 0.05
+        );
 
-        // Torso
-        pTorso.posY(a, pTorso.by + torsoBob - landK * 0.08);
-        pTorso.rotX(a, breath - torsoLeanF - landK * 0.25);
-        pTorso.rotZ(a, idleSway + torsoLeanS + (onGround ? c * (0.06 * speed01) : 0.0));
-        pTorso.rotY(a, -str01 * (0.10 * speed01));
+        pPelvis.rotX(
+                interpolation,
+                -torsoLeanF * 0.35
+                        - landK * 0.10
+        );
 
-        // Neck + head: follow pitch + step bob
-        double pitchFollow = clamp(pitchSm * 0.65, -0.65, 0.65);
-        pNeck.rotX(a, -pitchFollow * 0.35);
-        pHead.rotX(a, pitchFollow + (onGround ? Math.abs(s) * (0.09 * speed01) : 0.0));
-        pHead.rotZ(a, (onGround ? c * (0.06 * speed01) : 0.0));
-        pHead.rotY(a, -str01 * 0.10);
+        pPelvis.rotZ(
+                interpolation,
+                idleSway * 0.50
+                        + torsoLeanS * 0.55
+        );
 
-        // Arms
-        pLUA.rotX(a, armLx);
-        pRUA.rotX(a, armRx);
+        pTorso.posY(
+                interpolation,
+                pTorso.by
+                        + torsoBob
+                        - landK * 0.08
+        );
 
-        pLFA.rotX(a, 0.12 + elbowL);
-        pRFA.rotX(a, 0.12 + elbowR);
+        pTorso.rotX(
+                interpolation,
+                breath
+                        - torsoLeanF
+                        - landK * 0.25
+        );
 
-        // tiny hand “settle”
-        pLH.rotX(a, 0.06 + elbowL * 0.15);
-        pRH.rotX(a, 0.06 + elbowR * 0.15);
+        pTorso.rotZ(
+                interpolation,
+                idleSway
+                        + torsoLeanS
+                        + (
+                        onGround
+                                ? cosineGait
+                                * 0.06
+                                * speed01
+                                : 0.0
+                )
+        );
 
-        // Legs
-        pLT.rotX(a, hipLx);
-        pRT.rotX(a, hipRx);
+        pTorso.rotY(
+                interpolation,
+                -str01 * 0.10 * speed01
+        );
 
-        pLS.rotX(a, kneeLx);
-        pRS.rotX(a, kneeRx);
+        final double pitchFollow =
+                clamp(
+                        pitchSm * 0.65,
+                        -0.65,
+                        0.65
+                );
 
-        pLF.rotX(a, ankleLx);
-        pRF.rotX(a, ankleRx);
+        pNeck.rotX(
+                interpolation,
+                -pitchFollow * 0.35
+        );
+
+        pHead.rotX(
+                interpolation,
+                pitchFollow
+                        + (
+                        onGround
+                                ? absoluteSine
+                                * 0.09
+                                * speed01
+                                : 0.0
+                )
+        );
+
+        pHead.rotZ(
+                interpolation,
+                onGround
+                        ? cosineGait
+                        * 0.06
+                        * speed01
+                        : 0.0
+        );
+
+        pHead.rotY(
+                interpolation,
+                -str01 * 0.10
+        );
+
+        pLUA.rotX(interpolation, armLx);
+        pRUA.rotX(interpolation, armRx);
+
+        pLFA.rotX(
+                interpolation,
+                0.12 + elbowL
+        );
+
+        pRFA.rotX(
+                interpolation,
+                0.12 + elbowR
+        );
+
+        pLH.rotX(
+                interpolation,
+                0.06 + elbowL * 0.15
+        );
+
+        pRH.rotX(
+                interpolation,
+                0.06 + elbowR * 0.15
+        );
+
+        pLT.rotX(interpolation, hipLx);
+        pRT.rotX(interpolation, hipRx);
+
+        pLS.rotX(interpolation, kneeLx);
+        pRS.rotX(interpolation, kneeRx);
+
+        pLF.rotX(interpolation, ankleLx);
+        pRF.rotX(interpolation, ankleRx);
     }
 
-    // -------------------------------------------------------
-    // Small helper that keeps a “base pose” and applies
-    // smoothed offsets without allocations every frame.
-    // -------------------------------------------------------
+    private static final class HandSocketNode
+            extends GameObject {
+
+        @Override
+        public void update(double delta) {
+        }
+
+        @Override
+        public double[][] getVertices() {
+            return EMPTY_VERTICES;
+        }
+
+        @Override
+        public int[][] getFacesArray() {
+            return null;
+        }
+    }
+
     private static final class PoseBase {
-        final GameObject g;
 
-        final double bx, by, bz;
-        final double brx, bry, brz;
+        private final GameObject object;
 
-        PoseBase(GameObject g) {
-            this.g = g;
-            this.bx = g.getTransform().position.x;
-            this.by = g.getTransform().position.y;
-            this.bz = g.getTransform().position.z;
-            this.brx = g.getTransform().rotation.x;
-            this.bry = g.getTransform().rotation.y;
-            this.brz = g.getTransform().rotation.z;
+        private final double by;
+
+        private PoseBase(GameObject object) {
+            this.object = object;
+            this.by =
+                    object.getTransform().position.y;
         }
 
-        void posY(double a, double targetAbsY) {
-            var p = g.getTransform().position;
-            p.y += (targetAbsY - p.y) * a;
+        private void posY(
+                double interpolation,
+                double value
+        ) {
+            final double current =
+                    object.getTransform().position.y;
+
+            object.getTransform().position.y =
+                    current
+                            + (
+                            value - current
+                    ) * interpolation;
         }
 
-        void rotX(double a, double off) {
-            var r = g.getTransform().rotation;
-            double target = brx + off;
-            r.x += (target - r.x) * a;
+        private void rotX(
+                double interpolation,
+                double value
+        ) {
+            final double current =
+                    object.getTransform().rotation.x;
+
+            object.getTransform().rotation.x =
+                    current
+                            + (
+                            value - current
+                    ) * interpolation;
         }
 
-        void rotY(double a, double off) {
-            var r = g.getTransform().rotation;
-            double target = bry + off;
-            r.y += (target - r.y) * a;
+        private void rotY(
+                double interpolation,
+                double value
+        ) {
+            final double current =
+                    object.getTransform().rotation.y;
+
+            object.getTransform().rotation.y =
+                    current
+                            + (
+                            value - current
+                    ) * interpolation;
         }
 
-        void rotZ(double a, double off) {
-            var r = g.getTransform().rotation;
-            double target = brz + off;
-            r.z += (target - r.z) * a;
+        private void rotZ(
+                double interpolation,
+                double value
+        ) {
+            final double current =
+                    object.getTransform().rotation.z;
+
+            object.getTransform().rotation.z =
+                    current
+                            + (
+                            value - current
+                    ) * interpolation;
         }
     }
 
-    private static double clamp01(double v) {
-        if (v < 0) return 0;
-        if (v > 1) return 1;
-        return v;
+    private static double clamp01(
+            double value
+    ) {
+        if (value < 0.0) {
+            return 0.0;
+        }
+
+        if (value > 1.0) {
+            return 1.0;
+        }
+
+        return value;
     }
 
-    private static double clamp(double v, double lo, double hi) {
-        if (v < lo) return lo;
-        if (v > hi) return hi;
-        return v;
+    private static double clamp(
+            double value,
+            double minimum,
+            double maximum
+    ) {
+        if (value < minimum) {
+            return minimum;
+        }
+
+        if (value > maximum) {
+            return maximum;
+        }
+
+        return value;
     }
 }
