@@ -1,5 +1,8 @@
 package engine;
 
+import engine.assets.mesh.MeshAsset;
+import engine.assets.model.ModelLoader;
+
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.file.FileSystems;
@@ -10,7 +13,6 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
-import java.util.Locale;
 import java.util.Map;
 import java.util.NoSuchElementException;
 import java.util.Objects;
@@ -59,8 +61,8 @@ public final class AssetManager {
     }
 
     /**
-     * Reloads every OBJ below the model root and atomically publishes the
-     * result. Individual malformed files are logged and skipped.
+     * Reloads every supported model below the model root and atomically
+     * publishes the result. Individual malformed files are logged and skipped.
      */
     public void loadAllMeshes() {
         if (!Files.isDirectory(modelsRoot)) {
@@ -73,14 +75,14 @@ public final class AssetManager {
             return;
         }
 
-        final List<Path> objFiles = scanObjFiles();
+        final List<ModelSource> modelSources =
+                scanModelSources();
         final Map<String, Integer> aliasCounts =
-                countAliases(objFiles);
+                countAliases(modelSources);
         final Map<String, MeshData> loadedMeshes =
-                loadMeshes(objFiles);
+                loadMeshes(modelSources);
         final Map<String, String> aliases = buildAliases(
-                modelsRoot,
-                objFiles,
+                modelSources,
                 aliasCounts,
                 loadedMeshes
         );
@@ -100,8 +102,8 @@ public final class AssetManager {
                 "Loaded "
                         + loadedMeshes.size()
                         + " of "
-                        + objFiles.size()
-                        + " mesh files from "
+                        + modelSources.size()
+                        + " model files from "
                         + modelsRoot.toAbsolutePath()
         );
     }
@@ -156,14 +158,14 @@ public final class AssetManager {
         );
     }
 
-    private List<Path> scanObjFiles() {
-        final ArrayList<Path> objFiles =
+    private List<ModelSource> scanModelSources() {
+        final ArrayList<Path> modelFiles =
                 new ArrayList<>(256);
 
         try (var paths = Files.walk(modelsRoot)) {
             paths.filter(Files::isRegularFile)
-                    .filter(AssetManager::isObjFile)
-                    .forEach(objFiles::add);
+                    .filter(ModelLoader::supports)
+                    .forEach(modelFiles::add);
         } catch (IOException exception) {
             throw new UncheckedIOException(
                     "Failed to scan models root: " + modelsRoot,
@@ -171,14 +173,41 @@ public final class AssetManager {
             );
         }
 
-        objFiles.sort(Comparator.naturalOrder());
-        return objFiles;
+        modelFiles.sort(Comparator.naturalOrder());
+
+        final HashMap<String, Integer> baseIdCounts =
+                new HashMap<>(mapCapacity(modelFiles.size()));
+
+        for (Path path : modelFiles) {
+            baseIdCounts.merge(
+                    toBaseMeshId(modelsRoot, path),
+                    1,
+                    Integer::sum
+            );
+        }
+
+        final ArrayList<ModelSource> sources =
+                new ArrayList<>(modelFiles.size());
+
+        for (Path path : modelFiles) {
+            final String baseId =
+                    toBaseMeshId(modelsRoot, path);
+            final boolean extensionRequired =
+                    baseIdCounts.getOrDefault(baseId, 0) > 1;
+            final String id = extensionRequired
+                    ? toRelativeId(modelsRoot, path)
+                    : baseId;
+
+            sources.add(new ModelSource(path, id));
+        }
+
+        return sources;
     }
 
     private Map<String, MeshData> loadMeshes(
-            List<Path> objFiles
+            List<ModelSource> modelSources
     ) {
-        if (objFiles.isEmpty()) {
+        if (modelSources.isEmpty()) {
             return Map.of();
         }
 
@@ -186,17 +215,19 @@ public final class AssetManager {
                 Runtime.getRuntime().availableProcessors();
 
         final int workerCount = Math.min(
-                objFiles.size(),
+                modelSources.size(),
                 Math.max(1, processorCount - 1)
         );
 
         if (workerCount == 1) {
             final HashMap<String, MeshData> result =
-                    new HashMap<>(mapCapacity(objFiles.size()));
+                    new HashMap<>(
+                            mapCapacity(modelSources.size())
+                    );
 
-            for (Path path : objFiles) {
+            for (ModelSource source : modelSources) {
                 acceptLoadResult(
-                        loadOne(path),
+                        loadOne(source),
                         result
                 );
             }
@@ -217,14 +248,16 @@ public final class AssetManager {
                 new ExecutorCompletionService<>(executor);
 
         try {
-            for (Path path : objFiles) {
-                completion.submit(() -> loadOne(path));
+            for (ModelSource source : modelSources) {
+                completion.submit(() -> loadOne(source));
             }
 
             final HashMap<String, MeshData> result =
-                    new HashMap<>(mapCapacity(objFiles.size()));
+                    new HashMap<>(
+                            mapCapacity(modelSources.size())
+                    );
 
-            for (int i = 0; i < objFiles.size(); i++) {
+            for (int i = 0; i < modelSources.size(); i++) {
                 try {
                     acceptLoadResult(
                             completion.take().get(),
@@ -251,28 +284,34 @@ public final class AssetManager {
         }
     }
 
-    private MeshLoadResult loadOne(Path path) {
-        final String id = toMeshId(modelsRoot, path);
-
+    private MeshLoadResult loadOne(
+            ModelSource source
+    ) {
         try {
-            final OBJLoader.MeshAsset asset =
-                    OBJLoader.load(path, id);
+            final MeshAsset asset =
+                    ModelLoader.load(
+                            source.path(),
+                            source.id()
+                    );
 
             return MeshLoadResult.success(
-                    id,
+                    source.id(),
                     toMeshData(asset)
             );
         } catch (IOException | RuntimeException exception) {
-            return MeshLoadResult.failure(path, exception);
+            return MeshLoadResult.failure(
+                    source.path(),
+                    exception
+            );
         }
     }
 
     /**
-     * Converts OBJLoader's flat, binary-ready mesh representation into the
+     * Converts the flat, binary-ready mesh representation into the
      * engine-native MeshData representation used by GameObject and MeshObject.
      */
     private static MeshData toMeshData(
-            OBJLoader.MeshAsset asset
+            MeshAsset asset
     ) {
         Objects.requireNonNull(asset, "asset");
 
@@ -415,21 +454,25 @@ public final class AssetManager {
 
         LOGGER.log(
                 System.Logger.Level.WARNING,
-                "Failed to load OBJ " + result.path(),
+                "Failed to load model " + result.path(),
                 result.error()
         );
     }
 
     private static Map<String, Integer> countAliases(
-            List<Path> objFiles
+            List<ModelSource> modelSources
     ) {
         final HashMap<String, Integer> counts =
-                new HashMap<>(mapCapacity(objFiles.size()));
+                new HashMap<>(
+                        mapCapacity(modelSources.size())
+                );
 
-        for (Path path : objFiles) {
+        for (ModelSource source : modelSources) {
             counts.merge(
                     stripExtension(
-                            path.getFileName().toString()
+                            source.path()
+                                    .getFileName()
+                                    .toString()
                     ),
                     1,
                     Integer::sum
@@ -440,69 +483,58 @@ public final class AssetManager {
     }
 
     private static Map<String, String> buildAliases(
-            Path root,
-            List<Path> objFiles,
+            List<ModelSource> modelSources,
             Map<String, Integer> aliasCounts,
             Map<String, MeshData> loadedMeshes
     ) {
         final HashMap<String, String> aliases =
-                new HashMap<>(mapCapacity(aliasCounts.size()));
+                new HashMap<>(
+                        mapCapacity(aliasCounts.size())
+                );
 
-        for (Path path : objFiles) {
+        for (ModelSource source : modelSources) {
             final String alias = stripExtension(
-                    path.getFileName().toString()
+                    source.path()
+                            .getFileName()
+                            .toString()
             );
 
             if (aliasCounts.getOrDefault(alias, 0) != 1) {
                 continue;
             }
 
-            final String id = toMeshId(root, path);
-
-            if (loadedMeshes.containsKey(id)) {
-                aliases.put(alias, id);
+            if (loadedMeshes.containsKey(source.id())) {
+                aliases.put(alias, source.id());
             }
         }
 
         return aliases;
     }
 
-    private static boolean isObjFile(Path path) {
-        final String filename =
-                path.getFileName().toString();
-
-        return filename.length() > 4
-                && filename.regionMatches(
-                true,
-                filename.length() - 4,
-                ".obj",
-                0,
-                4
-        );
-    }
-
-    private static String toMeshId(
+    private static String toBaseMeshId(
             Path root,
             Path file
     ) {
-        final Path relative = root.relativize(file);
+        return stripExtension(toRelativeId(root, file));
+    }
 
-        String id = relative.toString().replace(
-                FileSystems.getDefault().getSeparator(),
-                "/"
-        );
-
-        if (id.toLowerCase(Locale.ROOT).endsWith(".obj")) {
-            id = id.substring(0, id.length() - 4);
-        }
-
-        return id;
+    private static String toRelativeId(
+            Path root,
+            Path file
+    ) {
+        return root.relativize(file)
+                .toString()
+                .replace(
+                        FileSystems.getDefault().getSeparator(),
+                        "/"
+                );
     }
 
     private static String stripExtension(String name) {
+        final int slash = name.lastIndexOf('/');
         final int dot = name.lastIndexOf('.');
 
-        return dot > 0
+        return dot > slash + 1
                 ? name.substring(0, dot)
                 : name;
     }
@@ -525,6 +557,12 @@ public final class AssetManager {
             Map<String, MeshData> meshById,
             Map<String, String> aliasToId,
             List<String> meshIds
+    ) {
+    }
+
+    private record ModelSource(
+            Path path,
+            String id
     ) {
     }
 

@@ -1,5 +1,6 @@
 package engine;
 
+import engine.spatial.SpatialHashIndex;
 import objects.GameObject;
 
 import java.util.ArrayList;

@@ -1,7 +1,7 @@
 package engine.inventory;
 
-import engine.Camera;
 import engine.GameEngine;
+import engine.camera.Camera;
 import engine.event.EventBus;
 import engine.event.events.DropHeldItemRequestedEvent;
 import engine.event.events.HotbarSelectRequestedEvent;

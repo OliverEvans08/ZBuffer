@@ -1,8 +1,8 @@
 package engine;
 
-import objects.GameObject;
-
+import engine.spatial.SpatialHashIndex;
 import java.util.ArrayList;
+import objects.GameObject;
 
 /** Lock-free-query XZ broad-phase index for active, visible renderables. */
 public final class SpatialIndex {
@@ -12,7 +12,9 @@ public final class SpatialIndex {
     public SpatialIndex(double cellSize) {
         delegate = new SpatialHashIndex(
                 cellSize,
-                object -> object.isActive() && object.isVisible()
+                object ->
+                        object.isActive()
+                                && object.isVisible()
         );
     }
 
@@ -36,7 +38,10 @@ public final class SpatialIndex {
             SyncBuffer[] buffers,
             int bufferCount
     ) {
-        delegate.syncBatches(buffers, bufferCount);
+        delegate.syncBatches(
+                buffers,
+                bufferCount
+        );
     }
 
     public void queryXZ(
@@ -46,7 +51,13 @@ public final class SpatialIndex {
             double maxZ,
             ArrayList<GameObject> output
     ) {
-        delegate.queryXZ(minX, maxX, minZ, maxZ, output);
+        delegate.queryXZ(
+                minX,
+                maxX,
+                minZ,
+                maxZ,
+                output
+        );
     }
 
     public static final class SyncBuffer

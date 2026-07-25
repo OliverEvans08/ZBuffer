@@ -1,6 +1,6 @@
 package engine.systems;
 
-import engine.Camera;
+import engine.camera.Camera;
 import engine.event.EventBus;
 import engine.event.events.MouseLookEvent;
 import engine.event.events.MovementIntentEvent;
