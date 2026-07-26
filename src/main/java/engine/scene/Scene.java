@@ -149,12 +149,12 @@ public final class Scene {
 
         final LightObject sun = LightObject.directional(
                 new Vector3(-0.4, -0.85, 0.3),
-                new Color(25, 244, 220),
-                0.2,
-                false
+                new Color(255, 244, 220),
+                0.8,
+                true
         );
 
-        sun.setAutoRotateY(Math.toRadians(6.0));
+        //sun.setAutoRotateY(Math.toRadians(6.0));
 
         addRootObjectImmediate(sun);
 

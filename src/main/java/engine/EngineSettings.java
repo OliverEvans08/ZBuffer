@@ -12,7 +12,7 @@ public final class EngineSettings {
     public static final int VERTEX_PARALLEL_CHUNK = 2048;
     public static final int DERIVED_PARALLEL_THRESHOLD = 64;
 
-    public static final long MINIMUM_REPAINT_NANOSECONDS = 1_000_000L;
+    public static final long MINIMUM_REPAINT_NANOSECONDS = 16_666_667L;
     public static final long IDLE_PARK_NANOSECONDS = 250_000L;
 
     private double fieldOfViewDegrees = 70.0;

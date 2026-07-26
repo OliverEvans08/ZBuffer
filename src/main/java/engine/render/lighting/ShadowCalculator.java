@@ -4,25 +4,37 @@ import engine.GameEngine;
 import engine.lighting.LightData;
 import engine.lighting.LightType;
 import engine.render.RenderFrame;
-import engine.render.RenderSettings;
-import engine.render.SceneCollector;
 import engine.render.util.RenderWorkerContext;
-import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
 import objects.GameObject;
 import util.AABB;
 
+/**
+ * Builds one independent depth shadow map per shadow-casting light.
+ *
+ * Only directional lights generate shadow maps. Point/spot maps (especially
+ * 6-face cubemaps) are the dominant remaining CPU cost and are deliberately
+ * disabled for performance. Visibility queries for those lights always return 1.0.
+ *
+ * Shadow maps are immutable while the camera frame is rasterized, so tile
+ * workers may sample them concurrently without locks.
+ */
 public final class ShadowCalculator {
-    private final GameEngine gameEngine;
     private final RenderFrame frame;
+    private ShadowMap[] maps = new ShadowMap[0];
 
     public ShadowCalculator(
             GameEngine gameEngine,
             RenderFrame frame
     ) {
-        this.gameEngine = gameEngine;
         this.frame = frame;
     }
 
+    /**
+     * Kept for the mesh compiler's existing API. Visibility is now evaluated
+     * per pixel from shadow maps, so object-wide flags are deliberately clear.
+     */
     public void calculateObjectShadowFlags(
             RenderWorkerContext context,
             GameObject receiver,
@@ -32,352 +44,227 @@ public final class ShadowCalculator {
             double cameraZ,
             double farDistance
     ) {
-        context.ensureShadowCapacity(frame.lightCount);
+        // Per-object flags are obsolete; shadows are sampled per pixel.
+    }
 
-        if (
-                frame.lightCount == 0 ||
-                        receiverBounds == null
-        ) {
-            return;
-        }
-
-        final double receiverX =
-                0.5 *
-                        (receiverBounds.minX +
-                                receiverBounds.maxX);
-        final double receiverY =
-                0.5 *
-                        (receiverBounds.minY +
-                                receiverBounds.maxY);
-        final double receiverZ =
-                0.5 *
-                        (receiverBounds.minZ +
-                                receiverBounds.maxZ);
-        final double cameraDeltaX = receiverX - cameraX;
-        final double cameraDeltaY = receiverY - cameraY;
-        final double cameraDeltaZ = receiverZ - cameraZ;
-
-        if (
-                cameraDeltaX * cameraDeltaX +
-                        cameraDeltaY * cameraDeltaY +
-                        cameraDeltaZ * cameraDeltaZ >
-                        RenderSettings
-                                .SHADOW_RECEIVER_MAXIMUM_DISTANCE *
-                                RenderSettings
-                                        .SHADOW_RECEIVER_MAXIMUM_DISTANCE
-        ) {
-            return;
-        }
+    public void buildShadowMaps(
+            List<GameObject> candidates,
+            double cameraX,
+            double cameraY,
+            double cameraZ,
+            double farDistance
+    ) {
+        ensureMapCapacity(frame.lightCount);
 
         for (
                 int lightIndex = 0;
                 lightIndex < frame.lightCount;
                 lightIndex++
         ) {
-            final LightData light =
-                    frame.lightArray[lightIndex];
+            final LightData light = frame.lightArray[lightIndex];
 
+            // Aggressive: only directional lights cast shadows.
+            // Point/spot cubemaps are extremely expensive on CPU.
             if (
                     light == null ||
                             !light.shadows ||
-                            light.strength <= 0.0
+                            light.strength <= 0.0 ||
+                            light.type != LightType.DIRECTIONAL
             ) {
+                maps[lightIndex] = null;
                 continue;
             }
 
-            double directionX;
-            double directionY;
-            double directionZ;
-            double maximumDistance;
+            ShadowMap map = maps[lightIndex];
 
-            if (light.type == LightType.DIRECTIONAL) {
-                directionX = -light.dx;
-                directionY = -light.dy;
-                directionZ = -light.dz;
-                maximumDistance = Math.min(
-                        farDistance,
-                        RenderSettings
-                                .SHADOW_DIRECTIONAL_MAXIMUM_DISTANCE
-                );
-            } else {
-                final double toLightX =
-                        light.x - receiverX;
-                final double toLightY =
-                        light.y - receiverY;
-                final double toLightZ =
-                        light.z - receiverZ;
-                final double distanceSquared =
-                        toLightX * toLightX +
-                                toLightY * toLightY +
-                                toLightZ * toLightZ;
+            if (map == null) {
+                map = new ShadowMap();
+                maps[lightIndex] = map;
+            }
+
+            map.configure(
+                    light,
+                    cameraX,
+                    cameraY,
+                    cameraZ,
+                    farDistance
+            );
+
+            if (candidates == null || candidates.isEmpty()) {
+                continue;
+            }
+
+            final double lightX = light.x;
+            final double lightY = light.y;
+            final double lightZ = light.z;
+            final double range =
+                    light.range > 0.0
+                            ? light.range
+                            : farDistance;
+            final double rangeSquared =
+                    range * range;
+
+            for (
+                    int objectIndex = 0;
+                    objectIndex < candidates.size();
+                    objectIndex++
+            ) {
+                final GameObject object =
+                        candidates.get(objectIndex);
 
                 if (
-                        distanceSquared < 1.0e-18 ||
-                                (light.range > 0.0 &&
-                                        distanceSquared >
-                                                light.range *
-                                                        light.range)
+                        object == null ||
+                                object == light.owner ||
+                                !object.isActive() ||
+                                !object.isVisible() ||
+                                object.isWireframe()
                 ) {
                     continue;
                 }
 
-                final double distance =
-                        Math.sqrt(distanceSquared);
-                final double inverseDistance =
-                        1.0 / distance;
-                directionX =
-                        toLightX * inverseDistance;
-                directionY =
-                        toLightY * inverseDistance;
-                directionZ =
-                        toLightZ * inverseDistance;
-
-                if (light.type == LightType.SPOT) {
-                    final double cosineTheta =
-                            light.dx * -directionX +
-                                    light.dy * -directionY +
-                                    light.dz * -directionZ;
-
-                    if (cosineTheta <= light.outerCos) {
-                        continue;
-                    }
-                }
-
-                maximumDistance =
-                        distance -
-                                RenderSettings.SHADOW_BIAS;
+                addObjectTriangles(map, object);
             }
-
-            if (maximumDistance <= 1.0e-6) {
-                continue;
-            }
-
-            final double originX =
-                    receiverX +
-                            directionX *
-                                    RenderSettings.SHADOW_BIAS;
-            final double originY =
-                    receiverY +
-                            directionY *
-                                    RenderSettings.SHADOW_BIAS;
-            final double originZ =
-                    receiverZ +
-                            directionZ *
-                                    RenderSettings.SHADOW_BIAS;
-
-            context.shadowedPerLight[lightIndex] =
-                    isOccluded(
-                            context,
-                            originX,
-                            originY,
-                            originZ,
-                            directionX,
-                            directionY,
-                            directionZ,
-                            maximumDistance,
-                            receiver,
-                            light.owner
-                    );
         }
     }
 
-    private boolean isOccluded(
-            RenderWorkerContext context,
-            double originX,
-            double originY,
-            double originZ,
-            double directionX,
-            double directionY,
-            double directionZ,
-            double maximumDistance,
-            GameObject receiver,
-            GameObject lightOwner
+    public double visibility(
+            int lightIndex,
+            double worldX,
+            double worldY,
+            double worldZ,
+            double normalX,
+            double normalY,
+            double normalZ,
+            double normalDotLight
     ) {
-        final double endX =
-                originX + directionX * maximumDistance;
-        final double endZ =
-                originZ + directionZ * maximumDistance;
-        final double padding =
-                RenderSettings.SHADOW_BIAS * 2.0;
-        final ArrayList<GameObject> candidates =
-                context.shadowCandidates;
+        if (
+                lightIndex < 0 ||
+                        lightIndex >= frame.lightCount ||
+                        lightIndex >= maps.length
+        ) {
+            return 1.0;
+        }
 
-        gameEngine.queryNearbyCollidersXZ(
-                Math.min(originX, endX) - padding,
-                Math.max(originX, endX) + padding,
-                Math.min(originZ, endZ) - padding,
-                Math.max(originZ, endZ) + padding,
-                candidates
+        final LightData light = frame.lightArray[lightIndex];
+        final ShadowMap map = maps[lightIndex];
+
+        if (
+                light == null ||
+                        !light.shadows ||
+                        map == null ||
+                        light.type != LightType.DIRECTIONAL
+        ) {
+            return 1.0;
+        }
+
+        return map.visibility(
+                worldX,
+                worldY,
+                worldZ,
+                normalX,
+                normalY,
+                normalZ,
+                normalDotLight
         );
+    }
 
-        for (
-                int i = 0, count = candidates.size();
-                i < count;
-                i++
+    private static void addObjectTriangles(
+            ShadowMap map,
+            GameObject object
+    ) {
+        final double[][] vertices =
+                object.getTransformedVertices();
+        final int[][] faces = object.getFacesArray();
+
+        if (
+                vertices == null ||
+                        vertices.length == 0 ||
+                        faces == null ||
+                        faces.length == 0
         ) {
-            final GameObject object = candidates.get(i);
-            final AABB bounds =
-                    object == null
-                            ? null
-                            : object.getWorldAABB();
+            return;
+        }
+
+        for (int faceIndex = 0; faceIndex < faces.length; faceIndex++) {
+            final int[] face = faces[faceIndex];
 
             if (
-                    object == null ||
-                            bounds == null ||
-                            !object.isActive() ||
-                            !object.isVisible() ||
-                            !object.isSolid() ||
-                            object == receiver ||
-                            object == lightOwner ||
-                            (receiver != null &&
-                                    SceneCollector
-                                            .isDescendantOrSelf(
-                                                    object,
-                                                    receiver
-                                            )) ||
-                            (lightOwner != null &&
-                                    SceneCollector
-                                            .isDescendantOrSelf(
-                                                    object,
-                                                    lightOwner
-                                            )) ||
-                            SceneCollector.containsPoint(
-                                    bounds,
-                                    originX,
-                                    originY,
-                                    originZ
-                            )
+                    face == null ||
+                            face.length != 3 ||
+                            !validIndex(face[0], vertices.length) ||
+                            !validIndex(face[1], vertices.length) ||
+                            !validIndex(face[2], vertices.length)
             ) {
                 continue;
             }
 
-            if (
-                    rayAabbHitDistance(
-                            originX,
-                            originY,
-                            originZ,
-                            directionX,
-                            directionY,
-                            directionZ,
-                            maximumDistance,
-                            bounds
-                    ) != Double.POSITIVE_INFINITY
-            ) {
-                return true;
-            }
-        }
+            final double[] point0 = vertices[face[0]];
+            final double[] point1 = vertices[face[1]];
+            final double[] point2 = vertices[face[2]];
 
-        return false;
+            if (
+                    !validPoint(point0) ||
+                            !validPoint(point1) ||
+                            !validPoint(point2)
+            ) {
+                continue;
+            }
+
+            map.addTriangle(
+                    point0[0],
+                    point0[1],
+                    point0[2],
+                    point1[0],
+                    point1[1],
+                    point1[2],
+                    point2[0],
+                    point2[1],
+                    point2[2]
+            );
+        }
     }
 
-    private static double rayAabbHitDistance(
-            double originX,
-            double originY,
-            double originZ,
-            double directionX,
-            double directionY,
-            double directionZ,
-            double maximumDistance,
-            AABB bounds
+    private void ensureMapCapacity(int required) {
+        if (maps.length >= required) {
+            return;
+        }
+
+        int capacity = Math.max(16, maps.length);
+
+        while (capacity < required) {
+            if (capacity > Integer.MAX_VALUE / 2) {
+                capacity = required;
+                break;
+            }
+            capacity <<= 1;
+        }
+
+        maps = Arrays.copyOf(maps, capacity);
+    }
+
+    private static boolean validIndex(
+            int index,
+            int length
     ) {
-        double minimumTime = 0.0;
-        double maximumTime = maximumDistance;
+        return index >= 0 && index < length;
+    }
 
-        if (
-                Math.abs(directionX) <
-                        RenderSettings.RAY_EPSILON
-        ) {
-            if (
-                    originX < bounds.minX ||
-                            originX > bounds.maxX
-            ) {
-                return Double.POSITIVE_INFINITY;
-            }
-        } else {
-            final double inverse = 1.0 / directionX;
-            double first =
-                    (bounds.minX - originX) * inverse;
-            double second =
-                    (bounds.maxX - originX) * inverse;
+    private static boolean validPoint(double[] point) {
+        return point != null &&
+                point.length >= 3 &&
+                Double.isFinite(point[0]) &&
+                Double.isFinite(point[1]) &&
+                Double.isFinite(point[2]);
+    }
 
-            if (first > second) {
-                final double temporary = first;
-                first = second;
-                second = temporary;
-            }
-
-            minimumTime = Math.max(minimumTime, first);
-            maximumTime = Math.min(maximumTime, second);
-
-            if (minimumTime > maximumTime) {
-                return Double.POSITIVE_INFINITY;
-            }
-        }
-
-        if (
-                Math.abs(directionY) <
-                        RenderSettings.RAY_EPSILON
-        ) {
-            if (
-                    originY < bounds.minY ||
-                            originY > bounds.maxY
-            ) {
-                return Double.POSITIVE_INFINITY;
-            }
-        } else {
-            final double inverse = 1.0 / directionY;
-            double first =
-                    (bounds.minY - originY) * inverse;
-            double second =
-                    (bounds.maxY - originY) * inverse;
-
-            if (first > second) {
-                final double temporary = first;
-                first = second;
-                second = temporary;
-            }
-
-            minimumTime = Math.max(minimumTime, first);
-            maximumTime = Math.min(maximumTime, second);
-
-            if (minimumTime > maximumTime) {
-                return Double.POSITIVE_INFINITY;
-            }
-        }
-
-        if (
-                Math.abs(directionZ) <
-                        RenderSettings.RAY_EPSILON
-        ) {
-            if (
-                    originZ < bounds.minZ ||
-                            originZ > bounds.maxZ
-            ) {
-                return Double.POSITIVE_INFINITY;
-            }
-        } else {
-            final double inverse = 1.0 / directionZ;
-            double first =
-                    (bounds.minZ - originZ) * inverse;
-            double second =
-                    (bounds.maxZ - originZ) * inverse;
-
-            if (first > second) {
-                final double temporary = first;
-                first = second;
-                second = temporary;
-            }
-
-            minimumTime = Math.max(minimumTime, first);
-            maximumTime = Math.min(maximumTime, second);
-
-            if (minimumTime > maximumTime) {
-                return Double.POSITIVE_INFINITY;
-            }
-        }
-
-        return minimumTime <= 1.0e-6
-                ? Double.POSITIVE_INFINITY
-                : minimumTime;
+    private static double clamp(
+            double value,
+            double minimum,
+            double maximum
+    ) {
+        return Math.max(
+                minimum,
+                Math.min(maximum, value)
+        );
     }
 }

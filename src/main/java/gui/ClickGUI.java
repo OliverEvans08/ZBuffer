@@ -4,69 +4,183 @@ import engine.GameEngine;
 import gui.components.Button;
 import gui.components.Slider;
 
-import java.awt.*;
+import java.awt.Color;
+import java.awt.GradientPaint;
+import java.awt.Graphics;
+import java.awt.Graphics2D;
 import java.awt.event.MouseEvent;
 import java.util.ArrayList;
 import java.util.List;
 
 public class ClickGUI {
 
+    private static final int CONTROL_X_OFFSET = 20;
+    private static final int DEBUG_BUTTON_Y_OFFSET = 20;
+    private static final int FXAA_BUTTON_Y_OFFSET = 60;
+    private static final int FOV_SLIDER_Y_OFFSET = 110;
+    private static final int RENDER_DISTANCE_SLIDER_Y_OFFSET = 150;
+    private static final int RENDER_SCALE_SLIDER_Y_OFFSET = 190;
+
     private final GameEngine engine;
 
     private boolean isOpen = false;
+
     public final List<Button> buttons = new ArrayList<>();
     public final List<Slider> sliders = new ArrayList<>();
 
-    private int panelX = 100, panelY = 100;
-    private int panelWidth = 260, panelHeight = 190;
+    private int panelX = 100;
+    private int panelY = 100;
+    private int panelWidth = 260;
+    private int panelHeight = 235;
+
     private boolean dragging = false;
-    private int dragX, dragY;
+    private int dragX;
+    private int dragY;
     private boolean mousePressed = false;
 
-    private Slider fovSlider;
-    private Slider renderSlider;
-    private Slider renderScaleSlider;
+    private final Button debugButton;
+    private final Button fxaaButton;
+
+    private final Slider fovSlider;
+    private final Slider renderSlider;
+    private final Slider renderScaleSlider;
 
     public ClickGUI(GameEngine engine) {
         this.engine = engine;
 
-        buttons.add(new Button(panelX + 20, panelY + 20, 200, 36, "Debug"));
+        debugButton = new Button(
+                panelX + CONTROL_X_OFFSET,
+                panelY + DEBUG_BUTTON_Y_OFFSET,
+                200,
+                36,
+                "Debug"
+        );
 
-        fovSlider = new Slider(panelX + 20, panelY + 70, 200, 30, 120, 70, "FOV")
-                .onChange(v -> engine.setFovDegrees(v));
+        buttons.add(debugButton);
+
+        fxaaButton = new Button(
+                panelX + CONTROL_X_OFFSET,
+                panelY + FXAA_BUTTON_Y_OFFSET,
+                200,
+                36,
+                "FXAA"
+        );
+
+        if (engine.renderer.isFxaaEnabled()) {
+            fxaaButton.toggle();
+        }
+
+        buttons.add(fxaaButton);
+
+        fovSlider = new Slider(
+                panelX + CONTROL_X_OFFSET,
+                panelY + FOV_SLIDER_Y_OFFSET,
+                200,
+                30,
+                120,
+                70,
+                "FOV"
+        ).onChange(engine::setFovDegrees);
+
         sliders.add(fovSlider);
 
-        renderSlider = new Slider(panelX + 20, panelY + 110, 200, 50, 500, 200, "Render Distance")
-                .onChange(v -> engine.setRenderDistance(v));
+        renderSlider = new Slider(
+                panelX + CONTROL_X_OFFSET,
+                panelY + RENDER_DISTANCE_SLIDER_Y_OFFSET,
+                200,
+                50,
+                500,
+                200,
+                "Render Distance"
+        ).onChange(engine::setRenderDistance);
+
         sliders.add(renderSlider);
 
-        int rsInit = (int) Math.round(engine.renderer.getRenderScale() * 100.0);
-        renderScaleSlider = new Slider(panelX + 20, panelY + 150, 200, 25, 100, rsInit, "Render Scale")
-                .onChange(v -> engine.renderer.setRenderScale(v / 100.0));
+        final int initialRenderScale =
+                (int) Math.round(
+                        engine.renderer.getRenderScale() * 100.0
+                );
+
+        renderScaleSlider = new Slider(
+                panelX + CONTROL_X_OFFSET,
+                panelY + RENDER_SCALE_SLIDER_Y_OFFSET,
+                200,
+                25,
+                100,
+                initialRenderScale,
+                "Render Scale"
+        ).onChange(
+                value -> engine.renderer.setRenderScale(
+                        value / 100.0
+                )
+        );
+
         sliders.add(renderScaleSlider);
     }
 
     public void render(Graphics graphics) {
-        if (!isOpen) return;
+        if (!isOpen) {
+            return;
+        }
 
-        Graphics2D g2d = (Graphics2D) graphics;
-        GradientPaint gradient = new GradientPaint(panelX, panelY, new Color(32, 32, 32),
-                panelX, panelY + panelHeight, new Color(10, 10, 10));
-        g2d.setPaint(gradient);
-        g2d.fillRoundRect(panelX, panelY, panelWidth, panelHeight, 16, 16);
+        final Graphics2D graphics2D =
+                (Graphics2D) graphics;
 
-        g2d.setColor(new Color(255, 255, 255, 24));
-        g2d.fillRoundRect(panelX, panelY, panelWidth, 24, 16, 16);
-        g2d.setColor(Color.WHITE);
-        g2d.drawString("Settings", panelX + 10, panelY + 16);
+        final GradientPaint gradient =
+                new GradientPaint(
+                        panelX,
+                        panelY,
+                        new Color(32, 32, 32),
+                        panelX,
+                        panelY + panelHeight,
+                        new Color(10, 10, 10)
+                );
 
-        for (Button button : buttons) button.render(graphics);
-        for (Slider slider : sliders) slider.render(graphics);
+        graphics2D.setPaint(gradient);
+        graphics2D.fillRoundRect(
+                panelX,
+                panelY,
+                panelWidth,
+                panelHeight,
+                16,
+                16
+        );
+
+        graphics2D.setColor(
+                new Color(255, 255, 255, 24)
+        );
+
+        graphics2D.fillRoundRect(
+                panelX,
+                panelY,
+                panelWidth,
+                24,
+                16,
+                16
+        );
+
+        graphics2D.setColor(Color.WHITE);
+        graphics2D.drawString(
+                "Settings",
+                panelX + 10,
+                panelY + 16
+        );
+
+        for (Button button : buttons) {
+            button.render(graphics);
+        }
+
+        for (Slider slider : sliders) {
+            slider.render(graphics);
+        }
     }
 
     public void setOpen(boolean open) {
-        if (this.isOpen == open) return;
-        this.isOpen = open;
+        if (isOpen == open) {
+            return;
+        }
+
+        isOpen = open;
         engine.onGuiToggled(open);
     }
 
@@ -75,7 +189,9 @@ public class ClickGUI {
     }
 
     public void clicked(int x, int y) {
-        if (!isOpen) return;
+        if (!isOpen) {
+            return;
+        }
 
         for (Button button : buttons) {
             if (button.contains(x, y)) {
@@ -93,47 +209,69 @@ public class ClickGUI {
         }
     }
 
-    public void mouseReleased(MouseEvent e) {
+    public void mouseReleased(MouseEvent event) {
         dragging = false;
         mousePressed = false;
-        for (Slider slider : sliders) slider.stopDragging();
+
+        for (Slider slider : sliders) {
+            slider.stopDragging();
+        }
     }
 
     public void mouseDragged(int x, int y) {
-        if (!isOpen) return;
+        if (!isOpen) {
+            return;
+        }
 
         if (dragging) {
             panelX = x - dragX;
             panelY = y - dragY;
 
-            buttons.get(0).bounds.setLocation(panelX + 20, panelY + 20);
-            for (int i = 0; i < sliders.size(); i++) {
-                sliders.get(i).bounds.setLocation(panelX + 20, panelY + 70 + (i * 40));
-            }
-        } else {
-            for (Slider slider : sliders) slider.drag(x);
+            updateControlLocations();
+            return;
+        }
+
+        for (Slider slider : sliders) {
+            slider.drag(x);
         }
     }
 
-    public void mouseMoved(MouseEvent e) {
-        if (!isOpen) return;
+    public void mouseMoved(MouseEvent event) {
+        if (!isOpen) {
+            return;
+        }
 
-        int mouseX = e.getX();
-        int mouseY = e.getY();
+        final int mouseX = event.getX();
+        final int mouseY = event.getY();
 
-        for (Button button : buttons) button.updateHoverStatus(mouseX, mouseY);
-        for (Slider slider : sliders) slider.updateHoverStatus(mouseX, mouseY);
+        for (Button button : buttons) {
+            button.updateHoverStatus(mouseX, mouseY);
+        }
+
+        for (Slider slider : sliders) {
+            slider.updateHoverStatus(mouseX, mouseY);
+        }
     }
 
-    public void mousePressed(MouseEvent e) {
+    public void mousePressed(MouseEvent event) {
         mousePressed = true;
-        if (!isOpen) return;
 
-        int x = e.getX();
-        int y = e.getY();
+        if (!isOpen) {
+            return;
+        }
 
-        boolean insidePanel = (x >= panelX && x <= panelX + panelWidth && y >= panelY && y <= panelY + panelHeight);
-        boolean inHeader = (insidePanel && y <= panelY + 24);
+        final int x = event.getX();
+        final int y = event.getY();
+
+        final boolean insidePanel =
+                x >= panelX
+                        && x <= panelX + panelWidth
+                        && y >= panelY
+                        && y <= panelY + panelHeight;
+
+        final boolean inHeader =
+                insidePanel
+                        && y <= panelY + 24;
 
         if (inHeader) {
             dragX = x - panelX;
@@ -151,7 +289,38 @@ public class ClickGUI {
     }
 
     private void handleButtonClick(Button button) {
-        // debug toggle only right now
+        if (button == fxaaButton) {
+            engine.renderer.setFxaaEnabled(
+                    fxaaButton.isToggled()
+            );
+        }
+    }
+
+    private void updateControlLocations() {
+        debugButton.bounds.setLocation(
+                panelX + CONTROL_X_OFFSET,
+                panelY + DEBUG_BUTTON_Y_OFFSET
+        );
+
+        fxaaButton.bounds.setLocation(
+                panelX + CONTROL_X_OFFSET,
+                panelY + FXAA_BUTTON_Y_OFFSET
+        );
+
+        fovSlider.bounds.setLocation(
+                panelX + CONTROL_X_OFFSET,
+                panelY + FOV_SLIDER_Y_OFFSET
+        );
+
+        renderSlider.bounds.setLocation(
+                panelX + CONTROL_X_OFFSET,
+                panelY + RENDER_DISTANCE_SLIDER_Y_OFFSET
+        );
+
+        renderScaleSlider.bounds.setLocation(
+                panelX + CONTROL_X_OFFSET,
+                panelY + RENDER_SCALE_SLIDER_Y_OFFSET
+        );
     }
 
     public boolean isMousePressed() {
@@ -171,6 +340,6 @@ public class ClickGUI {
     }
 
     public boolean isDebug() {
-        return buttons.get(0).isToggled();
+        return debugButton.isToggled();
     }
 }

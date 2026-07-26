@@ -28,6 +28,9 @@ public final class TriangleBatch {
             int index0,
             int index1,
             int index2,
+            double cameraNormalX,
+            double cameraNormalY,
+            double cameraNormalZ,
             int width,
             int height,
             MaterialState material,
@@ -53,6 +56,9 @@ public final class TriangleBatch {
                 projected.inverseZ[index2],
                 projected.uOverZ[index2],
                 projected.vOverZ[index2],
+                cameraNormalX,
+                cameraNormalY,
+                cameraNormalZ,
                 width,
                 height,
                 material,
@@ -79,6 +85,9 @@ public final class TriangleBatch {
             double cameraZ2,
             double u2,
             double v2,
+            double cameraNormalX,
+            double cameraNormalY,
+            double cameraNormalZ,
             double projectionScale,
             int width,
             int height,
@@ -98,39 +107,53 @@ public final class TriangleBatch {
             return;
         }
 
-        final double inverse0 = 1.0 / cameraZ0;
-        final double inverse1 = 1.0 / cameraZ1;
-        final double inverse2 = 1.0 / cameraZ2;
+        final double inverse0 =
+                1.0 / cameraZ0;
+
+        final double inverse1 =
+                1.0 / cameraZ1;
+
+        final double inverse2 =
+                1.0 / cameraZ2;
+
+        final double halfWidth =
+                width * 0.5;
+
+        final double halfHeight =
+                height * 0.5;
+
+        final double projectedScale0 =
+                projectionScale * inverse0;
+
+        final double projectedScale1 =
+                projectionScale * inverse1;
+
+        final double projectedScale2 =
+                projectionScale * inverse2;
+
         final double screenX0 =
-                cameraX0 *
-                        projectionScale *
-                        inverse0 +
-                        width * 0.5;
+                cameraX0 * projectedScale0 +
+                        halfWidth;
+
         final double screenY0 =
-                -cameraY0 *
-                        projectionScale *
-                        inverse0 +
-                        height * 0.5;
+                -cameraY0 * projectedScale0 +
+                        halfHeight;
+
         final double screenX1 =
-                cameraX1 *
-                        projectionScale *
-                        inverse1 +
-                        width * 0.5;
+                cameraX1 * projectedScale1 +
+                        halfWidth;
+
         final double screenY1 =
-                -cameraY1 *
-                        projectionScale *
-                        inverse1 +
-                        height * 0.5;
+                -cameraY1 * projectedScale1 +
+                        halfHeight;
+
         final double screenX2 =
-                cameraX2 *
-                        projectionScale *
-                        inverse2 +
-                        width * 0.5;
+                cameraX2 * projectedScale2 +
+                        halfWidth;
+
         final double screenY2 =
-                -cameraY2 *
-                        projectionScale *
-                        inverse2 +
-                        height * 0.5;
+                -cameraY2 * projectedScale2 +
+                        halfHeight;
 
         addScreenTriangle(
                 screenX0,
@@ -148,6 +171,9 @@ public final class TriangleBatch {
                 (float) inverse2,
                 (float) (u2 * inverse2),
                 (float) (v2 * inverse2),
+                cameraNormalX,
+                cameraNormalY,
+                cameraNormalZ,
                 width,
                 height,
                 material,
@@ -174,6 +200,9 @@ public final class TriangleBatch {
             float inverse2,
             float uOverZ2,
             float vOverZ2,
+            double cameraNormalX,
+            double cameraNormalY,
+            double cameraNormalZ,
             int width,
             int height,
             MaterialState material,
@@ -192,7 +221,10 @@ public final class TriangleBatch {
                         screenY2
                 );
 
-        if (!(signedArea > 0.0) && !(signedArea < 0.0)) {
+        if (
+                !(signedArea > 0.0) &&
+                        !(signedArea < 0.0)
+        ) {
             return;
         }
 
@@ -201,63 +233,123 @@ public final class TriangleBatch {
                 return;
             }
 
-            double temporary = screenX1;
+            double temporary =
+                    screenX1;
+
             screenX1 = screenX2;
             screenX2 = temporary;
+
             temporary = screenY1;
             screenY1 = screenY2;
             screenY2 = temporary;
 
-            final float temporaryInverse = inverse1;
+            final float temporaryInverse =
+                    inverse1;
+
             inverse1 = inverse2;
             inverse2 = temporaryInverse;
 
-            float temporaryFloat = uOverZ1;
+            float temporaryFloat =
+                    uOverZ1;
+
             uOverZ1 = uOverZ2;
             uOverZ2 = temporaryFloat;
+
             temporaryFloat = vOverZ1;
             vOverZ1 = vOverZ2;
             vOverZ2 = temporaryFloat;
+
+            /*
+             * Swapping two vertices reverses the geometric winding. Keep the
+             * stored face normal consistent with that new winding.
+             */
+            cameraNormalX = -cameraNormalX;
+            cameraNormalY = -cameraNormalY;
+            cameraNormalZ = -cameraNormalZ;
         }
 
-        final int minX = (int) Math.max(
-                0,
-                Math.floor(
-                        Math.min(
-                                screenX0,
-                                Math.min(screenX1, screenX2)
-                        )
-                )
-        );
-        final int maxX = (int) Math.min(
-                width - 1,
-                Math.floor(
-                        Math.max(
-                                screenX0,
-                                Math.max(screenX1, screenX2)
-                        ) + 0.5
-                )
-        );
-        final int minY = (int) Math.max(
-                0,
-                Math.floor(
-                        Math.min(
-                                screenY0,
-                                Math.min(screenY1, screenY2)
-                        )
-                )
-        );
-        final int maxY = (int) Math.min(
-                height - 1,
-                Math.floor(
-                        Math.max(
-                                screenY0,
-                                Math.max(screenY1, screenY2)
-                        ) + 0.5
-                )
-        );
+        double minimumScreenX =
+                screenX0;
 
-        if (minX > maxX || minY > maxY) {
+        if (screenX1 < minimumScreenX) {
+            minimumScreenX = screenX1;
+        }
+
+        if (screenX2 < minimumScreenX) {
+            minimumScreenX = screenX2;
+        }
+
+        double maximumScreenX =
+                screenX0;
+
+        if (screenX1 > maximumScreenX) {
+            maximumScreenX = screenX1;
+        }
+
+        if (screenX2 > maximumScreenX) {
+            maximumScreenX = screenX2;
+        }
+
+        double minimumScreenY =
+                screenY0;
+
+        if (screenY1 < minimumScreenY) {
+            minimumScreenY = screenY1;
+        }
+
+        if (screenY2 < minimumScreenY) {
+            minimumScreenY = screenY2;
+        }
+
+        double maximumScreenY =
+                screenY0;
+
+        if (screenY1 > maximumScreenY) {
+            maximumScreenY = screenY1;
+        }
+
+        if (screenY2 > maximumScreenY) {
+            maximumScreenY = screenY2;
+        }
+
+        int minX =
+                fastFloor(minimumScreenX);
+
+        int maxX =
+                fastFloor(maximumScreenX + 0.5);
+
+        int minY =
+                fastFloor(minimumScreenY);
+
+        int maxY =
+                fastFloor(maximumScreenY + 0.5);
+
+        if (minX < 0) {
+            minX = 0;
+        }
+
+        if (minY < 0) {
+            minY = 0;
+        }
+
+        final int lastX =
+                width - 1;
+
+        final int lastY =
+                height - 1;
+
+        if (maxX > lastX) {
+            maxX = lastX;
+        }
+
+        if (maxY > lastY) {
+            maxY = lastY;
+        }
+
+        if (
+                minX > maxX ||
+                        minY > maxY
+        ) {
             return;
         }
 
@@ -267,33 +359,68 @@ public final class TriangleBatch {
             );
         }
 
-        final TriangleBuffer output = buffer;
-        final int index = cursor++;
+        final TriangleBuffer output =
+                buffer;
+
+        final int index =
+                cursor++;
 
         output.x0[index] = screenX0;
         output.y0[index] = screenY0;
+
         output.x1[index] = screenX1;
         output.y1[index] = screenY1;
+
         output.x2[index] = screenX2;
         output.y2[index] = screenY2;
+
         output.inverseZ0[index] = inverse0;
         output.inverseZ1[index] = inverse1;
         output.inverseZ2[index] = inverse2;
+
         output.uOverZ0[index] = uOverZ0;
         output.vOverZ0[index] = vOverZ0;
+
         output.uOverZ1[index] = uOverZ1;
         output.vOverZ1[index] = vOverZ1;
+
         output.uOverZ2[index] = uOverZ2;
         output.vOverZ2[index] = vOverZ2;
-        output.materials[index] = material;
+
+        output.normalX[index] = cameraNormalX;
+        output.normalY[index] = cameraNormalY;
+        output.normalZ[index] = cameraNormalZ;
+
+        output.doubleSided[index] =
+                (byte) (
+                        isDoubleSided
+                                ? 1
+                                : 0
+                );
+
+        output.materials[index] =
+                material;
+
         output.shades[index] =
-                (shadeRed << 16) |
-                        (shadeGreen << 8) |
+                shadeRed << 16 |
+                        shadeGreen << 8 |
                         shadeBlue;
+
         output.minimumX[index] = minX;
         output.maximumX[index] = maxX;
         output.minimumY[index] = minY;
         output.maximumY[index] = maxY;
+    }
+
+    private static int fastFloor(
+            double value
+    ) {
+        final int truncated =
+                (int) value;
+
+        return value < truncated
+                ? truncated - 1
+                : truncated;
     }
 
     private static double edgeFunction(

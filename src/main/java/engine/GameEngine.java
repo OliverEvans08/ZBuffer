@@ -10,6 +10,8 @@ import engine.loop.GameLoop;
 import engine.render.Renderer;
 import engine.ui.GamePanel;
 import gui.ClickGUI;
+
+import java.awt.*;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -19,7 +21,9 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import objects.GameObject;
 import objects.dynamic.Body;
+import objects.lighting.LightObject;
 import sound.SoundEngine;
+import util.Vector3;
 
 public class GameEngine extends GamePanel implements Runnable {
 

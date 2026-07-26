@@ -10,6 +10,7 @@ import engine.render.lighting.MaterialResolver;
 import engine.render.lighting.ShadowCalculator;
 import engine.render.raster.DepthBuffer;
 import engine.render.raster.FrameBuffer;
+import engine.render.raster.FxaaProcessor;
 import engine.render.raster.SkyRenderer;
 import engine.render.raster.TileBinner;
 import engine.render.raster.TileGrid;
@@ -24,23 +25,49 @@ import util.AABB;
 public final class Renderer implements AutoCloseable {
     private final GameEngine gameEngine;
     private final Camera camera;
-    private final RenderSettings settings = new RenderSettings();
-    private final RenderFrame frame = new RenderFrame();
-    private final FrameBuffer frameBuffer = new FrameBuffer();
-    private final DepthBuffer depthBuffer = new DepthBuffer();
-    private final SkyRenderer skyRenderer = new SkyRenderer();
-    private final TileGrid tileGrid = new TileGrid();
+
+    private final RenderSettings settings =
+            new RenderSettings();
+
+    private final RenderFrame frame =
+            new RenderFrame();
+
+    private final FrameBuffer frameBuffer =
+            new FrameBuffer();
+
+    private final FxaaProcessor fxaaProcessor =
+            new FxaaProcessor();
+
+    private final DepthBuffer depthBuffer =
+            new DepthBuffer();
+
+    private final SkyRenderer skyRenderer =
+            new SkyRenderer();
+
+    private final TileGrid tileGrid =
+            new TileGrid();
+
     private final SceneCollector sceneCollector;
     private final RenderScheduler scheduler;
+
     private final MaterialResolver materialResolver =
             new MaterialResolver();
+
     private final ShadowCalculator shadowCalculator;
     private final LightingCalculator lightingCalculator;
     private final RenderMeshCompiler meshCompiler;
     private final TileRasterizer tileRasterizer;
 
-    public Renderer(Camera camera, GameEngine gameEngine) {
-        this(camera, gameEngine, null, 0);
+    public Renderer(
+            Camera camera,
+            GameEngine gameEngine
+    ) {
+        this(
+                camera,
+                gameEngine,
+                null,
+                0
+        );
     }
 
     public Renderer(
@@ -51,21 +78,40 @@ public final class Renderer implements AutoCloseable {
     ) {
         this.camera = camera;
         this.gameEngine = gameEngine;
-        sceneCollector = new SceneCollector(gameEngine, frame);
-        scheduler = new RenderScheduler(sharedPool, sharedWorkers);
-        shadowCalculator = new ShadowCalculator(gameEngine, frame);
-        lightingCalculator = new LightingCalculator(frame);
+
+        sceneCollector = new SceneCollector(
+                gameEngine,
+                frame
+        );
+
+        scheduler = new RenderScheduler(
+                sharedPool,
+                sharedWorkers
+        );
+
+        shadowCalculator = new ShadowCalculator(
+                gameEngine,
+                frame
+        );
+
+        lightingCalculator = new LightingCalculator(
+                frame,
+                shadowCalculator
+        );
+
         meshCompiler = new RenderMeshCompiler(
                 frame,
                 lightingCalculator,
                 shadowCalculator
         );
+
         tileRasterizer = new TileRasterizer(
                 frame.triangles,
                 tileGrid,
                 frameBuffer,
                 depthBuffer,
-                skyRenderer
+                skyRenderer,
+                lightingCalculator
         );
     }
 
@@ -73,16 +119,24 @@ public final class Renderer implements AutoCloseable {
         return settings.getRenderScale();
     }
 
-    public void setRenderScale(double renderScale) {
-        settings.setRenderScale(renderScale);
+    public void setRenderScale(
+            double renderScale
+    ) {
+        settings.setRenderScale(
+                renderScale
+        );
     }
 
     public boolean isFxaaEnabled() {
         return settings.isFxaaEnabled();
     }
 
-    public void setFxaaEnabled(boolean enabled) {
-        settings.setFxaaEnabled(enabled);
+    public void setFxaaEnabled(
+            boolean enabled
+    ) {
+        settings.setFxaaEnabled(
+                enabled
+        );
     }
 
     public void shutdown() {
@@ -111,38 +165,71 @@ public final class Renderer implements AutoCloseable {
 
         updateCameraValuesIfNeeded();
 
-        final int width = Math.max(
-                1,
-                (int) Math.round(
-                        windowWidth * settings.getRenderScale()
-                )
-        );
-        final int height = Math.max(
-                1,
-                (int) Math.round(
-                        windowHeight * settings.getRenderScale()
-                )
+        final int width =
+                Math.max(
+                        1,
+                        (int) Math.round(
+                                windowWidth *
+                                        settings
+                                                .getRenderScale()
+                        )
+                );
+
+        final int height =
+                Math.max(
+                        1,
+                        (int) Math.round(
+                                windowHeight *
+                                        settings
+                                                .getRenderScale()
+                        )
+                );
+
+        frameBuffer.ensure(
+                width,
+                height
         );
 
-        frameBuffer.ensure(width, height);
-        depthBuffer.ensure(width, height);
-        skyRenderer.ensure(width, height);
+        depthBuffer.ensure(
+                width,
+                height
+        );
 
-        final double fieldOfView = gameEngine.getFovRadians();
+        skyRenderer.ensure(
+                width,
+                height
+        );
+
+        final double fieldOfView =
+                gameEngine.getFovRadians();
+
         final double tangentHalfFieldOfView =
-                Math.tan(0.5 * fieldOfView);
-        final double farDistance = gameEngine.getRenderDistance();
+                Math.tan(
+                        0.5 * fieldOfView
+                );
+
+        final double farDistance =
+                gameEngine.getRenderDistance();
+
         final double projectionScale =
-                (0.5 * width) / tangentHalfFieldOfView;
-        final double cameraX = camera.getViewX();
-        final double cameraY = camera.getViewY();
-        final double cameraZ = camera.getViewZ();
+                (0.5 * width) /
+                        tangentHalfFieldOfView;
+
+        final double cameraX =
+                camera.getViewX();
+
+        final double cameraY =
+                camera.getViewY();
+
+        final double cameraZ =
+                camera.getViewZ();
 
         sceneCollector.buildNearbyRootLists(
                 cameraX,
                 cameraZ,
                 farDistance
         );
+
         sceneCollector.gatherLights(
                 roots,
                 cameraX,
@@ -150,7 +237,25 @@ public final class Renderer implements AutoCloseable {
                 cameraZ,
                 farDistance
         );
+
         frame.copyLightsToArray();
+
+        shadowCalculator.buildShadowMaps(
+                frame.nearbyRenderables,
+                cameraX,
+                cameraY,
+                cameraZ,
+                farDistance
+        );
+
+        lightingCalculator.beginFrame(
+                cameraX,
+                cameraY,
+                cameraZ,
+                projectionScale,
+                width,
+                height
+        );
 
         buildTriangleBatch(
                 frame.renderRoots,
@@ -163,16 +268,30 @@ public final class Renderer implements AutoCloseable {
                 cameraY,
                 cameraZ
         );
-        renderTiles(width, height);
+
+        renderTiles(
+                width,
+                height
+        );
+
+        if (settings.isFxaaEnabled()) {
+            fxaaProcessor.apply(
+                    frameBuffer.pixels,
+                    width,
+                    height
+            );
+        }
 
         graphics.setRenderingHint(
                 RenderingHints.KEY_INTERPOLATION,
                 RenderingHints.VALUE_INTERPOLATION_NEAREST_NEIGHBOR
         );
+
         graphics.setRenderingHint(
                 RenderingHints.KEY_RENDERING,
                 RenderingHints.VALUE_RENDER_SPEED
         );
+
         graphics.drawImage(
                 frameBuffer.image,
                 0,
@@ -183,53 +302,65 @@ public final class Renderer implements AutoCloseable {
         );
     }
 
-    private void renderTiles(int width, int height) {
+    private void renderTiles(
+            int width,
+            int height
+    ) {
         final int tileColumns =
-                (width + RenderSettings.TILE_SIZE - 1) >>
+                (width +
+                        RenderSettings.TILE_SIZE -
+                        1) >>
                         RenderSettings.TILE_SHIFT;
+
         final int tileRows =
-                (height + RenderSettings.TILE_SIZE - 1) >>
+                (height +
+                        RenderSettings.TILE_SIZE -
+                        1) >>
                         RenderSettings.TILE_SHIFT;
-        final int tileCount = tileColumns * tileRows;
 
-        TileBinner.bin(frame.triangles, tileGrid, width, height);
+        final int tileCount =
+                tileColumns * tileRows;
 
-        final long pixelCount = (long) width * height;
-        final int usefulWorkers = (int) Math.max(
-                1L,
-                (pixelCount +
-                        RenderSettings.PIXELS_PER_RENDER_WORKER -
-                        1L) /
-                        RenderSettings.PIXELS_PER_RENDER_WORKER
+        TileBinner.bin(
+                frame.triangles,
+                tileGrid,
+                width,
+                height
         );
-        final int workers = Math.max(
-                1,
-                Math.min(
+
+        final long pixelCount =
+                (long) width * height;
+
+        final int usefulWorkers =
+                (int) Math.max(
+                        1L,
+                        (
+                                pixelCount +
+                                        RenderSettings
+                                                .PIXELS_PER_RENDER_WORKER -
+                                        1L
+                        ) /
+                                RenderSettings
+                                        .PIXELS_PER_RENDER_WORKER
+                );
+
+        final int workers =
+                Math.max(
+                        1,
                         Math.min(
-                                scheduler.maximumWorkers,
-                                usefulWorkers
-                        ),
-                        tileCount
-                )
-        );
+                                Math.min(
+                                        scheduler.maximumWorkers,
+                                        usefulWorkers
+                                ),
+                                tileCount
+                        )
+                );
 
         if (workers == 1) {
-            for (int tile = 0; tile < tileCount; tile++) {
-                tileRasterizer.renderTile(
-                        tile,
-                        tileColumns,
-                        width,
-                        height
-                );
-            }
-            return;
-        }
-
-        scheduler.execute(workers, workerIndex -> {
             for (
-                    int tile = workerIndex;
+                    int tile = 0;
                     tile < tileCount;
-                    tile += workers
+                    tile++
             ) {
                 tileRasterizer.renderTile(
                         tile,
@@ -238,7 +369,26 @@ public final class Renderer implements AutoCloseable {
                         height
                 );
             }
-        });
+
+            return;
+        }
+
+        /*
+         * Tile bins may have very different triangle counts. Dynamic chunks
+         * prevent one worker from being stuck with all expensive tiles while
+         * other workers become idle.
+         */
+        scheduler.executeDynamic(
+                workers,
+                tileCount,
+                RenderSettings.TILE_WORK_CHUNK,
+                tile -> tileRasterizer.renderTile(
+                        tile,
+                        tileColumns,
+                        width,
+                        height
+                )
+        );
     }
 
     private void buildTriangleBatch(
@@ -256,25 +406,42 @@ public final class Renderer implements AutoCloseable {
         frame.itemCount = 0;
         frame.objectSet.clear();
 
-        if (topLevel == null || topLevel.isEmpty()) {
+        if (
+                topLevel == null ||
+                        topLevel.isEmpty()
+        ) {
             return;
         }
 
         final double tangentHalfFieldOfViewY =
-                (tangentHalfFieldOfViewX * height) / (double) width;
-        final GameObject playerBody = gameEngine.getPlayerBody();
-        final boolean firstPerson = gameEngine.isFirstPerson();
-        final int objectCount = topLevel.size();
+                (
+                        tangentHalfFieldOfViewX *
+                                height
+                ) /
+                        (double) width;
+
+        final GameObject playerBody =
+                gameEngine.getPlayerBody();
+
+        final boolean firstPerson =
+                gameEngine.isFirstPerson();
+
+        final int objectCount =
+                topLevel.size();
+
         int estimatedFaces = 0;
 
-        frame.ensureItemCapacity(objectCount);
+        frame.ensureItemCapacity(
+                objectCount
+        );
 
         for (
                 int objectIndex = 0;
                 objectIndex < objectCount;
                 objectIndex++
         ) {
-            final GameObject object = topLevel.get(objectIndex);
+            final GameObject object =
+                    topLevel.get(objectIndex);
 
             if (
                     object == null ||
@@ -290,12 +457,16 @@ public final class Renderer implements AutoCloseable {
 
             final boolean playerFamily =
                     playerBody != null &&
-                            SceneCollector.isDescendantOrSelf(
-                                    object,
-                                    playerBody
-                            );
+                            SceneCollector
+                                    .isDescendantOrSelf(
+                                            object,
+                                            playerBody
+                                    );
 
-            if (firstPerson && playerFamily) {
+            if (
+                    firstPerson &&
+                            playerFamily
+            ) {
                 continue;
             }
 
@@ -315,7 +486,9 @@ public final class Renderer implements AutoCloseable {
 
             final double[][] worldVertices =
                     object.getTransformedVertices();
-            final int[][] faces = object.getFacesArray();
+
+            final int[][] faces =
+                    object.getFacesArray();
 
             if (
                     worldVertices == null ||
@@ -326,23 +499,36 @@ public final class Renderer implements AutoCloseable {
                 continue;
             }
 
-            final double[][] textureCoordinates = object.getUVs();
+            final double[][] textureCoordinates =
+                    object.getUVs();
+
             RenderMesh mesh =
-                    meshCompiler.meshDataCache.get(object);
+                    meshCompiler.meshDataCache.get(
+                            object
+                    );
 
             if (
                     mesh == null ||
-                            !mesh.matches(worldVertices.length, faces)
+                            !mesh.matches(
+                                    worldVertices.length,
+                                    faces
+                            )
             ) {
                 mesh = RenderMeshCompiler.compile(
                         worldVertices,
                         faces,
                         textureCoordinates
                 );
-                meshCompiler.meshDataCache.put(object, mesh);
+
+                meshCompiler.meshDataCache.put(
+                        object,
+                        mesh
+                );
 
                 final ProjectionCache oldProjection =
-                        meshCompiler.projectionCache.remove(object);
+                        meshCompiler
+                                .projectionCache
+                                .remove(object);
 
                 if (oldProjection != null) {
                     oldProjection.invalidate();
@@ -354,14 +540,23 @@ public final class Renderer implements AutoCloseable {
             }
 
             ProjectionCache projected =
-                    meshCompiler.projectionCache.get(object);
+                    meshCompiler
+                            .projectionCache
+                            .get(object);
 
             if (projected == null) {
-                projected = new ProjectionCache();
-                meshCompiler.projectionCache.put(object, projected);
+                projected =
+                        new ProjectionCache();
+
+                meshCompiler.projectionCache.put(
+                        object,
+                        projected
+                );
             }
 
-            final AABB objectBounds = object.getWorldAABB();
+            final AABB objectBounds =
+                    object.getWorldAABB();
+
             final boolean cameraInside =
                     objectBounds != null &&
                             SceneCollector.containsPoint(
@@ -370,51 +565,97 @@ public final class Renderer implements AutoCloseable {
                                     cameraY,
                                     cameraZ
                             );
-            final boolean doubleSided =
-                    cameraInside || !object.isSolid();
-            final double nearDistance = playerFamily
-                    ? Math.max(
-                    RenderSettings.NEAR,
-                    RenderSettings.BODY_NEAR_PADDING
-            )
-                    : cameraInside
-                    ? Math.min(RenderSettings.NEAR, 0.02)
-                    : RenderSettings.NEAR;
-            final double zBias =
-                    playerFamily ? RenderSettings.BODY_Z_BIAS : 0.0;
-            final int item = frame.itemCount++;
 
-            frame.objects[item] = object;
-            frame.meshes[item] = mesh;
-            frame.projections[item] = projected;
+            final boolean doubleSided =
+                    cameraInside ||
+                            !object.isSolid();
+
+            final double nearDistance;
+
+            if (playerFamily) {
+                nearDistance =
+                        Math.max(
+                                RenderSettings.NEAR,
+                                RenderSettings
+                                        .BODY_NEAR_PADDING
+                        );
+            } else if (cameraInside) {
+                nearDistance =
+                        Math.min(
+                                RenderSettings.NEAR,
+                                0.02
+                        );
+            } else {
+                nearDistance =
+                        RenderSettings.NEAR;
+            }
+
+            final double zBias =
+                    playerFamily
+                            ? RenderSettings.BODY_Z_BIAS
+                            : 0.0;
+
+            final int item =
+                    frame.itemCount++;
+
+            frame.objects[item] =
+                    object;
+
+            frame.meshes[item] =
+                    mesh;
+
+            frame.projections[item] =
+                    projected;
+
             frame.materials[item] =
-                    materialResolver.getMaterialState(object);
-            frame.worldVertices[item] = worldVertices;
-            frame.bounds[item] = objectBounds;
-            frame.nearDistances[item] = nearDistance;
-            frame.zBiases[item] = zBias;
+                    materialResolver.getMaterialState(
+                            object
+                    );
+
+            frame.worldVertices[item] =
+                    worldVertices;
+
+            frame.bounds[item] =
+                    objectBounds;
+
+            frame.nearDistances[item] =
+                    nearDistance;
+
+            frame.zBiases[item] =
+                    zBias;
+
             frame.doubleSided[item] =
-                    (byte) (doubleSided ? 1 : 0);
+                    (byte) (
+                            doubleSided
+                                    ? 1
+                                    : 0
+                    );
 
             if (
                     estimatedFaces >
-                            Integer.MAX_VALUE - mesh.faceCount
+                            Integer.MAX_VALUE -
+                                    mesh.faceCount
             ) {
                 throw new IllegalStateException(
                         "Too many visible mesh faces"
                 );
             }
 
-            estimatedFaces += mesh.faceCount;
+            estimatedFaces +=
+                    mesh.faceCount;
         }
 
-        if (frame.itemCount == 0 || estimatedFaces == 0) {
+        if (
+                frame.itemCount == 0 ||
+                        estimatedFaces == 0
+        ) {
             return;
         }
 
         final int workers =
                 estimatedFaces <
-                        RenderSettings.TRIANGLE_BUILD_PARALLEL_THRESHOLD
+                        RenderSettings
+                                .TRIANGLE_BUILD_PARALLEL_THRESHOLD
                         ? 1
                         : Math.max(
                         1,
@@ -424,25 +665,45 @@ public final class Renderer implements AutoCloseable {
                         )
                 );
 
-        scheduler.ensureWorkerContexts(workers);
-        scheduler.ensureWorkerPartitionCapacity(workers);
-        scheduler.partitionFrameItemsByFaceCount(frame, workers);
+        scheduler.ensureWorkerContexts(
+                workers
+        );
 
-        final long maximumTriangles = (long) estimatedFaces * 2L;
+        scheduler.ensureWorkerPartitionCapacity(
+                workers
+        );
 
-        if (maximumTriangles > Integer.MAX_VALUE) {
+        scheduler.partitionFrameItemsByFaceCount(
+                frame,
+                workers
+        );
+
+        final long maximumTriangles =
+                (long) estimatedFaces * 2L;
+
+        if (
+                maximumTriangles >
+                        Integer.MAX_VALUE
+        ) {
             throw new IllegalStateException(
                     "Too many potentially clipped triangles"
             );
         }
 
-        frame.triangles.ensureCapacity((int) maximumTriangles);
-        scheduler.bindTriangleRanges(frame, workers);
+        frame.triangles.ensureCapacity(
+                (int) maximumTriangles
+        );
+
+        scheduler.bindTriangleRanges(
+                frame,
+                workers
+        );
 
         if (workers == 1) {
             meshCompiler.buildTrianglesForWorker(
                     scheduler.workerContexts[0],
-                    0,
+                    scheduler.workerItemStarts[0],
+                    scheduler.workerItemCounts[0],
                     width,
                     height,
                     projectionScale,
@@ -454,33 +715,57 @@ public final class Renderer implements AutoCloseable {
                     cameraZ,
                     playerBody
             );
-            scheduler.finishTriangleRanges(frame, 1);
+
+            scheduler.finishTriangleRanges(
+                    frame,
+                    1
+            );
+
             return;
         }
 
         scheduler.execute(
                 workers,
-                index -> meshCompiler.buildTrianglesForWorker(
-                        scheduler.workerContexts[index],
-                        index,
-                        width,
-                        height,
-                        projectionScale,
-                        farDistance,
-                        tangentHalfFieldOfViewX,
-                        tangentHalfFieldOfViewY,
-                        cameraX,
-                        cameraY,
-                        cameraZ,
-                        playerBody
-                )
+                workerIndex ->
+                        meshCompiler
+                                .buildTrianglesForWorker(
+                                        scheduler
+                                                .workerContexts[
+                                                workerIndex
+                                                ],
+                                        scheduler
+                                                .workerItemStarts[
+                                                workerIndex
+                                                ],
+                                        scheduler
+                                                .workerItemCounts[
+                                                workerIndex
+                                                ],
+                                        width,
+                                        height,
+                                        projectionScale,
+                                        farDistance,
+                                        tangentHalfFieldOfViewX,
+                                        tangentHalfFieldOfViewY,
+                                        cameraX,
+                                        cameraY,
+                                        cameraZ,
+                                        playerBody
+                                )
         );
-        scheduler.finishTriangleRanges(frame, workers);
+
+        scheduler.finishTriangleRanges(
+                frame,
+                workers
+        );
     }
 
     private void updateCameraValuesIfNeeded() {
-        final double yaw = camera.getViewYaw();
-        final double pitch = camera.getViewPitch();
+        final double yaw =
+                camera.getViewYaw();
+
+        final double pitch =
+                camera.getViewPitch();
 
         if (
                 !frame.cameraValuesCached ||
@@ -489,19 +774,41 @@ public final class Renderer implements AutoCloseable {
         ) {
             frame.cachedYaw = yaw;
             frame.cachedPitch = pitch;
-            frame.cosineYaw = Math.cos(yaw);
-            frame.sineYaw = Math.sin(yaw);
-            frame.cosinePitch = Math.cos(pitch);
-            frame.sinePitch = Math.sin(pitch);
+
+            frame.cosineYaw =
+                    Math.cos(yaw);
+
+            frame.sineYaw =
+                    Math.sin(yaw);
+
+            frame.cosinePitch =
+                    Math.cos(pitch);
+
+            frame.sinePitch =
+                    Math.sin(pitch);
+
             frame.absoluteCosineYaw =
-                    Math.abs(frame.cosineYaw);
+                    Math.abs(
+                            frame.cosineYaw
+                    );
+
             frame.absoluteSineYaw =
-                    Math.abs(frame.sineYaw);
+                    Math.abs(
+                            frame.sineYaw
+                    );
+
             frame.absoluteCosinePitch =
-                    Math.abs(frame.cosinePitch);
+                    Math.abs(
+                            frame.cosinePitch
+                    );
+
             frame.absoluteSinePitch =
-                    Math.abs(frame.sinePitch);
-            frame.cameraValuesCached = true;
+                    Math.abs(
+                            frame.sinePitch
+                    );
+
+            frame.cameraValuesCached =
+                    true;
         }
     }
 }

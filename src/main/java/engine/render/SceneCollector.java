@@ -168,7 +168,14 @@ public final class SceneCollector {
                     light.range = material.getEmissiveRange();
                     light.attLinear = 0.0;
                     light.attQuadratic = 1.0;
-                    light.shadows = true;
+                    /*
+                     * Aggressive: emissive materials do not cast shadows.
+                     * Point-light shadow maps (6 faces) are one of the
+                     * largest remaining CPU costs; disabling them here
+                     * yields large frame-time savings with only a modest
+                     * visual change for most scenes.
+                     */
+                    light.shadows = false;
                     light.owner = object;
                     frame.lights.add(light);
                 }

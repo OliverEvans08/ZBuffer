@@ -1,37 +1,61 @@
 package engine.render.raster;
 
-import engine.render.util.IntList;
 import java.util.Arrays;
 
 public final class TileGrid {
-    public IntList[] bins = new IntList[0];
+    public int[] triangleIndices = new int[0];
+    public int[] offsets = new int[1];
+    public int[] counts = new int[0];
+    public int[] writePositions = new int[0];
     public float[] depthMinimum = new float[0];
 
-    public void ensure(int requiredTiles) {
-        if (bins.length < requiredTiles) {
-            final IntList[] expanded =
-                    Arrays.copyOf(bins, requiredTiles);
-
-            for (
-                    int tile = bins.length;
-                    tile < requiredTiles;
-                    tile++
-            ) {
-                expanded[tile] = new IntList(64);
-            }
-
-            bins = expanded;
+    public void ensureTiles(int requiredTiles) {
+        if (counts.length >= requiredTiles) {
+            return;
         }
 
-        if (depthMinimum.length < requiredTiles) {
-            depthMinimum = new float[
-                    growCapacity(
-                            depthMinimum.length,
-                            requiredTiles,
-                            64
-                    )
-                    ];
+        final int capacity = growCapacity(
+                counts.length,
+                requiredTiles,
+                64
+        );
+
+        counts = Arrays.copyOf(
+                counts,
+                capacity
+        );
+
+        writePositions = Arrays.copyOf(
+                writePositions,
+                capacity
+        );
+
+        depthMinimum = Arrays.copyOf(
+                depthMinimum,
+                capacity
+        );
+
+        offsets = Arrays.copyOf(
+                offsets,
+                capacity + 1
+        );
+    }
+
+    public void ensureTriangleReferences(
+            int requiredReferences
+    ) {
+        if (triangleIndices.length >= requiredReferences) {
+            return;
         }
+
+        triangleIndices = Arrays.copyOf(
+                triangleIndices,
+                growCapacity(
+                        triangleIndices.length,
+                        requiredReferences,
+                        1_024
+                )
+        );
     }
 
     private static int growCapacity(
@@ -39,12 +63,16 @@ public final class TileGrid {
             int required,
             int minimum
     ) {
-        int capacity = Math.max(minimum, current);
+        int capacity = Math.max(
+                minimum,
+                current
+        );
 
         while (capacity < required) {
             if (capacity > Integer.MAX_VALUE / 2) {
                 return required;
             }
+
             capacity <<= 1;
         }
 
