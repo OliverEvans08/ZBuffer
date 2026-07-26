@@ -35,107 +35,32 @@ public final class TriangleRasterizer {
             float tileDepthFloor,
             LightingCalculator lightingCalculator
     ) {
-        final long x0 =
-                Math.round(
-                        triangles.x0[triangle] *
-                                RenderSettings.SUBPIXEL_SCALE
-                );
-
-        final long y0 =
-                Math.round(
-                        triangles.y0[triangle] *
-                                RenderSettings.SUBPIXEL_SCALE
-                );
-
-        final float inverseZ0 =
-                triangles.inverseZ0[triangle];
-
-        final float uOverZ0 =
-                triangles.uOverZ0[triangle];
-
-        final float vOverZ0 =
-                triangles.vOverZ0[triangle];
-
-        final long x1 =
-                Math.round(
-                        triangles.x1[triangle] *
-                                RenderSettings.SUBPIXEL_SCALE
-                );
-
-        final long y1 =
-                Math.round(
-                        triangles.y1[triangle] *
-                                RenderSettings.SUBPIXEL_SCALE
-                );
-
-        final float inverseZ1 =
-                triangles.inverseZ1[triangle];
-
-        final float uOverZ1 =
-                triangles.uOverZ1[triangle];
-
-        final float vOverZ1 =
-                triangles.vOverZ1[triangle];
-
-        final long x2 =
-                Math.round(
-                        triangles.x2[triangle] *
-                                RenderSettings.SUBPIXEL_SCALE
-                );
-
-        final long y2 =
-                Math.round(
-                        triangles.y2[triangle] *
-                                RenderSettings.SUBPIXEL_SCALE
-                );
-
-        final float inverseZ2 =
-                triangles.inverseZ2[triangle];
-
-        final float uOverZ2 =
-                triangles.uOverZ2[triangle];
-
-        final float vOverZ2 =
-                triangles.vOverZ2[triangle];
-
         final long edge0A =
-                y1 - y2;
+                triangles.edge0A[triangle];
 
         final long edge0B =
-                x2 - x1;
+                triangles.edge0B[triangle];
 
         final long edge0C =
-                x1 * y2 -
-                        y1 * x2;
+                triangles.edge0C[triangle];
 
         final long edge1A =
-                y2 - y0;
+                triangles.edge1A[triangle];
 
         final long edge1B =
-                x0 - x2;
+                triangles.edge1B[triangle];
 
         final long edge1C =
-                x2 * y0 -
-                        y2 * x0;
+                triangles.edge1C[triangle];
 
         final long edge2A =
-                y0 - y1;
+                triangles.edge2A[triangle];
 
         final long edge2B =
-                x1 - x0;
+                triangles.edge2B[triangle];
 
         final long edge2C =
-                x0 * y1 -
-                        y0 * x1;
-
-        final long signedArea =
-                edge0A * x0 +
-                        edge0B * y0 +
-                        edge0C;
-
-        if (signedArea <= 0L) {
-            return tileDepthFloor;
-        }
+                triangles.edge2C[triangle];
 
         final int minimumX =
                 Math.max(
@@ -318,10 +243,6 @@ public final class TriangleRasterizer {
                                 edge2StepY * spanY >=
                                 0L;
 
-        final double inverseArea =
-                1.0 /
-                        signedArea;
-
         final MaterialState material =
                 triangles.materials[triangle];
 
@@ -353,8 +274,20 @@ public final class TriangleRasterizer {
                 triangles.doubleSided[triangle] != 0;
 
         final boolean perPixelLighting =
-                lightingCalculator
-                        .isPerPixelLightingRequired();
+                triangles.lightMasks[triangle] !=
+                        0;
+
+        final int lightMask =
+                triangles.lightMasks[triangle];
+
+        final float baseLightRed =
+                triangles.baseLightRed[triangle];
+
+        final float baseLightGreen =
+                triangles.baseLightGreen[triangle];
+
+        final float baseLightBlue =
+                triangles.baseLightBlue[triangle];
 
         final int triangleShade =
                 triangles.shades[triangle];
@@ -405,28 +338,17 @@ public final class TriangleRasterizer {
         }
 
         double inverseZRow =
-                (
-                        rawEdge0Row * inverseZ0 +
-                                rawEdge1Row * inverseZ1 +
-                                rawEdge2Row * inverseZ2
-                ) *
-                        inverseArea;
+                triangles.inverseZOrigin[triangle] +
+                        triangles.inverseZStepX[triangle] *
+                                minimumX +
+                        triangles.inverseZStepY[triangle] *
+                                minimumY;
 
         final double inverseZStepX =
-                (
-                        edge0StepX * inverseZ0 +
-                                edge1StepX * inverseZ1 +
-                                edge2StepX * inverseZ2
-                ) *
-                        inverseArea;
+                triangles.inverseZStepX[triangle];
 
         final double inverseZStepY =
-                (
-                        edge0StepY * inverseZ0 +
-                                edge1StepY * inverseZ1 +
-                                edge2StepY * inverseZ2
-                ) *
-                        inverseArea;
+                triangles.inverseZStepY[triangle];
 
         final double tileCornerInverseZ =
                 inverseZRow;
@@ -472,75 +394,181 @@ public final class TriangleRasterizer {
                 final int rowIndex =
                         y * width;
 
-                for (
-                        int x = minimumX;
-                        x <= maximumX;
-                        x++
-                ) {
-                    if (
+                int x =
+                        minimumX;
+
+                while (x <= maximumX) {
+                    final int blockEnd =
+                            Math.min(
+                                    maximumX,
+                                    x +
+                                            PERSPECTIVE_BLOCK_SIZE -
+                                            1
+                            );
+
+                    final int blockSpan =
+                            blockEnd -
+                                    x;
+
+                    final long endEdge0 =
+                            edge0 +
+                                    edge0StepX *
+                                            blockSpan;
+
+                    final long endEdge1 =
+                            edge1 +
+                                    edge1StepX *
+                                            blockSpan;
+
+                    final long endEdge2 =
+                            edge2 +
+                                    edge2StepX *
+                                            blockSpan;
+
+                    final double endInverseZ =
+                            inverseZValue +
+                                    inverseZStepX *
+                                            blockSpan;
+
+                    final boolean outside =
                             (
-                                    edge0 |
-                                            edge1 |
-                                            edge2
-                            ) >= 0L
+                                    edge0 < 0L &&
+                                            endEdge0 < 0L
+                            ) ||
+                                    (
+                                            edge1 < 0L &&
+                                                    endEdge1 < 0L
+                                    ) ||
+                                    (
+                                            edge2 < 0L &&
+                                                    endEdge2 < 0L
+                                    );
+
+                    final boolean depthRejected =
+                            Math.max(
+                                    inverseZValue,
+                                    endInverseZ
+                            ) <=
+                                    tileDepthFloor;
+
+                    if (
+                            outside ||
+                                    depthRejected
                     ) {
-                        final int index =
-                                rowIndex + x;
+                        final int advance =
+                                blockSpan +
+                                        1;
 
-                        final float inverseZ =
-                                (float) inverseZValue;
+                        edge0 +=
+                                edge0StepX *
+                                        advance;
 
-                        if (
-                                inverseZ >
-                                        frameDepth[index]
-                        ) {
-                            final int color;
+                        edge1 +=
+                                edge1StepX *
+                                        advance;
 
-                            if (perPixelLighting) {
-                                final int shade =
-                                        lightingCalculator
-                                                .calculatePackedAtPixel(
-                                                        worldNormalX,
-                                                        worldNormalY,
-                                                        worldNormalZ,
-                                                        x + 0.5,
-                                                        y + 0.5,
-                                                        inverseZValue,
-                                                        doubleSided,
-                                                        material.ambient,
-                                                        material.diffuse
-                                                );
+                        edge2 +=
+                                edge2StepX *
+                                        advance;
 
-                                color =
-                                        shadeSolid(
-                                                tint,
-                                                shade,
-                                                emissive
-                                        );
-                            } else {
-                                color =
-                                        constantColor;
-                            }
+                        inverseZValue +=
+                                inverseZStepX *
+                                        advance;
 
-                            frameDepth[index] =
-                                    inverseZ;
+                        x =
+                                blockEnd +
+                                        1;
 
-                            framePixels[index] =
-                                    color;
-                        }
+                        continue;
                     }
 
-                    edge0 +=
-                            edge0StepX;
+                    final boolean blockInside =
+                            fullyCoversTile ||
+                                    (
+                                            edge0 |
+                                                    edge1 |
+                                                    edge2 |
+                                                    endEdge0 |
+                                                    endEdge1 |
+                                                    endEdge2
+                                    ) >=
+                                            0L;
 
-                    edge1 +=
-                            edge1StepX;
+                    for (
+                            ;
+                            x <= blockEnd;
+                            x++
+                    ) {
+                        if (
+                                blockInside ||
+                                        (
+                                                edge0 |
+                                                        edge1 |
+                                                        edge2
+                                        ) >= 0L
+                        ) {
+                            final int index =
+                                    rowIndex + x;
 
-                    edge2 +=
-                            edge2StepX;
+                            final float inverseZ =
+                                    (float) inverseZValue;
 
-                    inverseZValue +=
-                            inverseZStepX;
+                            if (
+                                    inverseZ >
+                                            frameDepth[index]
+                            ) {
+                                final int color;
+
+                                if (perPixelLighting) {
+                                    final int shade =
+                                            lightingCalculator
+                                                    .calculatePackedAtPixel(
+                                                            worldNormalX,
+                                                            worldNormalY,
+                                                            worldNormalZ,
+                                                            x + 0.5,
+                                                            y + 0.5,
+                                                            inverseZValue,
+                                                            doubleSided,
+                                                            material.ambient,
+                                                            material.diffuse,
+                                                            lightMask,
+                                                            baseLightRed,
+                                                            baseLightGreen,
+                                                            baseLightBlue
+                                                    );
+
+                                    color =
+                                            shadeSolid(
+                                                    tint,
+                                                    shade,
+                                                    emissive
+                                            );
+                                } else {
+                                    color =
+                                            constantColor;
+                                }
+
+                                frameDepth[index] =
+                                        inverseZ;
+
+                                framePixels[index] =
+                                        color;
+                            }
+                        }
+
+                        edge0 +=
+                                edge0StepX;
+
+                        edge1 +=
+                                edge1StepX;
+
+                        edge2 +=
+                                edge2StepX;
+
+                        inverseZValue +=
+                                inverseZStepX;
+                    }
                 }
 
                 edge0Row +=
@@ -571,52 +599,30 @@ public final class TriangleRasterizer {
          * Textured path.
          */
         double uOverZRow =
-                (
-                        rawEdge0Row * uOverZ0 +
-                                rawEdge1Row * uOverZ1 +
-                                rawEdge2Row * uOverZ2
-                ) *
-                        inverseArea;
+                triangles.uOverZOrigin[triangle] +
+                        triangles.uOverZStepX[triangle] *
+                                minimumX +
+                        triangles.uOverZStepY[triangle] *
+                                minimumY;
 
         double vOverZRow =
-                (
-                        rawEdge0Row * vOverZ0 +
-                                rawEdge1Row * vOverZ1 +
-                                rawEdge2Row * vOverZ2
-                ) *
-                        inverseArea;
+                triangles.vOverZOrigin[triangle] +
+                        triangles.vOverZStepX[triangle] *
+                                minimumX +
+                        triangles.vOverZStepY[triangle] *
+                                minimumY;
 
         final double uOverZStepX =
-                (
-                        edge0StepX * uOverZ0 +
-                                edge1StepX * uOverZ1 +
-                                edge2StepX * uOverZ2
-                ) *
-                        inverseArea;
+                triangles.uOverZStepX[triangle];
 
         final double vOverZStepX =
-                (
-                        edge0StepX * vOverZ0 +
-                                edge1StepX * vOverZ1 +
-                                edge2StepX * vOverZ2
-                ) *
-                        inverseArea;
+                triangles.vOverZStepX[triangle];
 
         final double uOverZStepY =
-                (
-                        edge0StepY * uOverZ0 +
-                                edge1StepY * uOverZ1 +
-                                edge2StepY * uOverZ2
-                ) *
-                        inverseArea;
+                triangles.uOverZStepY[triangle];
 
         final double vOverZStepY =
-                (
-                        edge0StepY * vOverZ0 +
-                                edge1StepY * vOverZ1 +
-                                edge2StepY * vOverZ2
-                ) *
-                        inverseArea;
+                triangles.vOverZStepY[triangle];
 
         final int emissiveRed =
                 emissive >>> 16 &
@@ -709,6 +715,98 @@ public final class TriangleRasterizer {
                 final int blockSpan =
                         blockEnd - x;
 
+                final long endEdge0 =
+                        edge0 +
+                                edge0StepX *
+                                        blockSpan;
+
+                final long endEdge1 =
+                        edge1 +
+                                edge1StepX *
+                                        blockSpan;
+
+                final long endEdge2 =
+                        edge2 +
+                                edge2StepX *
+                                        blockSpan;
+
+                final double endInverseZ =
+                        inverseZValue +
+                                inverseZStepX *
+                                        blockSpan;
+
+                final boolean outside =
+                        (
+                                edge0 < 0L &&
+                                        endEdge0 < 0L
+                        ) ||
+                                (
+                                        edge1 < 0L &&
+                                                endEdge1 < 0L
+                                ) ||
+                                (
+                                        edge2 < 0L &&
+                                                endEdge2 < 0L
+                                );
+
+                final boolean depthRejected =
+                        Math.max(
+                                inverseZValue,
+                                endInverseZ
+                        ) <=
+                                tileDepthFloor;
+
+                if (
+                        outside ||
+                                depthRejected
+                ) {
+                    final int advance =
+                            blockSpan +
+                                    1;
+
+                    edge0 +=
+                            edge0StepX *
+                                    advance;
+
+                    edge1 +=
+                            edge1StepX *
+                                    advance;
+
+                    edge2 +=
+                            edge2StepX *
+                                    advance;
+
+                    inverseZValue +=
+                            inverseZStepX *
+                                    advance;
+
+                    uOverZValue +=
+                            uOverZStepX *
+                                    advance;
+
+                    vOverZValue +=
+                            vOverZStepX *
+                                    advance;
+
+                    x =
+                            blockEnd +
+                                    1;
+
+                    continue;
+                }
+
+                final boolean blockInside =
+                        fullyCoversTile ||
+                                (
+                                        edge0 |
+                                                edge1 |
+                                                edge2 |
+                                                endEdge0 |
+                                                endEdge1 |
+                                                endEdge2
+                                ) >=
+                                        0L;
+
                 /*
                  * Exact perspective correction at the start of the block.
                  */
@@ -737,11 +835,6 @@ public final class TriangleRasterizer {
                     /*
                      * Exact perspective correction at the end of the block.
                      */
-                    final double endInverseZ =
-                            inverseZValue +
-                                    inverseZStepX *
-                                            blockSpan;
-
                     final double reciprocalEnd =
                             1.0 /
                                     endInverseZ;
@@ -787,11 +880,12 @@ public final class TriangleRasterizer {
                         x++
                 ) {
                     if (
-                            (
-                                    edge0 |
-                                            edge1 |
-                                            edge2
-                            ) >= 0L
+                            blockInside ||
+                                    (
+                                            edge0 |
+                                                    edge1 |
+                                                    edge2
+                                    ) >= 0L
                     ) {
                         final int index =
                                 rowIndex + x;
@@ -819,7 +913,11 @@ public final class TriangleRasterizer {
                                                         inverseZValue,
                                                         doubleSided,
                                                         material.ambient,
-                                                        material.diffuse
+                                                        material.diffuse,
+                                                        lightMask,
+                                                        baseLightRed,
+                                                        baseLightGreen,
+                                                        baseLightBlue
                                                 );
 
                                 final int modulation =

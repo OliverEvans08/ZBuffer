@@ -1084,10 +1084,25 @@ public final class RenderMeshCompiler {
         int shadeGreen = 255;
         int shadeBlue = 255;
 
+        int lightMask =
+                0;
+
+        float baseLightRed =
+                0.0f;
+
+        float baseLightGreen =
+                0.0f;
+
+        float baseLightBlue =
+                0.0f;
+
+        final boolean frameRequiresPerPixelLighting =
+                lightingCalculator
+                        .isPerPixelLightingRequired();
+
         if (
                 wireframe ||
-                        !lightingCalculator
-                                .isPerPixelLightingRequired()
+                        !frameRequiresPerPixelLighting
         ) {
             final double centerX =
                     (point0X + point1X + point2X) /
@@ -1139,6 +1154,136 @@ public final class RenderMeshCompiler {
                                                     lighting[2]
                             )
                     );
+        } else {
+            final double[] invariantLighting =
+                    lightingCalculator
+                            .calculateInvariantLighting(
+                                    context,
+                                    normalX,
+                                    normalY,
+                                    normalZ,
+                                    doubleSided
+                            );
+
+            baseLightRed =
+                    (float) invariantLighting[0];
+
+            baseLightGreen =
+                    (float) invariantLighting[1];
+
+            baseLightBlue =
+                    (float) invariantLighting[2];
+
+            double minimumX =
+                    point0X;
+
+            double maximumX =
+                    point0X;
+
+            if (point1X < minimumX) {
+                minimumX =
+                        point1X;
+            } else if (point1X > maximumX) {
+                maximumX =
+                        point1X;
+            }
+
+            if (point2X < minimumX) {
+                minimumX =
+                        point2X;
+            } else if (point2X > maximumX) {
+                maximumX =
+                        point2X;
+            }
+
+            double minimumY =
+                    point0Y;
+
+            double maximumY =
+                    point0Y;
+
+            if (point1Y < minimumY) {
+                minimumY =
+                        point1Y;
+            } else if (point1Y > maximumY) {
+                maximumY =
+                        point1Y;
+            }
+
+            if (point2Y < minimumY) {
+                minimumY =
+                        point2Y;
+            } else if (point2Y > maximumY) {
+                maximumY =
+                        point2Y;
+            }
+
+            double minimumZ =
+                    point0Z;
+
+            double maximumZ =
+                    point0Z;
+
+            if (point1Z < minimumZ) {
+                minimumZ =
+                        point1Z;
+            } else if (point1Z > maximumZ) {
+                maximumZ =
+                        point1Z;
+            }
+
+            if (point2Z < minimumZ) {
+                minimumZ =
+                        point2Z;
+            } else if (point2Z > maximumZ) {
+                maximumZ =
+                        point2Z;
+            }
+
+            lightMask =
+                    lightingCalculator
+                            .buildDynamicLightMask(
+                                    minimumX,
+                                    minimumY,
+                                    minimumZ,
+                                    maximumX,
+                                    maximumY,
+                                    maximumZ
+                            );
+
+            /*
+             * A frame may contain local lights while this triangle intersects
+             * none of them. Finalise its invariant shade now so rasterisation
+             * takes the constant-lighting path.
+             */
+            if (lightMask == 0) {
+                shadeRed =
+                        to255(
+                                clamp01(
+                                        material.ambient +
+                                                material.diffuse *
+                                                        baseLightRed
+                                )
+                        );
+
+                shadeGreen =
+                        to255(
+                                clamp01(
+                                        material.ambient +
+                                                material.diffuse *
+                                                        baseLightGreen
+                                )
+                        );
+
+                shadeBlue =
+                        to255(
+                                clamp01(
+                                        material.ambient +
+                                                material.diffuse *
+                                                        baseLightBlue
+                                )
+                        );
+            }
         }
 
         final double clipDistance =
@@ -1164,6 +1309,10 @@ public final class RenderMeshCompiler {
                     shadeRed,
                     shadeGreen,
                     shadeBlue,
+                    lightMask,
+                    baseLightRed,
+                    baseLightGreen,
+                    baseLightBlue,
                     doubleSided,
                     wireframe
             );
@@ -1251,6 +1400,10 @@ public final class RenderMeshCompiler {
                 shadeRed,
                 shadeGreen,
                 shadeBlue,
+                lightMask,
+                baseLightRed,
+                baseLightGreen,
+                baseLightBlue,
                 doubleSided,
                 wireframe
         );
@@ -1283,6 +1436,10 @@ public final class RenderMeshCompiler {
                     shadeRed,
                     shadeGreen,
                     shadeBlue,
+                    lightMask,
+                    baseLightRed,
+                    baseLightGreen,
+                    baseLightBlue,
                     doubleSided,
                     wireframe
             );

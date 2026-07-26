@@ -8,7 +8,6 @@ import engine.render.util.RenderWorkerContext;
 public final class LightingCalculator {
     private static final int MAX_PIXEL_LIGHTS = 8;
 
-    private static final byte TYPE_DISABLED = 0;
     private static final byte TYPE_DIRECTIONAL = 1;
     private static final byte TYPE_POINT = 2;
     private static final byte TYPE_SPOT = 3;
@@ -32,73 +31,100 @@ public final class LightingCalculator {
     private final ShadowCalculator shadowCalculator;
 
     /*
-     * Hot light data is flattened once per frame.
-     *
-     * This avoids:
-     * - LightData object dereferences for every pixel.
-     * - Enum loads and enum comparisons for every light and pixel.
-     * - Recalculating range squared.
-     * - Recalculating spotlight cone reciprocal.
-     * - Repeatedly negating directional vectors.
+     * Unshadowed directional lights are invariant across a flat triangle.
+     * They are accumulated once during triangle construction rather than once
+     * for every covered pixel.
      */
-    private final byte[] preparedTypes =
+    private final double[] invariantDirectionX =
+            new double[MAX_PIXEL_LIGHTS];
+
+    private final double[] invariantDirectionY =
+            new double[MAX_PIXEL_LIGHTS];
+
+    private final double[] invariantDirectionZ =
+            new double[MAX_PIXEL_LIGHTS];
+
+    private final double[] invariantStrength =
+            new double[MAX_PIXEL_LIGHTS];
+
+    private final float[] invariantRed =
+            new float[MAX_PIXEL_LIGHTS];
+
+    private final float[] invariantGreen =
+            new float[MAX_PIXEL_LIGHTS];
+
+    private final float[] invariantBlue =
+            new float[MAX_PIXEL_LIGHTS];
+
+    private int invariantLightCount;
+
+    /*
+     * Only position-dependent lights remain in the per-pixel arrays:
+     * point lights, spot lights and directional lights with a real shadow map.
+     * Entries are compact, so the hot loop never visits disabled slots.
+     */
+    private final byte[] dynamicTypes =
             new byte[MAX_PIXEL_LIGHTS];
 
-    private final int[] sourceLightIndices =
-            new int[MAX_PIXEL_LIGHTS];
-
-    private final double[] preparedX =
+    private final double[] dynamicX =
             new double[MAX_PIXEL_LIGHTS];
 
-    private final double[] preparedY =
+    private final double[] dynamicY =
             new double[MAX_PIXEL_LIGHTS];
 
-    private final double[] preparedZ =
+    private final double[] dynamicZ =
             new double[MAX_PIXEL_LIGHTS];
 
-    private final double[] preparedDirectionX =
+    private final double[] dynamicDirectionX =
             new double[MAX_PIXEL_LIGHTS];
 
-    private final double[] preparedDirectionY =
+    private final double[] dynamicDirectionY =
             new double[MAX_PIXEL_LIGHTS];
 
-    private final double[] preparedDirectionZ =
+    private final double[] dynamicDirectionZ =
             new double[MAX_PIXEL_LIGHTS];
 
-    private final double[] preparedStrength =
+    private final double[] dynamicStrength =
             new double[MAX_PIXEL_LIGHTS];
 
-    private final double[] preparedRange =
+    private final double[] dynamicRange =
             new double[MAX_PIXEL_LIGHTS];
 
-    private final double[] preparedRangeSquared =
+    private final double[] dynamicInverseRange =
             new double[MAX_PIXEL_LIGHTS];
 
-    private final double[] preparedLinear =
+    private final double[] dynamicRangeSquared =
             new double[MAX_PIXEL_LIGHTS];
 
-    private final double[] preparedQuadratic =
+    private final double[] dynamicLinear =
             new double[MAX_PIXEL_LIGHTS];
 
-    private final double[] preparedInnerCos =
+    private final double[] dynamicQuadratic =
             new double[MAX_PIXEL_LIGHTS];
 
-    private final double[] preparedOuterCos =
+    private final double[] dynamicInnerCos =
             new double[MAX_PIXEL_LIGHTS];
 
-    private final double[] preparedInverseConeWidth =
+    private final double[] dynamicOuterCos =
             new double[MAX_PIXEL_LIGHTS];
 
-    private final float[] preparedRed =
+    private final double[] dynamicInverseConeWidth =
+            new double[MAX_PIXEL_LIGHTS];
+
+    private final float[] dynamicRed =
             new float[MAX_PIXEL_LIGHTS];
 
-    private final float[] preparedGreen =
+    private final float[] dynamicGreen =
             new float[MAX_PIXEL_LIGHTS];
 
-    private final float[] preparedBlue =
+    private final float[] dynamicBlue =
             new float[MAX_PIXEL_LIGHTS];
 
-    private int preparedLightCount;
+    private final ShadowMap[] dynamicShadowMaps =
+            new ShadowMap[MAX_PIXEL_LIGHTS];
+
+    private int dynamicLightCount;
+    private int allDynamicLightsMask;
 
     private double cameraX;
     private double cameraY;
@@ -108,15 +134,10 @@ public final class LightingCalculator {
     private double halfHeight;
 
     /*
-     * Precomputed camera-ray transform.
-     *
      * A pixel position produces a world-space ray:
      *
      * world = camera + cameraSpaceZ *
      *         (constant + x * xCoefficient + y * yCoefficient)
-     *
-     * This replaces the full inverse-view matrix expression in every shaded
-     * pixel with three short affine expressions.
      */
     private double rayConstantX;
     private double rayConstantY;
@@ -187,12 +208,6 @@ public final class LightingCalculator {
                         ? 0.0
                         : 1.0 / projectionScale;
 
-        /*
-         * Expanded form of the existing inverse camera rotation.
-         *
-         * pixelOffsetX and pixelOffsetY are multiplied by cameraSpaceZ later,
-         * so all camera-constant coefficients are prepared once here.
-         */
         rayXCoefficientX =
                 cosineYaw *
                         inverseProjectionScale;
@@ -234,158 +249,348 @@ public final class LightingCalculator {
     }
 
     private void prepareLights() {
-        preparedLightCount =
+        invariantLightCount =
+                0;
+
+        dynamicLightCount =
+                0;
+
+        final LightData[] lights =
+                frame.lightArray;
+
+        final int sourceCount =
                 Math.min(
                         frame.lightCount,
                         MAX_PIXEL_LIGHTS
                 );
 
-        perPixelLightingRequired =
-                false;
-
-        final LightData[] lights =
-                frame.lightArray;
-
         for (
-                int index = 0;
-                index < preparedLightCount;
-                index++
+                int sourceIndex = 0;
+                sourceIndex < sourceCount;
+                sourceIndex++
         ) {
             final LightData light =
-                    lights[index];
-
-            sourceLightIndices[index] =
-                    index;
+                    lights[sourceIndex];
 
             if (
                     light == null ||
                             light.strength <= 0.0
             ) {
-                preparedTypes[index] =
-                        TYPE_DISABLED;
-
                 continue;
             }
 
-            preparedX[index] =
-                    light.x;
+            final ShadowMap shadowMap =
+                    light.shadows
+                            ? shadowCalculator
+                            .getShadowMap(
+                                    sourceIndex
+                            )
+                            : null;
 
-            preparedY[index] =
-                    light.y;
+            if (
+                    light.type ==
+                            LightType.DIRECTIONAL &&
+                            shadowMap == null
+            ) {
+                final int index =
+                        invariantLightCount++;
 
-            preparedZ[index] =
-                    light.z;
-
-            preparedStrength[index] =
-                    light.strength;
-
-            preparedRed[index] =
-                    (float) light.r;
-
-            preparedGreen[index] =
-                    (float) light.g;
-
-            preparedBlue[index] =
-                    (float) light.b;
-
-            if (light.type == LightType.DIRECTIONAL) {
-                preparedTypes[index] =
-                        TYPE_DIRECTIONAL;
-
-                /*
-                 * Direction from the shaded point towards the light.
-                 */
-                preparedDirectionX[index] =
+                invariantDirectionX[index] =
                         -light.dx;
 
-                preparedDirectionY[index] =
+                invariantDirectionY[index] =
                         -light.dy;
 
-                preparedDirectionZ[index] =
+                invariantDirectionZ[index] =
                         -light.dz;
 
-                if (light.shadows) {
-                    perPixelLightingRequired =
-                            true;
-                }
+                invariantStrength[index] =
+                        light.strength;
+
+                invariantRed[index] =
+                        (float) light.r;
+
+                invariantGreen[index] =
+                        (float) light.g;
+
+                invariantBlue[index] =
+                        (float) light.b;
 
                 continue;
             }
 
-            perPixelLightingRequired =
-                    true;
+            final int index =
+                    dynamicLightCount++;
+
+            dynamicX[index] =
+                    light.x;
+
+            dynamicY[index] =
+                    light.y;
+
+            dynamicZ[index] =
+                    light.z;
+
+            dynamicStrength[index] =
+                    light.strength;
+
+            dynamicRed[index] =
+                    (float) light.r;
+
+            dynamicGreen[index] =
+                    (float) light.g;
+
+            dynamicBlue[index] =
+                    (float) light.b;
+
+            dynamicShadowMaps[index] =
+                    shadowMap;
+
+            if (
+                    light.type ==
+                            LightType.DIRECTIONAL
+            ) {
+                dynamicTypes[index] =
+                        TYPE_DIRECTIONAL;
+
+                dynamicDirectionX[index] =
+                        -light.dx;
+
+                dynamicDirectionY[index] =
+                        -light.dy;
+
+                dynamicDirectionZ[index] =
+                        -light.dz;
+
+                continue;
+            }
 
             final double range =
-                    Math.max(
-                            0.0,
+                    Double.isFinite(
                             light.range
-                    );
+                    ) &&
+                            light.range >
+                                    0.0
+                            ? light.range
+                            : 0.0;
 
-            preparedRange[index] =
+            dynamicRange[index] =
                     range;
 
-            preparedRangeSquared[index] =
+            dynamicInverseRange[index] =
+                    range > 0.0
+                            ? 1.0 / range
+                            : 0.0;
+
+            dynamicRangeSquared[index] =
                     range * range;
 
-            preparedLinear[index] =
+            dynamicLinear[index] =
                     light.attLinear;
 
-            preparedQuadratic[index] =
+            dynamicQuadratic[index] =
                     light.attQuadratic;
 
             if (light.type == LightType.SPOT) {
-                preparedTypes[index] =
+                dynamicTypes[index] =
                         TYPE_SPOT;
 
-                preparedDirectionX[index] =
+                dynamicDirectionX[index] =
                         light.dx;
 
-                preparedDirectionY[index] =
+                dynamicDirectionY[index] =
                         light.dy;
 
-                preparedDirectionZ[index] =
+                dynamicDirectionZ[index] =
                         light.dz;
 
-                preparedInnerCos[index] =
+                dynamicInnerCos[index] =
                         light.innerCos;
 
-                preparedOuterCos[index] =
+                dynamicOuterCos[index] =
                         light.outerCos;
 
                 final double coneWidth =
                         light.innerCos -
                                 light.outerCos;
 
-                preparedInverseConeWidth[index] =
-                        coneWidth > MINIMUM_DENOMINATOR
+                dynamicInverseConeWidth[index] =
+                        coneWidth >
+                                MINIMUM_DENOMINATOR
                                 ? 1.0 / coneWidth
                                 : 0.0;
             } else {
-                preparedTypes[index] =
+                dynamicTypes[index] =
                         TYPE_POINT;
             }
         }
 
-        /*
-         * Clear stale type entries if the number of lights shrank. Only type
-         * must be cleared because disabled entries never read the other arrays.
-         */
-        for (
-                int index = preparedLightCount;
-                index < MAX_PIXEL_LIGHTS;
-                index++
-        ) {
-            preparedTypes[index] =
-                    TYPE_DISABLED;
-        }
+        allDynamicLightsMask =
+                dynamicLightCount == 0
+                        ? 0
+                        : (1 << dynamicLightCount) - 1;
+
+        perPixelLightingRequired =
+                dynamicLightCount != 0;
     }
 
     /**
-     * Per-pixel lighting entry.
-     *
-     * The supplied normal is already transformed into world space once per
-     * triangle by TriangleRasterizer.
+     * Returns the dynamic lights whose ranges intersect a triangle's
+     * world-space AABB. Directional and unlimited-range lights are always
+     * retained. The test is conservative, so it cannot cull a contributing
+     * light.
      */
+    public int buildDynamicLightMask(
+            double minimumX,
+            double minimumY,
+            double minimumZ,
+            double maximumX,
+            double maximumY,
+            double maximumZ
+    ) {
+        int mask =
+                0;
+
+        for (
+                int index = 0;
+                index < dynamicLightCount;
+                index++
+        ) {
+            if (
+                    dynamicTypes[index] ==
+                            TYPE_DIRECTIONAL ||
+                            dynamicRange[index] <= 0.0
+            ) {
+                mask |=
+                        1 << index;
+
+                continue;
+            }
+
+            final double lightX =
+                    dynamicX[index];
+
+            final double lightY =
+                    dynamicY[index];
+
+            final double lightZ =
+                    dynamicZ[index];
+
+            final double deltaX =
+                    lightX < minimumX
+                            ? minimumX - lightX
+                            : lightX > maximumX
+                            ? lightX - maximumX
+                            : 0.0;
+
+            final double deltaY =
+                    lightY < minimumY
+                            ? minimumY - lightY
+                            : lightY > maximumY
+                            ? lightY - maximumY
+                            : 0.0;
+
+            final double deltaZ =
+                    lightZ < minimumZ
+                            ? minimumZ - lightZ
+                            : lightZ > maximumZ
+                            ? lightZ - maximumZ
+                            : 0.0;
+
+            if (
+                    deltaX * deltaX +
+                            deltaY * deltaY +
+                            deltaZ * deltaZ <=
+                            dynamicRangeSquared[index]
+            ) {
+                mask |=
+                        1 << index;
+            }
+        }
+
+        return mask;
+    }
+
+    /**
+     * Accumulates the unshadowed directional-light contribution once per
+     * triangle. The returned array belongs to the worker context.
+     */
+    public double[] calculateInvariantLighting(
+            RenderWorkerContext context,
+            double normalX,
+            double normalY,
+            double normalZ,
+            boolean doubleSided
+    ) {
+        float red =
+                0.0f;
+
+        float green =
+                0.0f;
+
+        float blue =
+                0.0f;
+
+        for (
+                int index = 0;
+                index < invariantLightCount;
+                index++
+        ) {
+            double normalDotLight =
+                    normalX *
+                            invariantDirectionX[index] +
+                            normalY *
+                                    invariantDirectionY[index] +
+                            normalZ *
+                                    invariantDirectionZ[index];
+
+            if (
+                    doubleSided &&
+                            normalDotLight < 0.0
+            ) {
+                normalDotLight =
+                        -normalDotLight;
+            }
+
+            if (normalDotLight <= 0.0) {
+                continue;
+            }
+
+            final double contribution =
+                    normalDotLight *
+                            invariantStrength[index];
+
+            red +=
+                    (float) (
+                            contribution *
+                                    invariantRed[index]
+                    );
+
+            green +=
+                    (float) (
+                            contribution *
+                                    invariantGreen[index]
+                    );
+
+            blue +=
+                    (float) (
+                            contribution *
+                                    invariantBlue[index]
+                    );
+        }
+
+        context.lighting[0] =
+                red;
+
+        context.lighting[1] =
+                green;
+
+        context.lighting[2] =
+                blue;
+
+        return context.lighting;
+    }
+
     public int calculatePackedAtPixel(
             double worldNormalX,
             double worldNormalY,
@@ -395,14 +600,27 @@ public final class LightingCalculator {
             double inverseZ,
             boolean doubleSided,
             double ambient,
-            double diffuse
+            double diffuse,
+            int lightMask,
+            float baseRed,
+            float baseGreen,
+            float baseBlue
     ) {
+        final int effectiveMask =
+                lightMask &
+                        allDynamicLightsMask;
+
         if (
-                inverseZ <= 0.0 ||
+                effectiveMask == 0 ||
+                        inverseZ <= 0.0 ||
                         !Double.isFinite(inverseZ)
         ) {
-            return packGray(
-                    ambient
+            return packLighting(
+                    baseRed,
+                    baseGreen,
+                    baseBlue,
+                    ambient,
+                    diffuse
             );
         }
 
@@ -417,10 +635,6 @@ public final class LightingCalculator {
                 pixelY -
                         halfHeight;
 
-        /*
-         * The original inverse view transform has been algebraically factored
-         * into these affine ray expressions.
-         */
         final double rayX =
                 rayConstantX +
                         pixelOffsetX *
@@ -455,7 +669,7 @@ public final class LightingCalculator {
                         rayZ *
                                 cameraSpaceZ;
 
-        return calculatePackedAtWorld(
+        return calculateDynamicPackedAtWorld(
                 worldNormalX,
                 worldNormalY,
                 worldNormalZ,
@@ -464,7 +678,11 @@ public final class LightingCalculator {
                 worldZ,
                 doubleSided,
                 ambient,
-                diffuse
+                diffuse,
+                effectiveMask,
+                baseRed,
+                baseGreen,
+                baseBlue
         );
     }
 
@@ -538,20 +756,120 @@ public final class LightingCalculator {
         float blue =
                 0.0f;
 
-        final int lightCount =
-                preparedLightCount;
-
         for (
-                int preparedIndex = 0;
-                preparedIndex < lightCount;
-                preparedIndex++
+                int index = 0;
+                index < invariantLightCount;
+                index++
         ) {
-            final byte type =
-                    preparedTypes[preparedIndex];
+            double normalDotLight =
+                    normalX *
+                            invariantDirectionX[index] +
+                            normalY *
+                                    invariantDirectionY[index] +
+                            normalZ *
+                                    invariantDirectionZ[index];
 
-            if (type == TYPE_DISABLED) {
+            if (
+                    doubleSided &&
+                            normalDotLight < 0.0
+            ) {
+                normalDotLight =
+                        -normalDotLight;
+            }
+
+            if (normalDotLight <= 0.0) {
                 continue;
             }
+
+            final double contribution =
+                    normalDotLight *
+                            invariantStrength[index];
+
+            red +=
+                    (float) (
+                            contribution *
+                                    invariantRed[index]
+                    );
+
+            green +=
+                    (float) (
+                            contribution *
+                                    invariantGreen[index]
+                    );
+
+            blue +=
+                    (float) (
+                            contribution *
+                                    invariantBlue[index]
+                    );
+        }
+
+        if (allDynamicLightsMask == 0) {
+            return packLighting(
+                    red,
+                    green,
+                    blue,
+                    ambient,
+                    diffuse
+            );
+        }
+
+        return calculateDynamicPackedAtWorld(
+                normalX,
+                normalY,
+                normalZ,
+                worldX,
+                worldY,
+                worldZ,
+                doubleSided,
+                ambient,
+                diffuse,
+                allDynamicLightsMask,
+                red,
+                green,
+                blue
+        );
+    }
+
+    private int calculateDynamicPackedAtWorld(
+            double normalX,
+            double normalY,
+            double normalZ,
+            double worldX,
+            double worldY,
+            double worldZ,
+            boolean doubleSided,
+            double ambient,
+            double diffuse,
+            int lightMask,
+            float baseRed,
+            float baseGreen,
+            float baseBlue
+    ) {
+        float red =
+                baseRed;
+
+        float green =
+                baseGreen;
+
+        float blue =
+                baseBlue;
+
+        int remainingLights =
+                lightMask;
+
+        while (remainingLights != 0) {
+            final int index =
+                    Integer.numberOfTrailingZeros(
+                            remainingLights
+                    );
+
+            remainingLights &=
+                    remainingLights -
+                            1;
+
+            final byte type =
+                    dynamicTypes[index];
 
             double lightX;
             double lightY;
@@ -562,27 +880,27 @@ public final class LightingCalculator {
 
             if (type == TYPE_DIRECTIONAL) {
                 lightX =
-                        preparedDirectionX[preparedIndex];
+                        dynamicDirectionX[index];
 
                 lightY =
-                        preparedDirectionY[preparedIndex];
+                        dynamicDirectionY[index];
 
                 lightZ =
-                        preparedDirectionZ[preparedIndex];
+                        dynamicDirectionZ[index];
 
                 attenuation =
-                        preparedStrength[preparedIndex];
+                        dynamicStrength[index];
             } else {
                 final double toLightX =
-                        preparedX[preparedIndex] -
+                        dynamicX[index] -
                                 worldX;
 
                 final double toLightY =
-                        preparedY[preparedIndex] -
+                        dynamicY[index] -
                                 worldY;
 
                 final double toLightZ =
-                        preparedZ[preparedIndex] -
+                        dynamicZ[index] -
                                 worldZ;
 
                 final double distanceSquared =
@@ -598,26 +916,25 @@ public final class LightingCalculator {
                 }
 
                 final double range =
-                        preparedRange[preparedIndex];
+                        dynamicRange[index];
 
                 if (
                         range > 0.0 &&
                                 distanceSquared >
-                                        preparedRangeSquared[preparedIndex]
+                                        dynamicRangeSquared[index]
                 ) {
                     continue;
                 }
 
-                /*
-                 * Math.sqrt is intrinsified by HotSpot on supported targets.
-                 * Exactly one square root is retained and its reciprocal is
-                 * reused for normalisation, attenuation and range fade.
-                 */
                 final double inverseDistance =
                         1.0 /
                                 Math.sqrt(
                                         distanceSquared
                                 );
+
+                final double distance =
+                        distanceSquared *
+                                inverseDistance;
 
                 lightX =
                         toLightX *
@@ -634,27 +951,27 @@ public final class LightingCalculator {
                 if (type == TYPE_SPOT) {
                     final double cosineTheta =
                             -(
-                                    preparedDirectionX[preparedIndex] *
+                                    dynamicDirectionX[index] *
                                             lightX +
-                                            preparedDirectionY[preparedIndex] *
+                                            dynamicDirectionY[index] *
                                                     lightY +
-                                            preparedDirectionZ[preparedIndex] *
+                                            dynamicDirectionZ[index] *
                                                     lightZ
                             );
 
                     final double outerCos =
-                            preparedOuterCos[preparedIndex];
+                            dynamicOuterCos[index];
 
                     if (cosineTheta <= outerCos) {
                         continue;
                     }
 
                     final double innerCos =
-                            preparedInnerCos[preparedIndex];
+                            dynamicInnerCos[index];
 
                     if (cosineTheta < innerCos) {
                         final double inverseConeWidth =
-                                preparedInverseConeWidth[preparedIndex];
+                                dynamicInverseConeWidth[index];
 
                         double transition =
                                 inverseConeWidth == 0.0
@@ -685,24 +1002,12 @@ public final class LightingCalculator {
                     }
                 }
 
-                /*
-                 * Original:
-                 *
-                 * strength /
-                 * (1 + linear * distance + quadratic * distance²)
-                 *
-                 * Multiplying numerator and denominator by inverseDistance²
-                 * avoids computing distance separately.
-                 */
-                final double inverseDistanceSquared =
-                        inverseDistance *
-                                inverseDistance;
-
                 final double denominator =
-                        inverseDistanceSquared +
-                                preparedLinear[preparedIndex] *
-                                        inverseDistance +
-                                preparedQuadratic[preparedIndex];
+                        1.0 +
+                                dynamicLinear[index] *
+                                        distance +
+                                dynamicQuadratic[index] *
+                                        distanceSquared;
 
                 if (
                         denominator <=
@@ -712,21 +1017,14 @@ public final class LightingCalculator {
                 }
 
                 attenuation =
-                        preparedStrength[preparedIndex] *
-                                inverseDistanceSquared /
+                        dynamicStrength[index] /
                                 denominator;
 
                 if (range > 0.0) {
-                    final double normalisedDistance =
-                            1.0 /
-                                    (
-                                            inverseDistance *
-                                                    range
-                                    );
-
                     final double remaining =
                             1.0 -
-                                    normalisedDistance;
+                                    distance *
+                                            dynamicInverseRange[index];
 
                     attenuation *=
                             remaining *
@@ -747,20 +1045,25 @@ public final class LightingCalculator {
                             normalY * lightY +
                             normalZ * lightZ;
 
-            if (doubleSided) {
+            if (
+                    doubleSided &&
+                            normalDotLight < 0.0
+            ) {
                 normalDotLight =
-                        normalDotLight < 0.0
-                                ? -normalDotLight
-                                : normalDotLight;
+                        -normalDotLight;
             }
 
             if (normalDotLight <= 0.0) {
                 continue;
             }
 
+            final ShadowMap shadowMap =
+                    dynamicShadowMaps[index];
+
             final double visibility =
-                    shadowCalculator.visibility(
-                            sourceLightIndices[preparedIndex],
+                    shadowMap == null
+                            ? 1.0
+                            : shadowMap.visibility(
                             worldX,
                             worldY,
                             worldZ,
@@ -790,22 +1093,38 @@ public final class LightingCalculator {
             red +=
                     (float) (
                             contribution *
-                                    preparedRed[preparedIndex]
+                                    dynamicRed[index]
                     );
 
             green +=
                     (float) (
                             contribution *
-                                    preparedGreen[preparedIndex]
+                                    dynamicGreen[index]
                     );
 
             blue +=
                     (float) (
                             contribution *
-                                    preparedBlue[preparedIndex]
+                                    dynamicBlue[index]
                     );
         }
 
+        return packLighting(
+                red,
+                green,
+                blue,
+                ambient,
+                diffuse
+        );
+    }
+
+    private static int packLighting(
+            float red,
+            float green,
+            float blue,
+            double ambient,
+            double diffuse
+    ) {
         final int shadeRed =
                 to255(
                         ambient +
@@ -836,28 +1155,6 @@ public final class LightingCalculator {
                 shadeBlue;
     }
 
-    private static int packGray(
-            double value
-    ) {
-        final int channel =
-                to255(
-                        value
-                );
-
-        return (
-                channel << 16
-        ) |
-                (
-                        channel << 8
-                ) |
-                channel;
-    }
-
-    /*
-     * Performs clamp and conversion in one method. This avoids first creating
-     * a clamped double and then invoking another helper for every colour
-     * channel and every shaded pixel.
-     */
     private static int to255(
             double value
     ) {

@@ -58,6 +58,9 @@ public final class Renderer implements AutoCloseable {
     private final RenderMeshCompiler meshCompiler;
     private final TileRasterizer tileRasterizer;
 
+    private volatile RenderStats latestStats =
+            RenderStats.empty();
+
     public Renderer(
             Camera camera,
             GameEngine gameEngine
@@ -139,6 +142,10 @@ public final class Renderer implements AutoCloseable {
         );
     }
 
+    public RenderStats getLatestStats() {
+        return latestStats;
+    }
+
     public void shutdown() {
         close();
     }
@@ -162,6 +169,12 @@ public final class Renderer implements AutoCloseable {
         ) {
             return;
         }
+
+        final long frameStart =
+                System.nanoTime();
+
+        final long setupStart =
+                frameStart;
 
         updateCameraValuesIfNeeded();
 
@@ -224,6 +237,12 @@ public final class Renderer implements AutoCloseable {
         final double cameraZ =
                 camera.getViewZ();
 
+        final long setupNanos =
+                System.nanoTime() - setupStart;
+
+        final long sceneStart =
+                System.nanoTime();
+
         sceneCollector.buildNearbyRootLists(
                 cameraX,
                 cameraZ,
@@ -240,6 +259,12 @@ public final class Renderer implements AutoCloseable {
 
         frame.copyLightsToArray();
 
+        final long sceneNanos =
+                System.nanoTime() - sceneStart;
+
+        final long shadowStart =
+                System.nanoTime();
+
         shadowCalculator.buildShadowMaps(
                 frame.nearbyRenderables,
                 cameraX,
@@ -247,6 +272,12 @@ public final class Renderer implements AutoCloseable {
                 cameraZ,
                 farDistance
         );
+
+        final long shadowNanos =
+                System.nanoTime() - shadowStart;
+
+        final long cameraPassStart =
+                System.nanoTime();
 
         lightingCalculator.beginFrame(
                 cameraX,
@@ -269,10 +300,17 @@ public final class Renderer implements AutoCloseable {
                 cameraZ
         );
 
-        renderTiles(
-                width,
-                height
-        );
+        final long cameraPassNanos =
+                System.nanoTime() - cameraPassStart;
+
+        final RenderTileStats tileStats =
+                renderTiles(
+                        width,
+                        height
+                );
+
+        final long fxaaStart =
+                System.nanoTime();
 
         if (settings.isFxaaEnabled()) {
             fxaaProcessor.apply(
@@ -281,6 +319,12 @@ public final class Renderer implements AutoCloseable {
                     height
             );
         }
+
+        final long fxaaNanos =
+                System.nanoTime() - fxaaStart;
+
+        final long blitStart =
+                System.nanoTime();
 
         graphics.setRenderingHint(
                 RenderingHints.KEY_INTERPOLATION,
@@ -300,9 +344,32 @@ public final class Renderer implements AutoCloseable {
                 windowHeight,
                 null
         );
+
+        final long blitNanos =
+                System.nanoTime() - blitStart;
+
+        final long totalNanos =
+                System.nanoTime() - frameStart;
+
+        latestStats = new RenderStats(
+                frame.itemCount,
+                frame.triangles.count,
+                shadowCalculator.getLastTriangleCount(),
+                tileStats.tileReferences(),
+                tileStats.pixelsShaded(),
+                setupNanos,
+                sceneNanos,
+                shadowNanos,
+                cameraPassNanos,
+                tileStats.binningNanos(),
+                tileStats.rasterNanos(),
+                fxaaNanos,
+                blitNanos,
+                totalNanos
+        );
     }
 
-    private void renderTiles(
+    private RenderTileStats renderTiles(
             int width,
             int height
     ) {
@@ -321,12 +388,21 @@ public final class Renderer implements AutoCloseable {
         final int tileCount =
                 tileColumns * tileRows;
 
+        final long binningStart =
+                System.nanoTime();
+
         TileBinner.bin(
                 frame.triangles,
                 tileGrid,
                 width,
                 height
         );
+
+        final long binningNanos =
+                System.nanoTime() - binningStart;
+
+        final long tileReferences =
+                tileGrid.offsets[tileCount];
 
         final long pixelCount =
                 (long) width * height;
@@ -356,6 +432,11 @@ public final class Renderer implements AutoCloseable {
                         )
                 );
 
+        final long rasterStart =
+                System.nanoTime();
+
+        tileRasterizer.beginFrame();
+
         if (workers == 1) {
             for (
                     int tile = 0;
@@ -369,26 +450,42 @@ public final class Renderer implements AutoCloseable {
                         height
                 );
             }
-
-            return;
+        } else {
+            /*
+             * Tile bins may have very different triangle counts. Dynamic
+             * chunks prevent one worker from being stuck with all expensive
+             * tiles while other workers become idle.
+             */
+            scheduler.executeDynamic(
+                    workers,
+                    tileCount,
+                    RenderSettings.TILE_WORK_CHUNK,
+                    tile -> tileRasterizer.renderTile(
+                            tile,
+                            tileColumns,
+                            width,
+                            height
+                    )
+            );
         }
 
-        /*
-         * Tile bins may have very different triangle counts. Dynamic chunks
-         * prevent one worker from being stuck with all expensive tiles while
-         * other workers become idle.
-         */
-        scheduler.executeDynamic(
-                workers,
-                tileCount,
-                RenderSettings.TILE_WORK_CHUNK,
-                tile -> tileRasterizer.renderTile(
-                        tile,
-                        tileColumns,
-                        width,
-                        height
-                )
+        final long rasterNanos =
+                System.nanoTime() - rasterStart;
+
+        return new RenderTileStats(
+                tileReferences,
+                tileRasterizer.getPixelsShaded(),
+                binningNanos,
+                rasterNanos
         );
+    }
+
+    private record RenderTileStats(
+            long tileReferences,
+            long pixelsShaded,
+            long binningNanos,
+            long rasterNanos
+    ) {
     }
 
     private void buildTriangleBatch(

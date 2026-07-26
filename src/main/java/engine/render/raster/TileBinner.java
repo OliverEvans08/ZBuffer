@@ -5,9 +5,6 @@ import engine.render.geometry.TriangleBuffer;
 import java.util.Arrays;
 
 public final class TileBinner {
-    private static final float ONE_THIRD =
-            1.0f / 3.0f;
-
     /*
      * Tiny post-cull batches are faster with insertion sort. Larger batches
      * use a cache-friendly three-pass stable radix sort (11 + 11 + 10 bits).
@@ -291,14 +288,8 @@ public final class TileBinner {
         final int[] order =
                 triangles.order;
 
-        final float[] inverseZ0 =
-                triangles.inverseZ0;
-
-        final float[] inverseZ1 =
-                triangles.inverseZ1;
-
-        final float[] inverseZ2 =
-                triangles.inverseZ2;
+        final float[] averageInverseZ =
+                triangles.averageInverseZ;
 
         final int[] physicalIndices =
                 triangles.physicalIndices;
@@ -320,12 +311,7 @@ public final class TileBinner {
                     physicalIndices[position];
 
             final float depth =
-                    (
-                            inverseZ0[triangle] +
-                                    inverseZ1[triangle] +
-                                    inverseZ2[triangle]
-                    ) *
-                            ONE_THIRD;
+                    averageInverseZ[triangle];
 
             keys[position] =
                     ~Float.floatToRawIntBits(

@@ -1,5 +1,6 @@
 package engine.render.geometry;
 
+import engine.render.RenderSettings;
 import engine.render.lighting.MaterialState;
 
 public final class TriangleBatch {
@@ -37,6 +38,10 @@ public final class TriangleBatch {
             int shadeRed,
             int shadeGreen,
             int shadeBlue,
+            int lightMask,
+            float baseLightRed,
+            float baseLightGreen,
+            float baseLightBlue,
             boolean isDoubleSided,
             boolean isWireframe
     ) {
@@ -65,6 +70,10 @@ public final class TriangleBatch {
                 shadeRed,
                 shadeGreen,
                 shadeBlue,
+                lightMask,
+                baseLightRed,
+                baseLightGreen,
+                baseLightBlue,
                 isDoubleSided
         );
     }
@@ -96,6 +105,10 @@ public final class TriangleBatch {
             int shadeRed,
             int shadeGreen,
             int shadeBlue,
+            int lightMask,
+            float baseLightRed,
+            float baseLightGreen,
+            float baseLightBlue,
             boolean isDoubleSided,
             boolean isWireframe
     ) {
@@ -180,6 +193,10 @@ public final class TriangleBatch {
                 shadeRed,
                 shadeGreen,
                 shadeBlue,
+                lightMask,
+                baseLightRed,
+                baseLightGreen,
+                baseLightBlue,
                 isDoubleSided
         );
     }
@@ -209,6 +226,10 @@ public final class TriangleBatch {
             int shadeRed,
             int shadeGreen,
             int shadeBlue,
+            int lightMask,
+            float baseLightRed,
+            float baseLightGreen,
+            float baseLightBlue,
             boolean isDoubleSided
     ) {
         final double signedArea =
@@ -259,10 +280,6 @@ public final class TriangleBatch {
             vOverZ1 = vOverZ2;
             vOverZ2 = temporaryFloat;
 
-            /*
-             * Swapping two vertices reverses the geometric winding. Keep the
-             * stored face normal consistent with that new winding.
-             */
             cameraNormalX = -cameraNormalX;
             cameraNormalY = -cameraNormalY;
             cameraNormalZ = -cameraNormalZ;
@@ -353,6 +370,222 @@ public final class TriangleBatch {
             return;
         }
 
+        final long fixedX0 =
+                Math.round(
+                        screenX0 *
+                                RenderSettings.SUBPIXEL_SCALE
+                );
+
+        final long fixedY0 =
+                Math.round(
+                        screenY0 *
+                                RenderSettings.SUBPIXEL_SCALE
+                );
+
+        final long fixedX1 =
+                Math.round(
+                        screenX1 *
+                                RenderSettings.SUBPIXEL_SCALE
+                );
+
+        final long fixedY1 =
+                Math.round(
+                        screenY1 *
+                                RenderSettings.SUBPIXEL_SCALE
+                );
+
+        final long fixedX2 =
+                Math.round(
+                        screenX2 *
+                                RenderSettings.SUBPIXEL_SCALE
+                );
+
+        final long fixedY2 =
+                Math.round(
+                        screenY2 *
+                                RenderSettings.SUBPIXEL_SCALE
+                );
+
+        final long edge0A =
+                fixedY1 -
+                        fixedY2;
+
+        final long edge0B =
+                fixedX2 -
+                        fixedX1;
+
+        final long edge0C =
+                fixedX1 *
+                        fixedY2 -
+                        fixedY1 *
+                                fixedX2;
+
+        final long edge1A =
+                fixedY2 -
+                        fixedY0;
+
+        final long edge1B =
+                fixedX0 -
+                        fixedX2;
+
+        final long edge1C =
+                fixedX2 *
+                        fixedY0 -
+                        fixedY2 *
+                                fixedX0;
+
+        final long edge2A =
+                fixedY0 -
+                        fixedY1;
+
+        final long edge2B =
+                fixedX1 -
+                        fixedX0;
+
+        final long edge2C =
+                fixedX0 *
+                        fixedY1 -
+                        fixedY0 *
+                                fixedX1;
+
+        final long fixedArea =
+                edge0A *
+                        fixedX0 +
+                        edge0B *
+                                fixedY0 +
+                        edge0C;
+
+        if (fixedArea <= 0L) {
+            return;
+        }
+
+        final long edge0StepX =
+                edge0A *
+                        RenderSettings.SUBPIXEL_SCALE;
+
+        final long edge0StepY =
+                edge0B *
+                        RenderSettings.SUBPIXEL_SCALE;
+
+        final long edge1StepX =
+                edge1A *
+                        RenderSettings.SUBPIXEL_SCALE;
+
+        final long edge1StepY =
+                edge1B *
+                        RenderSettings.SUBPIXEL_SCALE;
+
+        final long edge2StepX =
+                edge2A *
+                        RenderSettings.SUBPIXEL_SCALE;
+
+        final long edge2StepY =
+                edge2B *
+                        RenderSettings.SUBPIXEL_SCALE;
+
+        final long originX =
+                RenderSettings.SUBPIXEL_HALF;
+
+        final long originY =
+                RenderSettings.SUBPIXEL_HALF;
+
+        final long originEdge0 =
+                edge0A *
+                        originX +
+                        edge0B *
+                                originY +
+                        edge0C;
+
+        final long originEdge1 =
+                edge1A *
+                        originX +
+                        edge1B *
+                                originY +
+                        edge1C;
+
+        final long originEdge2 =
+                edge2A *
+                        originX +
+                        edge2B *
+                                originY +
+                        edge2C;
+
+        final double inverseArea =
+                1.0 /
+                        fixedArea;
+
+        final double inverseZOrigin =
+                (
+                        originEdge0 * inverse0 +
+                                originEdge1 * inverse1 +
+                                originEdge2 * inverse2
+                ) *
+                        inverseArea;
+
+        final double inverseZStepX =
+                (
+                        edge0StepX * inverse0 +
+                                edge1StepX * inverse1 +
+                                edge2StepX * inverse2
+                ) *
+                        inverseArea;
+
+        final double inverseZStepY =
+                (
+                        edge0StepY * inverse0 +
+                                edge1StepY * inverse1 +
+                                edge2StepY * inverse2
+                ) *
+                        inverseArea;
+
+        final double uOverZOrigin =
+                (
+                        originEdge0 * uOverZ0 +
+                                originEdge1 * uOverZ1 +
+                                originEdge2 * uOverZ2
+                ) *
+                        inverseArea;
+
+        final double uOverZStepX =
+                (
+                        edge0StepX * uOverZ0 +
+                                edge1StepX * uOverZ1 +
+                                edge2StepX * uOverZ2
+                ) *
+                        inverseArea;
+
+        final double uOverZStepY =
+                (
+                        edge0StepY * uOverZ0 +
+                                edge1StepY * uOverZ1 +
+                                edge2StepY * uOverZ2
+                ) *
+                        inverseArea;
+
+        final double vOverZOrigin =
+                (
+                        originEdge0 * vOverZ0 +
+                                originEdge1 * vOverZ1 +
+                                originEdge2 * vOverZ2
+                ) *
+                        inverseArea;
+
+        final double vOverZStepX =
+                (
+                        edge0StepX * vOverZ0 +
+                                edge1StepX * vOverZ1 +
+                                edge2StepX * vOverZ2
+                ) *
+                        inverseArea;
+
+        final double vOverZStepY =
+                (
+                        edge0StepY * vOverZ0 +
+                                edge1StepY * vOverZ1 +
+                                edge2StepY * vOverZ2
+                ) *
+                        inverseArea;
+
         if (cursor >= limit) {
             throw new IllegalStateException(
                     "Triangle worker exceeded its reserved range"
@@ -374,9 +607,45 @@ public final class TriangleBatch {
         output.x2[index] = screenX2;
         output.y2[index] = screenY2;
 
+        output.edge0A[index] = edge0A;
+        output.edge0B[index] = edge0B;
+        output.edge0C[index] = edge0C;
+
+        output.edge1A[index] = edge1A;
+        output.edge1B[index] = edge1B;
+        output.edge1C[index] = edge1C;
+
+        output.edge2A[index] = edge2A;
+        output.edge2B[index] = edge2B;
+        output.edge2C[index] = edge2C;
+
         output.inverseZ0[index] = inverse0;
         output.inverseZ1[index] = inverse1;
         output.inverseZ2[index] = inverse2;
+
+        float maximumInverse =
+                inverse0;
+
+        if (inverse1 > maximumInverse) {
+            maximumInverse =
+                    inverse1;
+        }
+
+        if (inverse2 > maximumInverse) {
+            maximumInverse =
+                    inverse2;
+        }
+
+        output.maximumInverseZ[index] =
+                maximumInverse;
+
+        output.averageInverseZ[index] =
+                (
+                        inverse0 +
+                                inverse1 +
+                                inverse2
+                ) *
+                        (1.0f / 3.0f);
 
         output.uOverZ0[index] = uOverZ0;
         output.vOverZ0[index] = vOverZ0;
@@ -386,6 +655,33 @@ public final class TriangleBatch {
 
         output.uOverZ2[index] = uOverZ2;
         output.vOverZ2[index] = vOverZ2;
+
+        output.inverseZOrigin[index] =
+                inverseZOrigin;
+
+        output.inverseZStepX[index] =
+                inverseZStepX;
+
+        output.inverseZStepY[index] =
+                inverseZStepY;
+
+        output.uOverZOrigin[index] =
+                uOverZOrigin;
+
+        output.uOverZStepX[index] =
+                uOverZStepX;
+
+        output.uOverZStepY[index] =
+                uOverZStepY;
+
+        output.vOverZOrigin[index] =
+                vOverZOrigin;
+
+        output.vOverZStepX[index] =
+                vOverZStepX;
+
+        output.vOverZStepY[index] =
+                vOverZStepY;
 
         output.normalX[index] = cameraNormalX;
         output.normalY[index] = cameraNormalY;
@@ -397,6 +693,18 @@ public final class TriangleBatch {
                                 ? 1
                                 : 0
                 );
+
+        output.lightMasks[index] =
+                lightMask;
+
+        output.baseLightRed[index] =
+                baseLightRed;
+
+        output.baseLightGreen[index] =
+                baseLightGreen;
+
+        output.baseLightBlue[index] =
+                baseLightBlue;
 
         output.materials[index] =
                 material;

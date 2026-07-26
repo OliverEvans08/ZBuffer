@@ -1,10 +1,16 @@
 package engine.ui;
 
 import engine.EngineContext;
+import engine.render.RenderStats;
 import java.awt.Color;
 import java.awt.Graphics;
+import java.util.Locale;
 
 public final class DebugOverlay {
+
+    private static final int LEFT = 10;
+    private static final int FIRST_LINE_Y = 20;
+    private static final int LINE_HEIGHT = 20;
 
     private final EngineContext context;
 
@@ -13,114 +19,327 @@ public final class DebugOverlay {
     }
 
     public void draw(Graphics graphics, int fps) {
+        final RenderStats stats =
+                context.renderer.getLatestStats();
+
         graphics.setColor(Color.WHITE);
-        graphics.drawString("FPS: " + fps, 10, 20);
-        graphics.drawString(
-                "FeetY: " + String.format("%.3f", context.camera.y),
-                10,
-                40
+
+        int line = 0;
+
+        drawLine(
+                graphics,
+                line++,
+                "FPS: " + fps
         );
-        graphics.drawString(
-                "EyeY: " + String.format("%.3f", context.camera.getViewY()),
-                10,
-                60
+
+        drawLine(
+                graphics,
+                line++,
+                "Visible objects: " +
+                        stats.visibleObjects()
         );
-        graphics.drawString(
-                "X/Z: " + String.format(
-                        "%.3f/%.3f",
-                        context.camera.x,
-                        context.camera.z
-                ),
-                10,
-                80
+
+        drawLine(
+                graphics,
+                line++,
+                "Camera-pass triangles: " +
+                        stats.cameraPassTriangles()
         );
-        graphics.drawString(
-                "FlightMode: " + context.camera.flightMode,
-                10,
-                100
+
+        drawLine(
+                graphics,
+                line++,
+                "Shadow-pass triangles: " +
+                        stats.shadowPassTriangles()
         );
-        graphics.drawString(
-                "Yaw: " + String.format(
-                        "%.1f°",
-                        Math.toDegrees(context.camera.yaw)
-                ),
-                10,
-                120
+
+        drawLine(
+                graphics,
+                line++,
+                "Tile references: " +
+                        stats.tileReferences()
         );
-        graphics.drawString(
-                "Pitch: " + String.format(
-                        "%.1f°",
-                        Math.toDegrees(context.camera.pitch)
-                ),
-                10,
-                140
+
+        drawLine(
+                graphics,
+                line++,
+                "Pixels shaded: " +
+                        stats.pixelsShaded()
         );
-        graphics.drawString(
+
+        line++;
+
+        drawLine(
+                graphics,
+                line++,
+                "Frame total: " +
+                        milliseconds(
+                                stats.totalMilliseconds()
+                        )
+        );
+
+        drawLine(
+                graphics,
+                line++,
+                "  Setup: " +
+                        milliseconds(
+                                stats.setupMilliseconds()
+                        )
+        );
+
+        drawLine(
+                graphics,
+                line++,
+                "  Scene/lights: " +
+                        milliseconds(
+                                stats.sceneMilliseconds()
+                        )
+        );
+
+        drawLine(
+                graphics,
+                line++,
+                "  Shadow pass: " +
+                        milliseconds(
+                                stats.shadowMilliseconds()
+                        )
+        );
+
+        drawLine(
+                graphics,
+                line++,
+                "  Camera pass: " +
+                        milliseconds(
+                                stats.cameraPassMilliseconds()
+                        )
+        );
+
+        drawLine(
+                graphics,
+                line++,
+                "  Tile binning: " +
+                        milliseconds(
+                                stats.tileBinningMilliseconds()
+                        )
+        );
+
+        drawLine(
+                graphics,
+                line++,
+                "  Raster/shade: " +
+                        milliseconds(
+                                stats.rasterMilliseconds()
+                        )
+        );
+
+        drawLine(
+                graphics,
+                line++,
+                "  FXAA: " +
+                        milliseconds(
+                                stats.fxaaMilliseconds()
+                        )
+        );
+
+        drawLine(
+                graphics,
+                line++,
+                "  Blit: " +
+                        milliseconds(
+                                stats.blitMilliseconds()
+                        )
+        );
+
+        line++;
+
+        drawLine(
+                graphics,
+                line++,
+                "FeetY: " +
+                        format(
+                                "%.3f",
+                                context.camera.y
+                        )
+        );
+
+        drawLine(
+                graphics,
+                line++,
+                "EyeY: " +
+                        format(
+                                "%.3f",
+                                context.camera.getViewY()
+                        )
+        );
+
+        drawLine(
+                graphics,
+                line++,
+                "X/Z: " +
+                        format(
+                                "%.3f/%.3f",
+                                context.camera.x,
+                                context.camera.z
+                        )
+        );
+
+        drawLine(
+                graphics,
+                line++,
+                "FlightMode: " +
+                        context.camera.flightMode
+        );
+
+        drawLine(
+                graphics,
+                line++,
+                "Yaw: " +
+                        format(
+                                "%.1f°",
+                                Math.toDegrees(
+                                        context.camera.yaw
+                                )
+                        )
+        );
+
+        drawLine(
+                graphics,
+                line++,
+                "Pitch: " +
+                        format(
+                                "%.1f°",
+                                Math.toDegrees(
+                                        context.camera.pitch
+                                )
+                        )
+        );
+
+        drawLine(
+                graphics,
+                line++,
                 "LoadedObjects: " +
-                        context.scene.getRootObjects().size(),
-                10,
-                160
+                        context.scene
+                                .getRootObjects()
+                                .size()
         );
-        graphics.drawString(
+
+        drawLine(
+                graphics,
+                line++,
                 "SolidColliders: " +
-                        context.scene.getColliders().size(),
-                10,
-                180
+                        context.scene
+                                .getColliders()
+                                .size()
         );
-        graphics.drawString(
-                "GUIOpen: " + context.clickGUI.isOpen(),
-                10,
-                200
+
+        drawLine(
+                graphics,
+                line++,
+                "GUIOpen: " +
+                        context.clickGUI.isOpen()
         );
-        graphics.drawString(
-                "InvOpen: " + context.inventoryUI.isOpen(),
-                10,
-                220
+
+        drawLine(
+                graphics,
+                line++,
+                "InvOpen: " +
+                        context.inventoryUI.isOpen()
         );
-        graphics.drawString(
-                "FOV: " + String.format(
-                        "%.1f°",
-                        context.settings.getFieldOfViewDegrees()
-                ),
-                10,
-                240
+
+        drawLine(
+                graphics,
+                line++,
+                "FOV: " +
+                        format(
+                                "%.1f°",
+                                context.settings
+                                        .getFieldOfViewDegrees()
+                        )
         );
-        graphics.drawString(
-                "RenderDist: " + String.format(
-                        "%.0f",
-                        context.settings.getRenderDistance()
-                ),
-                10,
-                260
+
+        drawLine(
+                graphics,
+                line++,
+                "RenderDist: " +
+                        format(
+                                "%.0f",
+                                context.settings
+                                        .getRenderDistance()
+                        )
         );
-        graphics.drawString(
+
+        drawLine(
+                graphics,
+                line++,
                 "CamMode: " +
-                        (context.camera.isFirstPerson()
-                                ? "First"
-                                : "Third"),
-                10,
-                280
+                        (
+                                context.camera.isFirstPerson()
+                                        ? "First"
+                                        : "Third"
+                        )
         );
-        graphics.drawString(
-                "RenderScale: " + String.format(
-                        "%.2f",
-                        context.renderer.getRenderScale()
-                ),
-                10,
-                300
+
+        drawLine(
+                graphics,
+                line++,
+                "RenderScale: " +
+                        format(
+                                "%.2f",
+                                context.renderer
+                                        .getRenderScale()
+                        )
         );
-        graphics.drawString(
-                "FXAA: " + context.renderer.isFxaaEnabled(),
-                10,
-                320
+
+        drawLine(
+                graphics,
+                line++,
+                "FXAA: " +
+                        context.renderer
+                                .isFxaaEnabled()
         );
+
+        drawLine(
+                graphics,
+                line,
+                "MasterVol: " +
+                        format(
+                                "%.2f",
+                                context.soundEngine
+                                        .getMasterVolume()
+                        )
+        );
+    }
+
+    private static void drawLine(
+            Graphics graphics,
+            int line,
+            String text
+    ) {
         graphics.drawString(
-                "MasterVol: " + String.format(
-                        "%.2f",
-                        context.soundEngine.getMasterVolume()
-                ),
-                10,
-                340
+                text,
+                LEFT,
+                FIRST_LINE_Y +
+                        line * LINE_HEIGHT
+        );
+    }
+
+    private static String milliseconds(
+            double value
+    ) {
+        return format(
+                "%.3f ms",
+                value
+        );
+    }
+
+    private static String format(
+            String pattern,
+            Object... arguments
+    ) {
+        return String.format(
+                Locale.ROOT,
+                pattern,
+                arguments
         );
     }
 }

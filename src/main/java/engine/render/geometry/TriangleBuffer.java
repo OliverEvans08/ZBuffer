@@ -33,9 +33,30 @@ public final class TriangleBuffer {
     public double[] x2 = new double[0];
     public double[] y2 = new double[0];
 
+    /*
+     * Fixed-point edge equations are prepared once when a triangle enters the
+     * batch. A triangle may be referenced by many tiles; keeping the setup
+     * here prevents every tile from repeating six rounds, three cross
+     * products, edge-step construction and interpolation-plane construction.
+     */
+    public long[] edge0A = new long[0];
+    public long[] edge0B = new long[0];
+    public long[] edge0C = new long[0];
+
+    public long[] edge1A = new long[0];
+    public long[] edge1B = new long[0];
+    public long[] edge1C = new long[0];
+
+    public long[] edge2A = new long[0];
+    public long[] edge2B = new long[0];
+    public long[] edge2C = new long[0];
+
     public float[] inverseZ0 = new float[0];
     public float[] inverseZ1 = new float[0];
     public float[] inverseZ2 = new float[0];
+
+    public float[] maximumInverseZ = new float[0];
+    public float[] averageInverseZ = new float[0];
 
     public float[] uOverZ0 = new float[0];
     public float[] vOverZ0 = new float[0];
@@ -46,11 +67,37 @@ public final class TriangleBuffer {
     public float[] uOverZ2 = new float[0];
     public float[] vOverZ2 = new float[0];
 
+    /*
+     * Attribute planes at pixel centre (0.5, 0.5), plus one-pixel X/Y
+     * increments. Raster tiles can jump directly to their first pixel using
+     * origin + x * stepX + y * stepY.
+     */
+    public double[] inverseZOrigin = new double[0];
+    public double[] inverseZStepX = new double[0];
+    public double[] inverseZStepY = new double[0];
+
+    public double[] uOverZOrigin = new double[0];
+    public double[] uOverZStepX = new double[0];
+    public double[] uOverZStepY = new double[0];
+
+    public double[] vOverZOrigin = new double[0];
+    public double[] vOverZStepX = new double[0];
+    public double[] vOverZStepY = new double[0];
+
     public double[] normalX = new double[0];
     public double[] normalY = new double[0];
     public double[] normalZ = new double[0];
 
     public byte[] doubleSided = new byte[0];
+
+    /*
+     * Dynamic lights are represented as a compact per-triangle bit mask.
+     * Invariant directional light is accumulated once during triangle setup.
+     */
+    public int[] lightMasks = new int[0];
+    public float[] baseLightRed = new float[0];
+    public float[] baseLightGreen = new float[0];
+    public float[] baseLightBlue = new float[0];
 
     public MaterialState[] materials =
             new MaterialState[0];
@@ -109,9 +156,33 @@ public final class TriangleBuffer {
         x2 = Arrays.copyOf(x2, capacity);
         y2 = Arrays.copyOf(y2, capacity);
 
+        edge0A = Arrays.copyOf(edge0A, capacity);
+        edge0B = Arrays.copyOf(edge0B, capacity);
+        edge0C = Arrays.copyOf(edge0C, capacity);
+
+        edge1A = Arrays.copyOf(edge1A, capacity);
+        edge1B = Arrays.copyOf(edge1B, capacity);
+        edge1C = Arrays.copyOf(edge1C, capacity);
+
+        edge2A = Arrays.copyOf(edge2A, capacity);
+        edge2B = Arrays.copyOf(edge2B, capacity);
+        edge2C = Arrays.copyOf(edge2C, capacity);
+
         inverseZ0 = Arrays.copyOf(inverseZ0, capacity);
         inverseZ1 = Arrays.copyOf(inverseZ1, capacity);
         inverseZ2 = Arrays.copyOf(inverseZ2, capacity);
+
+        maximumInverseZ =
+                Arrays.copyOf(
+                        maximumInverseZ,
+                        capacity
+                );
+
+        averageInverseZ =
+                Arrays.copyOf(
+                        averageInverseZ,
+                        capacity
+                );
 
         uOverZ0 = Arrays.copyOf(uOverZ0, capacity);
         vOverZ0 = Arrays.copyOf(vOverZ0, capacity);
@@ -122,6 +193,60 @@ public final class TriangleBuffer {
         uOverZ2 = Arrays.copyOf(uOverZ2, capacity);
         vOverZ2 = Arrays.copyOf(vOverZ2, capacity);
 
+        inverseZOrigin =
+                Arrays.copyOf(
+                        inverseZOrigin,
+                        capacity
+                );
+
+        inverseZStepX =
+                Arrays.copyOf(
+                        inverseZStepX,
+                        capacity
+                );
+
+        inverseZStepY =
+                Arrays.copyOf(
+                        inverseZStepY,
+                        capacity
+                );
+
+        uOverZOrigin =
+                Arrays.copyOf(
+                        uOverZOrigin,
+                        capacity
+                );
+
+        uOverZStepX =
+                Arrays.copyOf(
+                        uOverZStepX,
+                        capacity
+                );
+
+        uOverZStepY =
+                Arrays.copyOf(
+                        uOverZStepY,
+                        capacity
+                );
+
+        vOverZOrigin =
+                Arrays.copyOf(
+                        vOverZOrigin,
+                        capacity
+                );
+
+        vOverZStepX =
+                Arrays.copyOf(
+                        vOverZStepX,
+                        capacity
+                );
+
+        vOverZStepY =
+                Arrays.copyOf(
+                        vOverZStepY,
+                        capacity
+                );
+
         normalX = Arrays.copyOf(normalX, capacity);
         normalY = Arrays.copyOf(normalY, capacity);
         normalZ = Arrays.copyOf(normalZ, capacity);
@@ -129,6 +254,30 @@ public final class TriangleBuffer {
         doubleSided =
                 Arrays.copyOf(
                         doubleSided,
+                        capacity
+                );
+
+        lightMasks =
+                Arrays.copyOf(
+                        lightMasks,
+                        capacity
+                );
+
+        baseLightRed =
+                Arrays.copyOf(
+                        baseLightRed,
+                        capacity
+                );
+
+        baseLightGreen =
+                Arrays.copyOf(
+                        baseLightGreen,
+                        capacity
+                );
+
+        baseLightBlue =
+                Arrays.copyOf(
+                        baseLightBlue,
                         capacity
                 );
 

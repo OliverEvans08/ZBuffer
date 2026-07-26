@@ -6,6 +6,7 @@ import engine.lighting.LightType;
 import engine.render.RenderFrame;
 import engine.render.util.RenderWorkerContext;
 import java.util.Arrays;
+import java.util.IdentityHashMap;
 import java.util.List;
 import objects.GameObject;
 import util.AABB;
@@ -23,6 +24,12 @@ import util.AABB;
 public final class ShadowCalculator {
     private final RenderFrame frame;
     private ShadowMap[] maps = new ShadowMap[0];
+
+    private long lastTriangleCount;
+
+    private final IdentityHashMap<GameObject, ShadowGeometry>
+            geometryCache =
+            new IdentityHashMap<>(2048);
 
     public ShadowCalculator(
             GameEngine gameEngine,
@@ -47,6 +54,10 @@ public final class ShadowCalculator {
         // Per-object flags are obsolete; shadows are sampled per pixel.
     }
 
+    public long getLastTriangleCount() {
+        return lastTriangleCount;
+    }
+
     public void buildShadowMaps(
             List<GameObject> candidates,
             double cameraX,
@@ -54,6 +65,8 @@ public final class ShadowCalculator {
             double cameraZ,
             double farDistance
     ) {
+        lastTriangleCount = 0L;
+
         ensureMapCapacity(frame.lightCount);
 
         for (
@@ -61,10 +74,13 @@ public final class ShadowCalculator {
                 lightIndex < frame.lightCount;
                 lightIndex++
         ) {
-            final LightData light = frame.lightArray[lightIndex];
+            final LightData light =
+                    frame.lightArray[lightIndex];
 
-            // Aggressive: only directional lights cast shadows.
-            // Point/spot cubemaps are extremely expensive on CPU.
+            /*
+             * Aggressive: only directional lights cast shadows.
+             * Point/spot cubemaps are extremely expensive on CPU.
+             */
             if (
                     light == null ||
                             !light.shadows ||
@@ -90,19 +106,12 @@ public final class ShadowCalculator {
                     farDistance
             );
 
-            if (candidates == null || candidates.isEmpty()) {
+            if (
+                    candidates == null ||
+                            candidates.isEmpty()
+            ) {
                 continue;
             }
-
-            final double lightX = light.x;
-            final double lightY = light.y;
-            final double lightZ = light.z;
-            final double range =
-                    light.range > 0.0
-                            ? light.range
-                            : farDistance;
-            final double rangeSquared =
-                    range * range;
 
             for (
                     int objectIndex = 0;
@@ -122,7 +131,18 @@ public final class ShadowCalculator {
                     continue;
                 }
 
-                addObjectTriangles(map, object);
+                if (
+                        !map.intersects(
+                                object.getWorldAABB()
+                        )
+                ) {
+                    continue;
+                }
+
+                addObjectTriangles(
+                        map,
+                        object
+                );
             }
         }
     }
@@ -145,8 +165,11 @@ public final class ShadowCalculator {
             return 1.0;
         }
 
-        final LightData light = frame.lightArray[lightIndex];
-        final ShadowMap map = maps[lightIndex];
+        final LightData light =
+                frame.lightArray[lightIndex];
+
+        final ShadowMap map =
+                maps[lightIndex];
 
         if (
                 light == null ||
@@ -168,13 +191,28 @@ public final class ShadowCalculator {
         );
     }
 
-    private static void addObjectTriangles(
+    ShadowMap getShadowMap(
+            int lightIndex
+    ) {
+        if (
+                lightIndex < 0 ||
+                        lightIndex >= maps.length
+        ) {
+            return null;
+        }
+
+        return maps[lightIndex];
+    }
+
+    private void addObjectTriangles(
             ShadowMap map,
             GameObject object
     ) {
         final double[][] vertices =
                 object.getTransformedVertices();
-        final int[][] faces = object.getFacesArray();
+
+        final int[][] faces =
+                object.getFacesArray();
 
         if (
                 vertices == null ||
@@ -185,22 +223,46 @@ public final class ShadowCalculator {
             return;
         }
 
-        for (int faceIndex = 0; faceIndex < faces.length; faceIndex++) {
-            final int[] face = faces[faceIndex];
+        ShadowGeometry geometry =
+                geometryCache.get(
+                        object
+                );
 
-            if (
-                    face == null ||
-                            face.length != 3 ||
-                            !validIndex(face[0], vertices.length) ||
-                            !validIndex(face[1], vertices.length) ||
-                            !validIndex(face[2], vertices.length)
-            ) {
-                continue;
-            }
+        if (
+                geometry == null ||
+                        !geometry.matches(
+                                vertices.length,
+                                faces
+                        )
+        ) {
+            geometry =
+                    compileGeometry(
+                            vertices.length,
+                            faces
+                    );
 
-            final double[] point0 = vertices[face[0]];
-            final double[] point1 = vertices[face[1]];
-            final double[] point2 = vertices[face[2]];
+            geometryCache.put(
+                    object,
+                    geometry
+            );
+        }
+
+        final int[] indices =
+                geometry.indices;
+
+        for (
+                int offset = 0;
+                offset < indices.length;
+                offset += 3
+        ) {
+            final double[] point0 =
+                    vertices[indices[offset]];
+
+            final double[] point1 =
+                    vertices[indices[offset + 1]];
+
+            final double[] point2 =
+                    vertices[indices[offset + 2]];
 
             if (
                     !validPoint(point0) ||
@@ -221,35 +283,121 @@ public final class ShadowCalculator {
                     point2[1],
                     point2[2]
             );
+
+            lastTriangleCount++;
         }
     }
 
-    private void ensureMapCapacity(int required) {
+    private static ShadowGeometry compileGeometry(
+            int vertexCount,
+            int[][] faces
+    ) {
+        final int[] maximumIndices =
+                new int[
+                        faces.length *
+                                3
+                        ];
+
+        int output =
+                0;
+
+        for (
+                int faceIndex = 0;
+                faceIndex < faces.length;
+                faceIndex++
+        ) {
+            final int[] face =
+                    faces[faceIndex];
+
+            if (
+                    face == null ||
+                            face.length != 3 ||
+                            !validIndex(
+                                    face[0],
+                                    vertexCount
+                            ) ||
+                            !validIndex(
+                                    face[1],
+                                    vertexCount
+                            ) ||
+                            !validIndex(
+                                    face[2],
+                                    vertexCount
+                            )
+            ) {
+                continue;
+            }
+
+            maximumIndices[output++] =
+                    face[0];
+
+            maximumIndices[output++] =
+                    face[1];
+
+            maximumIndices[output++] =
+                    face[2];
+        }
+
+        final int[] indices =
+                output ==
+                        maximumIndices.length
+                        ? maximumIndices
+                        : Arrays.copyOf(
+                        maximumIndices,
+                        output
+                );
+
+        return new ShadowGeometry(
+                vertexCount,
+                faces,
+                indices
+        );
+    }
+
+    private void ensureMapCapacity(
+            int required
+    ) {
         if (maps.length >= required) {
             return;
         }
 
-        int capacity = Math.max(16, maps.length);
+        int capacity =
+                Math.max(
+                        16,
+                        maps.length
+                );
 
         while (capacity < required) {
-            if (capacity > Integer.MAX_VALUE / 2) {
+            if (
+                    capacity >
+                            Integer.MAX_VALUE / 2
+            ) {
                 capacity = required;
                 break;
             }
-            capacity <<= 1;
+
+            capacity <<=
+                    1;
         }
 
-        maps = Arrays.copyOf(maps, capacity);
+        maps =
+                Arrays.copyOf(
+                        maps,
+                        capacity
+                );
     }
 
     private static boolean validIndex(
             int index,
             int length
     ) {
-        return index >= 0 && index < length;
+        return index >= 0 &&
+                index < length;
     }
 
-    private static boolean validPoint(double[] point) {
+    private static boolean validPoint(
+            double[] point
+    ) {
         return point != null &&
                 point.length >= 3 &&
                 Double.isFinite(point[0]) &&
@@ -257,14 +405,34 @@ public final class ShadowCalculator {
                 Double.isFinite(point[2]);
     }
 
-    private static double clamp(
-            double value,
-            double minimum,
-            double maximum
-    ) {
-        return Math.max(
-                minimum,
-                Math.min(maximum, value)
-        );
+    private static final class ShadowGeometry {
+        private final int vertexCount;
+        private final int[][] sourceFaces;
+        private final int[] indices;
+
+        private ShadowGeometry(
+                int vertexCount,
+                int[][] sourceFaces,
+                int[] indices
+        ) {
+            this.vertexCount =
+                    vertexCount;
+
+            this.sourceFaces =
+                    sourceFaces;
+
+            this.indices =
+                    indices;
+        }
+
+        private boolean matches(
+                int vertexCount,
+                int[][] faces
+        ) {
+            return this.vertexCount ==
+                    vertexCount &&
+                    sourceFaces ==
+                            faces;
+        }
     }
 }

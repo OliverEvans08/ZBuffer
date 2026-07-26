@@ -5,6 +5,7 @@ import engine.render.geometry.TriangleBuffer;
 import engine.render.lighting.LightingCalculator;
 import engine.render.lighting.MaterialState;
 import java.util.Arrays;
+import java.util.concurrent.atomic.LongAdder;
 
 public final class TileRasterizer {
     private final TriangleBuffer triangles;
@@ -13,6 +14,9 @@ public final class TileRasterizer {
     private final DepthBuffer depthBuffer;
     private final SkyRenderer skyRenderer;
     private final LightingCalculator lightingCalculator;
+
+    private final LongAdder pixelsShaded =
+            new LongAdder();
 
     public TileRasterizer(
             TriangleBuffer triangles,
@@ -39,6 +43,14 @@ public final class TileRasterizer {
 
         this.lightingCalculator =
                 lightingCalculator;
+    }
+
+    public void beginFrame() {
+        pixelsShaded.reset();
+    }
+
+    public long getPixelsShaded() {
+        return pixelsShaded.sum();
     }
 
     public void renderTile(
@@ -133,14 +145,8 @@ public final class TileRasterizer {
         final MaterialState[] materials =
                 triangles.materials;
 
-        final float[] inverseZ0 =
-                triangles.inverseZ0;
-
-        final float[] inverseZ1 =
-                triangles.inverseZ1;
-
-        final float[] inverseZ2 =
-                triangles.inverseZ2;
+        final float[] maximumInverseZ =
+                triangles.maximumInverseZ;
 
         float depthMinimum =
                 Float.NEGATIVE_INFINITY;
@@ -169,23 +175,8 @@ public final class TileRasterizer {
                 continue;
             }
 
-            final float first =
-                    inverseZ0[triangle];
-
-            final float second =
-                    inverseZ1[triangle];
-
-            final float third =
-                    inverseZ2[triangle];
-
             final float maximumTriangleDepth =
-                    Math.max(
-                            first,
-                            Math.max(
-                                    second,
-                                    third
-                            )
-                    );
+                    maximumInverseZ[triangle];
 
             /*
              * Triangles are ordered front-to-back. Once a triangle's closest
@@ -215,5 +206,39 @@ public final class TileRasterizer {
 
         grid.depthMinimum[tile] =
                 depthMinimum;
+
+        long shaded = 0L;
+
+        /*
+         * Any pixel whose depth differs from the clear value received camera
+         * geometry during this frame. Counting after tile rendering avoids
+         * atomic operations in the inner triangle/pixel raster loops.
+         */
+        for (
+                int y = minimumY;
+                y < maximumYExclusive;
+                y++
+        ) {
+            int pixel =
+                    y * width +
+                            minimumX;
+
+            final int end =
+                    pixel +
+                            tileWidth;
+
+            while (pixel < end) {
+                if (
+                        frameDepth[pixel] !=
+                                Float.NEGATIVE_INFINITY
+                ) {
+                    shaded++;
+                }
+
+                pixel++;
+            }
+        }
+
+        pixelsShaded.add(shaded);
     }
 }
