@@ -51,6 +51,22 @@ public final class VerticalCollisionResolver {
             double previousY,
             double previousZ
     ) {
+        resolve(
+                camera,
+                previousX,
+                previousY,
+                previousZ,
+                0.0
+        );
+    }
+
+    public void resolve(
+            Camera camera,
+            double previousX,
+            double previousY,
+            double previousZ,
+            double groundedSnapDown
+    ) {
         if (gameEngine == null) {
             return;
         }
@@ -64,6 +80,20 @@ public final class VerticalCollisionResolver {
         double previousHead = previousY + HEIGHT;
         double newFeet = camera.y;
         double newHead = camera.y + HEIGHT;
+
+        /*
+         * A grounded player may search farther below the actual gravity
+         * position. If no floor is found, camera.y remains at newFeet, so a
+         * real ledge still transitions naturally into a fall instead of
+         * teleporting the player down by the probe distance.
+         */
+        double floorSweepEnd = movingDown
+                ? Math.min(
+                newFeet,
+                previousFeet
+                        - Math.max(0.0, groundedSnapDown)
+        )
+                : newFeet;
 
         double bestFloor = Double.NEGATIVE_INFINITY;
         double bestCeiling = Double.POSITIVE_INFINITY;
@@ -94,7 +124,7 @@ public final class VerticalCollisionResolver {
                             camera.z,
                             cachedBounds,
                             previousFeet,
-                            newFeet
+                            floorSweepEnd
                     );
 
                     if (Double.isFinite(floor)) {
@@ -121,7 +151,7 @@ public final class VerticalCollisionResolver {
                                 floorContactCache.triangle,
                                 true,
                                 previousFeet,
-                                newFeet,
+                                floorSweepEnd,
                                 camera.x,
                                 camera.z,
                                 closestXZ
@@ -231,7 +261,7 @@ public final class VerticalCollisionResolver {
                             collider,
                             true,
                             previousFeet,
-                            newFeet,
+                            floorSweepEnd,
                             skipTriangle
                     );
 
@@ -271,7 +301,7 @@ public final class VerticalCollisionResolver {
                         camera.z,
                         bounds,
                         previousFeet,
-                        newFeet
+                        floorSweepEnd
                 );
 
                 if (floor > bestFloor) {
@@ -308,6 +338,11 @@ public final class VerticalCollisionResolver {
                 floorContactCache.aabb = bestFloorIsAabb;
                 floorContactCache.height = bestFloor;
             } else {
+                /*
+                 * Keep the real integrated gravity position. floorSweepEnd
+                 * is only a query endpoint, never an unconditional drop.
+                 */
+                camera.y = newFeet;
                 clearFloorCache();
             }
         } else if (bestCeiling != Double.POSITIVE_INFINITY) {

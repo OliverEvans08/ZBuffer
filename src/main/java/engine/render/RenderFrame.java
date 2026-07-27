@@ -3,6 +3,7 @@ package engine.render;
 import engine.lighting.LightData;
 import engine.render.geometry.ProjectionCache;
 import engine.render.geometry.RenderMesh;
+import engine.render.geometry.RenderMeshChunkLayout;
 import engine.render.geometry.TriangleBuffer;
 import engine.render.lighting.MaterialState;
 import java.util.ArrayList;
@@ -12,14 +13,15 @@ import objects.GameObject;
 import util.AABB;
 
 public final class RenderFrame {
+
     public final ArrayList<LightData> lights =
             new ArrayList<>();
 
     public final ArrayList<GameObject> nearbyRenderables =
             new ArrayList<>(4096);
 
-    public final ArrayList<GameObject> renderRoots =
-            new ArrayList<>(4096);
+    public final ArrayList<SceneChunk> sceneChunks =
+            new ArrayList<>(256);
 
     public final IdentityHashMap<GameObject, Boolean> objectSet =
             new IdentityHashMap<>(4096);
@@ -41,6 +43,12 @@ public final class RenderFrame {
     public ProjectionCache[] projections =
             new ProjectionCache[0];
 
+    public RenderMeshChunkLayout[] chunkLayouts =
+            new RenderMeshChunkLayout[0];
+
+    public byte[][] visibleMeshChunks =
+            new byte[0][];
+
     public MaterialState[] materials =
             new MaterialState[0];
 
@@ -58,6 +66,28 @@ public final class RenderFrame {
 
     public byte[] doubleSided =
             new byte[0];
+
+    public byte[] projectionValid =
+            new byte[0];
+
+    public byte[] chunkCullValid =
+            new byte[0];
+
+    /*
+     * Twelve affine model-view values per item. Only partitioned items write
+     * and read their range.
+     */
+    public double[] modelViewMatrices =
+            new double[0];
+
+    public int[] itemChunksTested =
+            new int[0];
+
+    public int[] itemChunksVisible =
+            new int[0];
+
+    public int[] itemFacesRejected =
+            new int[0];
 
     /*
      * Assigned worker for each render item.
@@ -78,6 +108,14 @@ public final class RenderFrame {
             new long[0];
 
     public int itemCount;
+
+    public int nearbyChunkCount;
+    public int visibleChunkCount;
+
+    public int partitionedItemCount;
+    public int meshChunksTested;
+    public int meshChunksVisible;
+    public int meshChunkFacesRejected;
 
     public double cachedYaw;
     public double cachedPitch;
@@ -122,15 +160,6 @@ public final class RenderFrame {
         lights.toArray(
                 lightArray
         );
-
-        /*
-         * ArrayList.toArray(T[]) writes null at index size whenever the
-         * destination has spare capacity.
-         *
-         * Lighting is explicitly bounded by lightCount, so clearing every
-         * remaining array slot each frame would only create unnecessary memory
-         * writes and cache traffic.
-         */
     }
 
     public void ensureItemCapacity(
@@ -165,6 +194,18 @@ public final class RenderFrame {
         projections =
                 Arrays.copyOf(
                         projections,
+                        capacity
+                );
+
+        chunkLayouts =
+                Arrays.copyOf(
+                        chunkLayouts,
+                        capacity
+                );
+
+        visibleMeshChunks =
+                Arrays.copyOf(
+                        visibleMeshChunks,
                         capacity
                 );
 
@@ -204,6 +245,42 @@ public final class RenderFrame {
                         capacity
                 );
 
+        projectionValid =
+                Arrays.copyOf(
+                        projectionValid,
+                        capacity
+                );
+
+        chunkCullValid =
+                Arrays.copyOf(
+                        chunkCullValid,
+                        capacity
+                );
+
+        modelViewMatrices =
+                Arrays.copyOf(
+                        modelViewMatrices,
+                        capacity * 12
+                );
+
+        itemChunksTested =
+                Arrays.copyOf(
+                        itemChunksTested,
+                        capacity
+                );
+
+        itemChunksVisible =
+                Arrays.copyOf(
+                        itemChunksVisible,
+                        capacity
+                );
+
+        itemFacesRejected =
+                Arrays.copyOf(
+                        itemFacesRejected,
+                        capacity
+                );
+
         itemWorkers =
                 Arrays.copyOf(
                         itemWorkers,
@@ -223,6 +300,31 @@ public final class RenderFrame {
                 );
     }
 
+    public void finishMeshChunkStats() {
+        int tested = 0;
+        int visible = 0;
+        int rejectedFaces = 0;
+
+        for (
+                int item = 0;
+                item < itemCount;
+                item++
+        ) {
+            tested +=
+                    itemChunksTested[item];
+
+            visible +=
+                    itemChunksVisible[item];
+
+            rejectedFaces +=
+                    itemFacesRejected[item];
+        }
+
+        meshChunksTested = tested;
+        meshChunksVisible = visible;
+        meshChunkFacesRejected = rejectedFaces;
+    }
+
     private static int growCapacity(
             int current,
             int required,
@@ -237,14 +339,12 @@ public final class RenderFrame {
         while (capacity < required) {
             if (
                     capacity >
-                            Integer.MAX_VALUE /
-                                    2
+                            Integer.MAX_VALUE / 2
             ) {
                 return required;
             }
 
-            capacity <<=
-                    1;
+            capacity <<= 1;
         }
 
         return capacity;

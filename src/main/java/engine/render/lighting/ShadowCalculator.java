@@ -2,7 +2,6 @@ package engine.render.lighting;
 
 import engine.GameEngine;
 import engine.lighting.LightData;
-import engine.lighting.LightType;
 import engine.render.RenderFrame;
 import engine.render.util.RenderWorkerContext;
 import java.util.Arrays;
@@ -14,9 +13,9 @@ import util.AABB;
 /**
  * Builds one independent depth shadow map per shadow-casting light.
  *
- * Only directional lights generate shadow maps. Point/spot maps (especially
- * 6-face cubemaps) are the dominant remaining CPU cost and are deliberately
- * disabled for performance. Visibility queries for those lights always return 1.0.
+ * Every shadow-enabled light type is allowed to generate a shadow map.
+ * Directional, point, spot, and other supported light types are passed through
+ * to ShadowMap without being disabled here.
  *
  * Shadow maps are immutable while the camera frame is rasterized, so tile
  * workers may sample them concurrently without locks.
@@ -77,15 +76,10 @@ public final class ShadowCalculator {
             final LightData light =
                     frame.lightArray[lightIndex];
 
-            /*
-             * Aggressive: only directional lights cast shadows.
-             * Point/spot cubemaps are extremely expensive on CPU.
-             */
             if (
                     light == null ||
                             !light.shadows ||
-                            light.strength <= 0.0 ||
-                            light.type != LightType.DIRECTIONAL
+                            light.strength <= 0.0
             ) {
                 maps[lightIndex] = null;
                 continue;
@@ -174,8 +168,7 @@ public final class ShadowCalculator {
         if (
                 light == null ||
                         !light.shadows ||
-                        map == null ||
-                        light.type != LightType.DIRECTIONAL
+                        map == null
         ) {
             return 1.0;
         }

@@ -14,15 +14,22 @@ public final class DebugOverlay {
 
     private final EngineContext context;
 
-    public DebugOverlay(EngineContext context) {
+    public DebugOverlay(
+            EngineContext context
+    ) {
         this.context = context;
     }
 
-    public void draw(Graphics graphics, int fps) {
+    public void draw(
+            Graphics graphics,
+            int fps
+    ) {
         final RenderStats stats =
                 context.renderer.getLatestStats();
 
-        graphics.setColor(Color.WHITE);
+        graphics.setColor(
+                Color.WHITE
+        );
 
         int line = 0;
 
@@ -37,6 +44,15 @@ public final class DebugOverlay {
                 line++,
                 "Visible objects: " +
                         stats.visibleObjects()
+        );
+
+        drawLine(
+                graphics,
+                line++,
+                "Chunks nearby/visible: " +
+                        stats.nearbyChunks() +
+                        "/" +
+                        stats.visibleChunks()
         );
 
         drawLine(
@@ -111,6 +127,33 @@ public final class DebugOverlay {
                 "  Camera pass: " +
                         milliseconds(
                                 stats.cameraPassMilliseconds()
+                        )
+        );
+
+        drawLine(
+                graphics,
+                line++,
+                "    Camera transform: " +
+                        milliseconds(
+                                stats.cameraTransformationMilliseconds()
+                        )
+        );
+
+        drawLine(
+                graphics,
+                line++,
+                "    Clipping: " +
+                        milliseconds(
+                                stats.clippingMilliseconds()
+                        )
+        );
+
+        drawLine(
+                graphics,
+                line++,
+                "    Triangle emission: " +
+                        milliseconds(
+                                stats.triangleEmissionMilliseconds()
                         )
         );
 
@@ -285,8 +328,7 @@ public final class DebugOverlay {
                 "RenderScale: " +
                         format(
                                 "%.2f",
-                                context.renderer
-                                        .getRenderScale()
+                                context.renderer.getRenderScale()
                         )
         );
 
@@ -294,8 +336,7 @@ public final class DebugOverlay {
                 graphics,
                 line++,
                 "FXAA: " +
-                        context.renderer
-                                .isFxaaEnabled()
+                        context.renderer.isFxaaEnabled()
         );
 
         drawLine(
@@ -304,8 +345,7 @@ public final class DebugOverlay {
                 "MasterVol: " +
                         format(
                                 "%.2f",
-                                context.soundEngine
-                                        .getMasterVolume()
+                                context.soundEngine.getMasterVolume()
                         )
         );
     }

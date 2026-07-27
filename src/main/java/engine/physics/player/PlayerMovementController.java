@@ -3,6 +3,8 @@ package engine.physics.player;
 import engine.GameEngine;
 import engine.camera.Camera;
 
+import static engine.physics.player.PlayerCapsule.MAX_STEP_DOWN;
+
 public final class PlayerMovementController {
 
     public static final double GRAVITY = -30.0;
@@ -55,7 +57,9 @@ public final class PlayerMovementController {
             double sinYaw
     ) {
         double previousX = camera.x;
+        double previousY = camera.y;
         double previousZ = camera.z;
+        boolean wasOnGround = camera.onGround;
 
         playerMotion.moveHorizontal(
                 camera,
@@ -65,14 +69,16 @@ public final class PlayerMovementController {
         );
 
         if (!camera.flightMode) {
-            collisionResolver.resolveHorizontal(
+            collisionResolver.resolveGroundMovement(
                     camera,
                     previousX,
-                    previousZ
+                    previousY,
+                    previousZ,
+                    wasOnGround
             );
         }
 
-        double previousY = camera.y;
+        double verticalStartY = camera.y;
 
         playerMotion.moveVertical(camera, delta);
 
@@ -80,8 +86,9 @@ public final class PlayerMovementController {
             collisionResolver.resolveVertical(
                     camera,
                     previousX,
-                    previousY,
-                    previousZ
+                    verticalStartY,
+                    previousZ,
+                    wasOnGround ? MAX_STEP_DOWN : 0.0
             );
         }
 

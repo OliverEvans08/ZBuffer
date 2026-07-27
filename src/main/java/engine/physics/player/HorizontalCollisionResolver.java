@@ -9,6 +9,7 @@ import java.util.ArrayList;
 import objects.GameObject;
 import util.AABB;
 
+import static engine.physics.collision.AabbCollisionQueries.VERT_SNAP_EPS;
 import static engine.physics.collision.AabbCollisionQueries.resolveCapsuleAgainstAabb;
 import static engine.physics.collision.CapsuleTriangleQueries.resolveCapsuleAgainstTriangle;
 import static engine.physics.player.PlayerCapsule.HEIGHT;
@@ -46,6 +47,9 @@ public final class HorizontalCollisionResolver {
         if (gameEngine == null) {
             return;
         }
+
+        double supportTolerance =
+                camera.onGround ? VERT_SNAP_EPS : 0.0;
 
         double sweptMinimumX =
                 Math.min(previousX, camera.x) - RADIUS;
@@ -87,7 +91,13 @@ public final class HorizontalCollisionResolver {
                             || bounds.maxZ < sweptMinimumZ
                             || bounds.minZ > sweptMaximumZ
                             || camera.y + HEIGHT <= bounds.minY
-                            || camera.y >= bounds.maxY
+                            /*
+                             * A support face or tiny seam at foot height
+                             * must not behave like a vertical wall. The
+                             * vertical/step pass will put the feet on it.
+                             */
+                            || camera.y
+                            >= bounds.maxY - supportTolerance
                             || collisionFilter
                             .shouldIgnoreColliderForPlayer(
                                     camera,
@@ -114,6 +124,8 @@ public final class HorizontalCollisionResolver {
             MeshCollider collider
     ) {
         MeshBvh bvh = collider.wallBvh;
+        double supportTolerance =
+                camera.onGround ? VERT_SNAP_EPS : 0.0;
 
         ensureBvhStackCapacity(bvh.nodeCount);
 
@@ -130,8 +142,7 @@ public final class HorizontalCollisionResolver {
                             - HORIZONTAL_TRI_PAD
                             > camera.x + RADIUS
                             || bvh.maxY[node]
-                            + HORIZONTAL_TRI_PAD
-                            <= camera.y
+                            <= camera.y + supportTolerance
                             || bvh.minY[node]
                             - HORIZONTAL_TRI_PAD
                             >= camera.y + HEIGHT
@@ -165,8 +176,8 @@ public final class HorizontalCollisionResolver {
                                     - HORIZONTAL_TRI_PAD
                                     > camera.x + RADIUS
                                     || collider.maxY[triangle]
-                                    + HORIZONTAL_TRI_PAD
                                     <= camera.y
+                                    + supportTolerance
                                     || collider.minY[triangle]
                                     - HORIZONTAL_TRI_PAD
                                     >= camera.y + HEIGHT

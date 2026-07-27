@@ -11,21 +11,28 @@ import objects.GameObject;
 import util.AABB;
 
 public final class RenderMeshCompiler {
+
     private static final double BASIS_EPSILON =
             1.0e-20;
 
     private final RenderFrame frame;
-
     private final LightingCalculator lightingCalculator;
     private final ShadowCalculator shadowCalculator;
 
-    public final IdentityHashMap<GameObject, RenderMesh>
-            meshDataCache =
+    public final IdentityHashMap<GameObject, RenderMesh> meshDataCache =
             new IdentityHashMap<>(4096);
 
-    public final IdentityHashMap<GameObject, ProjectionCache>
-            projectionCache =
+    public final IdentityHashMap<GameObject, ProjectionCache> projectionCache =
             new IdentityHashMap<>(4096);
+
+    public final IdentityHashMap<GameObject, RenderMeshChunkLayout> chunkLayoutCache =
+            new IdentityHashMap<>(4096);
+
+    public final IdentityHashMap<GameObject, byte[]> chunkVisibilityCache =
+            new IdentityHashMap<>(4096);
+
+    private RenderChunkSettings chunkSettings =
+            RenderChunkSettings.fromSystemProperties();
 
     public RenderMeshCompiler(
             RenderFrame frame,
@@ -33,10 +40,37 @@ public final class RenderMeshCompiler {
             ShadowCalculator shadowCalculator
     ) {
         this.frame = frame;
-        this.lightingCalculator =
-                lightingCalculator;
-        this.shadowCalculator =
-                shadowCalculator;
+        this.lightingCalculator = lightingCalculator;
+        this.shadowCalculator = shadowCalculator;
+    }
+
+    public RenderChunkSettings getChunkSettings() {
+        return chunkSettings;
+    }
+
+    /**
+     * Changes the policy used by future mesh compilations.
+     *
+     * <p>Compiled geometry is invalidated because face membership and the
+     * benefit decision are both policy-dependent. Projection buffers remain
+     * reusable and will resize or invalidate naturally when the replacement
+     * RenderMesh is observed.</p>
+     */
+    public void setChunkSettings(
+            RenderChunkSettings settings
+    ) {
+        if (settings == null) {
+            throw new NullPointerException("settings");
+        }
+
+        if (settings.equals(chunkSettings)) {
+            return;
+        }
+
+        chunkSettings = settings;
+        meshDataCache.clear();
+        chunkLayoutCache.clear();
+        chunkVisibilityCache.clear();
     }
 
     public static RenderMesh compile(
@@ -44,6 +78,32 @@ public final class RenderMeshCompiler {
             int[][] faces,
             double[][] uvs
     ) {
+        return compileChunked(
+                vertices,
+                faces,
+                uvs,
+                RenderChunkSettings.disabled()
+        ).mesh();
+    }
+
+    public static RenderMeshCompilation compileChunked(
+            double[][] vertices,
+            int[][] faces,
+            double[][] uvs,
+            RenderChunkSettings chunkSettings
+    ) {
+        if (vertices == null) {
+            throw new NullPointerException("vertices");
+        }
+
+        if (faces == null) {
+            throw new NullPointerException("faces");
+        }
+
+        if (chunkSettings == null) {
+            throw new NullPointerException("chunkSettings");
+        }
+
         final int vertexCount =
                 vertices.length;
 
@@ -129,7 +189,9 @@ public final class RenderMeshCompiler {
         }
 
         final int[] indices =
-                new int[validFaceCount * 3];
+                new int[
+                        validFaceCount * 3
+                        ];
 
         int output = 0;
 
@@ -178,7 +240,8 @@ public final class RenderMeshCompiler {
                 new double[9];
 
         if (anchor0 >= 0) {
-            double maximumLengthSquared = 0.0;
+            double maximumLengthSquared =
+                    0.0;
 
             for (
                     int index = 0;
@@ -190,20 +253,26 @@ public final class RenderMeshCompiler {
                 }
 
                 final double deltaX =
-                        x[index] - x[anchor0];
+                        x[index] -
+                                x[anchor0];
 
                 final double deltaY =
-                        y[index] - y[anchor0];
+                        y[index] -
+                                y[anchor0];
 
                 final double deltaZ =
-                        z[index] - z[anchor0];
+                        z[index] -
+                                z[anchor0];
 
                 final double lengthSquared =
                         deltaX * deltaX +
                                 deltaY * deltaY +
                                 deltaZ * deltaZ;
 
-                if (lengthSquared > maximumLengthSquared) {
+                if (
+                        lengthSquared >
+                                maximumLengthSquared
+                ) {
                     maximumLengthSquared =
                             lengthSquared;
 
@@ -211,17 +280,24 @@ public final class RenderMeshCompiler {
                 }
             }
 
-            if (maximumLengthSquared > BASIS_EPSILON) {
+            if (
+                    maximumLengthSquared >
+                            BASIS_EPSILON
+            ) {
                 final double direction1X =
-                        x[anchor1] - x[anchor0];
+                        x[anchor1] -
+                                x[anchor0];
 
                 final double direction1Y =
-                        y[anchor1] - y[anchor0];
+                        y[anchor1] -
+                                y[anchor0];
 
                 final double direction1Z =
-                        z[anchor1] - z[anchor0];
+                        z[anchor1] -
+                                z[anchor0];
 
-                double maximumCrossSquared = 0.0;
+                double maximumCrossSquared =
+                        0.0;
 
                 for (
                         int index = 0;
@@ -233,13 +309,16 @@ public final class RenderMeshCompiler {
                     }
 
                     final double deltaX =
-                            x[index] - x[anchor0];
+                            x[index] -
+                                    x[anchor0];
 
                     final double deltaY =
-                            y[index] - y[anchor0];
+                            y[index] -
+                                    y[anchor0];
 
                     final double deltaZ =
-                            z[index] - z[anchor0];
+                            z[index] -
+                                    z[anchor0];
 
                     final double crossX =
                             direction1Y * deltaZ -
@@ -258,7 +337,10 @@ public final class RenderMeshCompiler {
                                     crossY * crossY +
                                     crossZ * crossZ;
 
-                    if (crossSquared > maximumCrossSquared) {
+                    if (
+                            crossSquared >
+                                    maximumCrossSquared
+                    ) {
                         maximumCrossSquared =
                                 crossSquared;
 
@@ -266,15 +348,21 @@ public final class RenderMeshCompiler {
                     }
                 }
 
-                if (maximumCrossSquared > BASIS_EPSILON) {
+                if (
+                        maximumCrossSquared >
+                                BASIS_EPSILON
+                ) {
                     final double direction2X =
-                            x[anchor2] - x[anchor0];
+                            x[anchor2] -
+                                    x[anchor0];
 
                     final double direction2Y =
-                            y[anchor2] - y[anchor0];
+                            y[anchor2] -
+                                    y[anchor0];
 
                     final double direction2Z =
-                            z[anchor2] - z[anchor0];
+                            z[anchor2] -
+                                    z[anchor0];
 
                     final double crossX =
                             direction1Y * direction2Z -
@@ -288,7 +376,8 @@ public final class RenderMeshCompiler {
                             direction1X * direction2Y -
                                     direction1Y * direction2X;
 
-                    double maximumDeterminant = 0.0;
+                    double maximumDeterminant =
+                            0.0;
 
                     for (
                             int index = 0;
@@ -300,13 +389,16 @@ public final class RenderMeshCompiler {
                         }
 
                         final double direction3X =
-                                x[index] - x[anchor0];
+                                x[index] -
+                                        x[anchor0];
 
                         final double direction3Y =
-                                y[index] - y[anchor0];
+                                y[index] -
+                                        y[anchor0];
 
                         final double direction3Z =
-                                z[index] - z[anchor0];
+                                z[index] -
+                                        z[anchor0];
 
                         final double determinant =
                                 Math.abs(
@@ -315,7 +407,10 @@ public final class RenderMeshCompiler {
                                                 crossZ * direction3Z
                                 );
 
-                        if (determinant > maximumDeterminant) {
+                        if (
+                                determinant >
+                                        maximumDeterminant
+                        ) {
                             maximumDeterminant =
                                     determinant;
 
@@ -327,17 +422,23 @@ public final class RenderMeshCompiler {
                     final double direction3Y;
                     final double direction3Z;
 
-                    if (maximumDeterminant > BASIS_EPSILON) {
+                    if (
+                            maximumDeterminant >
+                                    BASIS_EPSILON
+                    ) {
                         basisMode = 3;
 
                         direction3X =
-                                x[anchor3] - x[anchor0];
+                                x[anchor3] -
+                                        x[anchor0];
 
                         direction3Y =
-                                y[anchor3] - y[anchor0];
+                                y[anchor3] -
+                                        y[anchor0];
 
                         direction3Z =
-                                z[anchor3] - z[anchor0];
+                                z[anchor3] -
+                                        z[anchor0];
                     } else {
                         basisMode = 2;
 
@@ -348,13 +449,16 @@ public final class RenderMeshCompiler {
                                         );
 
                         direction3X =
-                                crossX * inverseCrossLength;
+                                crossX *
+                                        inverseCrossLength;
 
                         direction3Y =
-                                crossY * inverseCrossLength;
+                                crossY *
+                                        inverseCrossLength;
 
                         direction3Z =
-                                crossZ * inverseCrossLength;
+                                crossZ *
+                                        inverseCrossLength;
                     }
 
                     invertBasis(
@@ -373,13 +477,19 @@ public final class RenderMeshCompiler {
                     basisMode = 1;
 
                     final double absoluteX =
-                            Math.abs(direction1X);
+                            Math.abs(
+                                    direction1X
+                            );
 
                     final double absoluteY =
-                            Math.abs(direction1Y);
+                            Math.abs(
+                                    direction1Y
+                            );
 
                     final double absoluteZ =
-                            Math.abs(direction1Z);
+                            Math.abs(
+                                    direction1Z
+                            );
 
                     double direction2X;
                     double direction2Y;
@@ -392,7 +502,9 @@ public final class RenderMeshCompiler {
                         direction2X = 0.0;
                         direction2Y = -direction1Z;
                         direction2Z = direction1Y;
-                    } else if (absoluteY <= absoluteZ) {
+                    } else if (
+                            absoluteY <= absoluteZ
+                    ) {
                         direction2X = -direction1Z;
                         direction2Y = 0.0;
                         direction2Z = direction1X;
@@ -446,21 +558,36 @@ public final class RenderMeshCompiler {
             }
         }
 
-        return new RenderMesh(
-                vertexCount,
-                faces,
-                x,
-                y,
-                z,
-                u,
-                v,
-                indices,
-                anchor0,
-                anchor1,
-                anchor2,
-                anchor3,
-                basisMode,
-                inverseBasis
+        final RenderMeshChunkLayout chunkLayout =
+                RenderMeshPartitioner.partition(
+                        x,
+                        y,
+                        z,
+                        indices,
+                        chunkSettings
+                );
+
+        final RenderMesh mesh =
+                new RenderMesh(
+                        vertexCount,
+                        faces,
+                        x,
+                        y,
+                        z,
+                        u,
+                        v,
+                        indices,
+                        anchor0,
+                        anchor1,
+                        anchor2,
+                        anchor3,
+                        basisMode,
+                        inverseBasis
+                );
+
+        return new RenderMeshCompilation(
+                mesh,
+                chunkLayout
         );
     }
 
@@ -469,17 +596,28 @@ public final class RenderMeshCompiler {
             int vertexCount,
             byte[] validVertices
     ) {
-        return face != null &&
-                face.length == 3 &&
-                validIndex(face[0], vertexCount) &&
-                validIndex(face[1], vertexCount) &&
-                validIndex(face[2], vertexCount) &&
-                validVertices[face[0]] != 0 &&
-                validVertices[face[1]] != 0 &&
-                validVertices[face[2]] != 0 &&
-                face[0] != face[1] &&
-                face[1] != face[2] &&
-                face[2] != face[0];
+        return (
+                face != null &&
+                        face.length == 3 &&
+                        validIndex(
+                                face[0],
+                                vertexCount
+                        ) &&
+                        validIndex(
+                                face[1],
+                                vertexCount
+                        ) &&
+                        validIndex(
+                                face[2],
+                                vertexCount
+                        ) &&
+                        validVertices[face[0]] != 0 &&
+                        validVertices[face[1]] != 0 &&
+                        validVertices[face[2]] != 0 &&
+                        face[0] != face[1] &&
+                        face[1] != face[2] &&
+                        face[2] != face[0]
+        );
     }
 
     public static boolean calculateModelMatrix(
@@ -551,13 +689,19 @@ public final class RenderMeshCompiler {
             basis2Z = output[8] - originZ;
         } else if (mesh.basisMode == 1) {
             final double absoluteX =
-                    Math.abs(basis1X);
+                    Math.abs(
+                            basis1X
+                    );
 
             final double absoluteY =
-                    Math.abs(basis1Y);
+                    Math.abs(
+                            basis1Y
+                    );
 
             final double absoluteZ =
-                    Math.abs(basis1Z);
+                    Math.abs(
+                            basis1Z
+                    );
 
             if (
                     absoluteX <= absoluteY &&
@@ -566,7 +710,9 @@ public final class RenderMeshCompiler {
                 basis2X = 0.0;
                 basis2Y = -basis1Z;
                 basis2Z = basis1Y;
-            } else if (absoluteY <= absoluteZ) {
+            } else if (
+                    absoluteY <= absoluteZ
+            ) {
                 basis2X = -basis1Z;
                 basis2Y = 0.0;
                 basis2Z = basis1X;
@@ -581,7 +727,10 @@ public final class RenderMeshCompiler {
                             basis2Y * basis2Y +
                             basis2Z * basis2Z;
 
-            if (perpendicularLengthSquared <= BASIS_EPSILON) {
+            if (
+                    perpendicularLengthSquared <=
+                            BASIS_EPSILON
+            ) {
                 return false;
             }
 
@@ -629,7 +778,10 @@ public final class RenderMeshCompiler {
                             basis3Y * basis3Y +
                             basis3Z * basis3Z;
 
-            if (lengthSquared <= BASIS_EPSILON) {
+            if (
+                    lengthSquared <=
+                            BASIS_EPSILON
+            ) {
                 return false;
             }
 
@@ -740,7 +892,12 @@ public final class RenderMeshCompiler {
             double[] output,
             int offset
     ) {
-        if (!validIndex(index, vertices.length)) {
+        if (
+                !validIndex(
+                        index,
+                        vertices.length
+                )
+        ) {
             return false;
         }
 
@@ -794,65 +951,164 @@ public final class RenderMeshCompiler {
                                 );
 
         final double inverseDeterminant =
-                1.0 / determinant;
+                1.0 /
+                        determinant;
 
         output[0] =
                 (
                         basis2Y * basis3Z -
                                 basis3Y * basis2Z
-                ) * inverseDeterminant;
+                ) *
+                        inverseDeterminant;
 
         output[1] =
                 (
                         basis3X * basis2Z -
                                 basis2X * basis3Z
-                ) * inverseDeterminant;
+                ) *
+                        inverseDeterminant;
 
         output[2] =
                 (
                         basis2X * basis3Y -
                                 basis3X * basis2Y
-                ) * inverseDeterminant;
+                ) *
+                        inverseDeterminant;
 
         output[3] =
                 (
                         basis3Y * basis1Z -
                                 basis1Y * basis3Z
-                ) * inverseDeterminant;
+                ) *
+                        inverseDeterminant;
 
         output[4] =
                 (
                         basis1X * basis3Z -
                                 basis3X * basis1Z
-                ) * inverseDeterminant;
+                ) *
+                        inverseDeterminant;
 
         output[5] =
                 (
                         basis3X * basis1Y -
                                 basis1X * basis3Y
-                ) * inverseDeterminant;
+                ) *
+                        inverseDeterminant;
 
         output[6] =
                 (
                         basis1Y * basis2Z -
                                 basis2Y * basis1Z
-                ) * inverseDeterminant;
+                ) *
+                        inverseDeterminant;
 
         output[7] =
                 (
                         basis2X * basis1Z -
                                 basis1X * basis2Z
-                ) * inverseDeterminant;
+                ) *
+                        inverseDeterminant;
 
         output[8] =
                 (
                         basis1X * basis2Y -
                                 basis2X * basis1Y
-                ) * inverseDeterminant;
+                ) *
+                        inverseDeterminant;
+    }
+
+    private static void writeModelViewMatrix(
+            double[] model,
+            double[] output,
+            int offset,
+            double cameraX,
+            double cameraY,
+            double cameraZ,
+            double cosineYaw,
+            double sineYaw,
+            double cosinePitch,
+            double sinePitch,
+            double zBias
+    ) {
+        final double yawZ0 =
+                -sineYaw * model[0] +
+                        cosineYaw * model[8];
+
+        final double yawZ1 =
+                -sineYaw * model[1] +
+                        cosineYaw * model[9];
+
+        final double yawZ2 =
+                -sineYaw * model[2] +
+                        cosineYaw * model[10];
+
+        final double translatedX =
+                model[3] - cameraX;
+
+        final double translatedY =
+                model[7] - cameraY;
+
+        final double translatedZ =
+                model[11] - cameraZ;
+
+        final double yawTranslatedZ =
+                -sineYaw * translatedX +
+                        cosineYaw * translatedZ;
+
+        output[offset] =
+                cosineYaw * model[0] +
+                        sineYaw * model[8];
+
+        output[offset + 1] =
+                cosineYaw * model[1] +
+                        sineYaw * model[9];
+
+        output[offset + 2] =
+                cosineYaw * model[2] +
+                        sineYaw * model[10];
+
+        output[offset + 3] =
+                cosineYaw * translatedX +
+                        sineYaw * translatedZ;
+
+        output[offset + 4] =
+                cosinePitch * model[4] +
+                        sinePitch * yawZ0;
+
+        output[offset + 5] =
+                cosinePitch * model[5] +
+                        sinePitch * yawZ1;
+
+        output[offset + 6] =
+                cosinePitch * model[6] +
+                        sinePitch * yawZ2;
+
+        output[offset + 7] =
+                cosinePitch * translatedY +
+                        sinePitch * yawTranslatedZ;
+
+        output[offset + 8] =
+                -sinePitch * model[4] +
+                        cosinePitch * yawZ0;
+
+        output[offset + 9] =
+                -sinePitch * model[5] +
+                        cosinePitch * yawZ1;
+
+        output[offset + 10] =
+                -sinePitch * model[6] +
+                        cosinePitch * yawZ2;
+
+        output[offset + 11] =
+                -sinePitch * translatedY +
+                        cosinePitch * yawTranslatedZ +
+                        zBias;
     }
 
     public void buildTrianglesForWorker(
             RenderWorkerContext context,
+            TriangleBuildTimings timings,
             int orderedItemStart,
             int orderedItemCount,
             int width,
@@ -867,10 +1123,17 @@ public final class RenderMeshCompiler {
             GameObject playerBody
     ) {
         final int orderedItemEnd =
-                orderedItemStart + orderedItemCount;
+                orderedItemStart +
+                        orderedItemCount;
 
         final int[] orderedItems =
                 frame.workerOrderedItems;
+
+        final byte[] projectionValid =
+                frame.projectionValid;
+
+        final long transformStart =
+                System.nanoTime();
 
         for (
                 int orderedPosition = orderedItemStart;
@@ -879,6 +1142,96 @@ public final class RenderMeshCompiler {
         ) {
             final int item =
                     orderedItems[orderedPosition];
+
+            frame.itemChunksTested[item] = 0;
+            frame.itemChunksVisible[item] = 0;
+            frame.itemFacesRejected[item] = 0;
+            frame.chunkCullValid[item] = 0;
+
+            final RenderMesh mesh =
+                    frame.meshes[item];
+
+            final ProjectionCache projected =
+                    frame.projections[item];
+
+            final boolean validProjection =
+                    projected.update(
+                            mesh,
+                            frame.worldVertices[item],
+                            context.modelMatrix,
+                            context.modelViewMatrix,
+                            cameraX,
+                            cameraY,
+                            cameraZ,
+                            frame.cosineYaw,
+                            frame.sineYaw,
+                            frame.cosinePitch,
+                            frame.sinePitch,
+                            frame.zBiases[item],
+                            projectionScale,
+                            width,
+                            height
+                    );
+
+            projectionValid[item] =
+                    (byte) (
+                            validProjection
+                                    ? 1
+                                    : 0
+                    );
+
+            final RenderMeshChunkLayout chunkLayout =
+                    frame.chunkLayouts[item];
+
+            if (
+                    validProjection &&
+                            chunkLayout != null &&
+                            chunkLayout.isPartitioned() &&
+                            calculateModelMatrix(
+                                    mesh,
+                                    frame.worldVertices[item],
+                                    context.modelMatrix
+                            )
+            ) {
+                writeModelViewMatrix(
+                        context.modelMatrix,
+                        frame.modelViewMatrices,
+                        item * 12,
+                        cameraX,
+                        cameraY,
+                        cameraZ,
+                        frame.cosineYaw,
+                        frame.sineYaw,
+                        frame.cosinePitch,
+                        frame.sinePitch,
+                        frame.zBiases[item]
+                );
+
+                frame.chunkCullValid[item] = 1;
+            }
+        }
+
+        timings.cameraTransformNanos +=
+                System.nanoTime() -
+                        transformStart;
+
+        final long clippingBefore =
+                timings.clippingNanos;
+
+        final long emissionStart =
+                System.nanoTime();
+
+        for (
+                int orderedPosition = orderedItemStart;
+                orderedPosition < orderedItemEnd;
+                orderedPosition++
+        ) {
+            final int item =
+                    orderedItems[orderedPosition];
+
+            if (projectionValid[item] == 0) {
+                continue;
+            }
 
             final GameObject object =
                     frame.objects[item];
@@ -901,26 +1254,80 @@ public final class RenderMeshCompiler {
             final double nearDistance =
                     frame.nearDistances[item];
 
-            if (
-                    !projected.update(
-                            mesh,
-                            frame.worldVertices[item],
-                            context.modelMatrix,
-                            context.modelViewMatrix,
-                            cameraX,
-                            cameraY,
-                            cameraZ,
-                            frame.cosineYaw,
-                            frame.sineYaw,
-                            frame.cosinePitch,
-                            frame.sinePitch,
-                            frame.zBiases[item],
-                            projectionScale,
-                            width,
-                            height
-                    )
-            ) {
-                continue;
+            final RenderMeshChunkLayout chunkLayout =
+                    frame.chunkLayouts[item];
+
+            final boolean partitioned =
+                    chunkLayout != null &&
+                            chunkLayout.isPartitioned() &&
+                            frame.chunkCullValid[item] != 0;
+
+            final byte[] visibleChunks =
+                    frame.visibleMeshChunks[item];
+
+            if (partitioned) {
+                final RenderMeshChunk[] chunks =
+                        chunkLayout.chunks();
+
+                final int matrixOffset =
+                        item * 12;
+
+                int visibleChunkCount = 0;
+                int visibleFaceCount = 0;
+
+                for (
+                        int chunkIndex = 0;
+                        chunkIndex < chunks.length;
+                        chunkIndex++
+                ) {
+                    final RenderMeshChunk chunk =
+                            chunks[chunkIndex];
+
+                    final boolean visible =
+                            RenderChunkCuller.passesFrustum(
+                                    chunk,
+                                    frame.modelViewMatrices,
+                                    matrixOffset,
+                                    nearDistance,
+                                    farDistance,
+                                    tangentHalfFieldOfViewX,
+                                    tangentHalfFieldOfViewY
+                            );
+
+                    visibleChunks[chunkIndex] =
+                            (byte) (
+                                    visible
+                                            ? 1
+                                            : 0
+                            );
+
+                    if (visible) {
+                        visibleChunkCount++;
+                        visibleFaceCount +=
+                                chunk.faceCount;
+                    }
+                }
+
+                frame.itemChunksTested[item] =
+                        chunks.length;
+
+                frame.itemChunksVisible[item] =
+                        visibleChunkCount;
+
+                frame.itemFacesRejected[item] =
+                        Math.max(
+                                0,
+                                mesh.faceCount -
+                                        visibleFaceCount
+                        );
+
+                if (visibleChunkCount == 0) {
+                    continue;
+                }
+            } else {
+                frame.itemChunksTested[item] = 0;
+                frame.itemChunksVisible[item] = 0;
+                frame.itemFacesRejected[item] = 0;
             }
 
             shadowCalculator.calculateObjectShadowFlags(
@@ -936,28 +1343,85 @@ public final class RenderMeshCompiler {
             final int[] indices =
                     mesh.indices;
 
-            for (
-                    int faceOffset = 0;
-                    faceOffset < indices.length;
-                    faceOffset += 3
-            ) {
-                buildFaceTriangle(
-                        context,
-                        mesh,
-                        projected,
-                        indices[faceOffset],
-                        indices[faceOffset + 1],
-                        indices[faceOffset + 2],
-                        nearDistance,
-                        farDistance,
-                        projectionScale,
-                        width,
-                        height,
-                        material,
-                        doubleSided,
-                        material.wireframe
-                );
+            if (!partitioned) {
+                for (
+                        int faceOffset = 0;
+                        faceOffset < indices.length;
+                        faceOffset += 3
+                ) {
+                    buildFaceTriangle(
+                            context,
+                            mesh,
+                            projected,
+                            indices[faceOffset],
+                            indices[faceOffset + 1],
+                            indices[faceOffset + 2],
+                            nearDistance,
+                            farDistance,
+                            projectionScale,
+                            width,
+                            height,
+                            material,
+                            doubleSided,
+                            material.wireframe,
+                            timings
+                    );
+                }
+            } else {
+                final byte[] faceChunks =
+                        chunkLayout.faceChunks();
+
+                int face = 0;
+
+                for (
+                        int faceOffset = 0;
+                        faceOffset < indices.length;
+                        faceOffset += 3
+                ) {
+                    final int chunkIndex =
+                            faceChunks[face++] &
+                                    0xff;
+
+                    if (
+                            visibleChunks[chunkIndex] ==
+                                    0
+                    ) {
+                        continue;
+                    }
+
+                    buildFaceTriangle(
+                            context,
+                            mesh,
+                            projected,
+                            indices[faceOffset],
+                            indices[faceOffset + 1],
+                            indices[faceOffset + 2],
+                            nearDistance,
+                            farDistance,
+                            projectionScale,
+                            width,
+                            height,
+                            material,
+                            doubleSided,
+                            material.wireframe,
+                            timings
+                    );
+                }
             }
+        }
+
+        final long clippingDuringEmission =
+                timings.clippingNanos -
+                        clippingBefore;
+
+        final long emissionElapsed =
+                System.nanoTime() -
+                        emissionStart -
+                        clippingDuringEmission;
+
+        if (emissionElapsed > 0L) {
+            timings.triangleEmissionNanos +=
+                    emissionElapsed;
         }
     }
 
@@ -975,7 +1439,8 @@ public final class RenderMeshCompiler {
             int height,
             MaterialState material,
             boolean doubleSided,
-            boolean wireframe
+            boolean wireframe,
+            TriangleBuildTimings timings
     ) {
         if (
                 projected.cameraZ[index0] >= farDistance &&
@@ -1007,22 +1472,28 @@ public final class RenderMeshCompiler {
         final double point2Z = worldZ[index2];
 
         final double edge1X =
-                point1X - point0X;
+                point1X -
+                        point0X;
 
         final double edge1Y =
-                point1Y - point0Y;
+                point1Y -
+                        point0Y;
 
         final double edge1Z =
-                point1Z - point0Z;
+                point1Z -
+                        point0Z;
 
         final double edge2X =
-                point2X - point0X;
+                point2X -
+                        point0X;
 
         final double edge2Y =
-                point2Y - point0Y;
+                point2Y -
+                        point0Y;
 
         final double edge2Z =
-                point2Z - point0Z;
+                point2Z -
+                        point0Z;
 
         double normalX =
                 edge1Y * edge2Z -
@@ -1041,7 +1512,10 @@ public final class RenderMeshCompiler {
                         normalY * normalY +
                         normalZ * normalZ;
 
-        if (normalLengthSquared < 1.0e-24) {
+        if (
+                normalLengthSquared <
+                        1.0e-24
+        ) {
             return;
         }
 
@@ -1055,15 +1529,6 @@ public final class RenderMeshCompiler {
         normalY *= inverseNormalLength;
         normalZ *= inverseNormalLength;
 
-        /*
-         * Rotate the already-normalised world-space face normal into camera
-         * space once. TriangleBatch previously rebuilt the same normal from
-         * three camera-space vertices, including another cross product and
-         * square root for every emitted triangle and again after clipping.
-         *
-         * A pure camera rotation preserves vector length, so the result does
-         * not need to be normalised again.
-         */
         final double cameraNormalX =
                 frame.cosineYaw * normalX +
                         frame.sineYaw * normalZ;
@@ -1084,36 +1549,41 @@ public final class RenderMeshCompiler {
         int shadeGreen = 255;
         int shadeBlue = 255;
 
-        int lightMask =
-                0;
+        int lightMask = 0;
 
-        float baseLightRed =
-                0.0f;
-
-        float baseLightGreen =
-                0.0f;
-
-        float baseLightBlue =
-                0.0f;
+        float baseLightRed = 0.0f;
+        float baseLightGreen = 0.0f;
+        float baseLightBlue = 0.0f;
 
         final boolean frameRequiresPerPixelLighting =
-                lightingCalculator
-                        .isPerPixelLightingRequired();
+                lightingCalculator.isPerPixelLightingRequired();
 
         if (
                 wireframe ||
                         !frameRequiresPerPixelLighting
         ) {
             final double centerX =
-                    (point0X + point1X + point2X) /
+                    (
+                            point0X +
+                                    point1X +
+                                    point2X
+                    ) /
                             3.0;
 
             final double centerY =
-                    (point0Y + point1Y + point2Y) /
+                    (
+                            point0Y +
+                                    point1Y +
+                                    point2Y
+                    ) /
                             3.0;
 
             final double centerZ =
-                    (point0Z + point1Z + point2Z) /
+                    (
+                            point0Z +
+                                    point1Z +
+                                    point2Z
+                    ) /
                             3.0;
 
             final double[] lighting =
@@ -1156,14 +1626,13 @@ public final class RenderMeshCompiler {
                     );
         } else {
             final double[] invariantLighting =
-                    lightingCalculator
-                            .calculateInvariantLighting(
-                                    context,
-                                    normalX,
-                                    normalY,
-                                    normalZ,
-                                    doubleSided
-                            );
+                    lightingCalculator.calculateInvariantLighting(
+                            context,
+                            normalX,
+                            normalY,
+                            normalZ,
+                            doubleSided
+                    );
 
             baseLightRed =
                     (float) invariantLighting[0];
@@ -1174,88 +1643,61 @@ public final class RenderMeshCompiler {
             baseLightBlue =
                     (float) invariantLighting[2];
 
-            double minimumX =
-                    point0X;
-
-            double maximumX =
-                    point0X;
+            double minimumX = point0X;
+            double maximumX = point0X;
 
             if (point1X < minimumX) {
-                minimumX =
-                        point1X;
+                minimumX = point1X;
             } else if (point1X > maximumX) {
-                maximumX =
-                        point1X;
+                maximumX = point1X;
             }
 
             if (point2X < minimumX) {
-                minimumX =
-                        point2X;
+                minimumX = point2X;
             } else if (point2X > maximumX) {
-                maximumX =
-                        point2X;
+                maximumX = point2X;
             }
 
-            double minimumY =
-                    point0Y;
-
-            double maximumY =
-                    point0Y;
+            double minimumY = point0Y;
+            double maximumY = point0Y;
 
             if (point1Y < minimumY) {
-                minimumY =
-                        point1Y;
+                minimumY = point1Y;
             } else if (point1Y > maximumY) {
-                maximumY =
-                        point1Y;
+                maximumY = point1Y;
             }
 
             if (point2Y < minimumY) {
-                minimumY =
-                        point2Y;
+                minimumY = point2Y;
             } else if (point2Y > maximumY) {
-                maximumY =
-                        point2Y;
+                maximumY = point2Y;
             }
 
-            double minimumZ =
-                    point0Z;
-
-            double maximumZ =
-                    point0Z;
+            double minimumZ = point0Z;
+            double maximumZ = point0Z;
 
             if (point1Z < minimumZ) {
-                minimumZ =
-                        point1Z;
+                minimumZ = point1Z;
             } else if (point1Z > maximumZ) {
-                maximumZ =
-                        point1Z;
+                maximumZ = point1Z;
             }
 
             if (point2Z < minimumZ) {
-                minimumZ =
-                        point2Z;
+                minimumZ = point2Z;
             } else if (point2Z > maximumZ) {
-                maximumZ =
-                        point2Z;
+                maximumZ = point2Z;
             }
 
             lightMask =
-                    lightingCalculator
-                            .buildDynamicLightMask(
-                                    minimumX,
-                                    minimumY,
-                                    minimumZ,
-                                    maximumX,
-                                    maximumY,
-                                    maximumZ
-                            );
+                    lightingCalculator.buildDynamicLightMask(
+                            minimumX,
+                            minimumY,
+                            minimumZ,
+                            maximumX,
+                            maximumY,
+                            maximumZ
+                    );
 
-            /*
-             * A frame may contain local lights while this triangle intersects
-             * none of them. Finalise its invariant shade now so rasterisation
-             * takes the constant-lighting path.
-             */
             if (lightMask == 0) {
                 shadeRed =
                         to255(
@@ -1320,6 +1762,9 @@ public final class RenderMeshCompiler {
             return;
         }
 
+        final long clippingStart =
+                System.nanoTime();
+
         final double[] cameraX =
                 projected.cameraX;
 
@@ -1368,6 +1813,10 @@ public final class RenderMeshCompiler {
                         context.clipOutputU,
                         context.clipOutputV
                 );
+
+        timings.clippingNanos +=
+                System.nanoTime() -
+                        clippingStart;
 
         if (clippedCount < 3) {
             return;
@@ -1489,7 +1938,9 @@ public final class RenderMeshCompiler {
             int index,
             int length
     ) {
-        return index >= 0 &&
-                index < length;
+        return (
+                index >= 0 &&
+                        index < length
+        );
     }
 }

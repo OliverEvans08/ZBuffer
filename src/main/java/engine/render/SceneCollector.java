@@ -11,17 +11,26 @@ import util.AABB;
 import util.Vector3;
 
 public final class SceneCollector {
+
     private static final LightData FALLBACK_LIGHT =
             createFallbackLight();
 
     private final GameEngine gameEngine;
     private final RenderFrame frame;
+
     private final ArrayDeque<GameObject> lightTraversalStack =
             new ArrayDeque<>(256);
-    private final IdentityHashMap<GameObject, LightData>
-            emissiveLightCache = new IdentityHashMap<>(128);
 
-    public SceneCollector(GameEngine gameEngine, RenderFrame frame) {
+    private final IdentityHashMap<GameObject, LightData> emissiveLightCache =
+            new IdentityHashMap<>(128);
+
+    private final SceneChunkGrid sceneChunkGrid =
+            new SceneChunkGrid();
+
+    public SceneCollector(
+            GameEngine gameEngine,
+            RenderFrame frame
+    ) {
         this.gameEngine = gameEngine;
         this.frame = frame;
     }
@@ -32,13 +41,31 @@ public final class SceneCollector {
             double farDistance
     ) {
         frame.nearbyRenderables.clear();
-        frame.renderRoots.clear();
+        frame.sceneChunks.clear();
+        frame.nearbyChunkCount = 0;
+        frame.visibleChunkCount = 0;
 
         final double padding = 8.0;
-        final double minimumX = cameraX - farDistance - padding;
-        final double maximumX = cameraX + farDistance + padding;
-        final double minimumZ = cameraZ - farDistance - padding;
-        final double maximumZ = cameraZ + farDistance + padding;
+
+        final double minimumX =
+                cameraX -
+                        farDistance -
+                        padding;
+
+        final double maximumX =
+                cameraX +
+                        farDistance +
+                        padding;
+
+        final double minimumZ =
+                cameraZ -
+                        farDistance -
+                        padding;
+
+        final double maximumZ =
+                cameraZ +
+                        farDistance +
+                        padding;
 
         gameEngine.queryNearbyRenderablesXZ(
                 minimumX,
@@ -48,14 +75,24 @@ public final class SceneCollector {
                 frame.nearbyRenderables
         );
 
-        final boolean firstPerson = gameEngine.isFirstPerson();
-        final GameObject playerBody = gameEngine.getPlayerBody();
+        final GameObject playerBody =
+                gameEngine.getPlayerBody();
 
-        if (playerBody != null && !firstPerson) {
-            frame.renderRoots.add(playerBody);
-        }
+        sceneChunkGrid.beginFrame();
 
-        for (GameObject object : frame.nearbyRenderables) {
+        final int nearbyCount =
+                frame.nearbyRenderables.size();
+
+        for (
+                int index = 0;
+                index < nearbyCount;
+                index++
+        ) {
+            final GameObject object =
+                    frame.nearbyRenderables.get(
+                            index
+                    );
+
             if (
                     object == null ||
                             !object.isActive() ||
@@ -64,8 +101,19 @@ public final class SceneCollector {
             ) {
                 continue;
             }
-            frame.renderRoots.add(object);
+
+            sceneChunkGrid.add(
+                    object,
+                    object.getWorldAABB()
+            );
         }
+
+        sceneChunkGrid.copyActiveChunksTo(
+                frame.sceneChunks
+        );
+
+        frame.nearbyChunkCount =
+                frame.sceneChunks.size();
     }
 
     public void gatherLights(
@@ -77,25 +125,43 @@ public final class SceneCollector {
     ) {
         frame.lights.clear();
 
-        if (roots == null || roots.isEmpty()) {
-            frame.lights.add(FALLBACK_LIGHT);
+        if (
+                roots == null ||
+                        roots.isEmpty()
+        ) {
+            frame.lights.add(
+                    FALLBACK_LIGHT
+            );
+
             return;
         }
 
-        final ArrayDeque<GameObject> stack = lightTraversalStack;
+        final ArrayDeque<GameObject> stack =
+                lightTraversalStack;
+
         stack.clear();
 
-        for (int i = roots.size() - 1; i >= 0; i--) {
-            final GameObject root = roots.get(i);
+        for (
+                int i = roots.size() - 1;
+                i >= 0;
+                i--
+        ) {
+            final GameObject root =
+                    roots.get(i);
+
             if (root != null) {
                 stack.push(root);
             }
         }
 
         while (!stack.isEmpty()) {
-            final GameObject object = stack.pop();
+            final GameObject object =
+                    stack.pop();
 
-            if (object == null || !object.isActive()) {
+            if (
+                    object == null ||
+                            !object.isActive()
+            ) {
                 continue;
             }
 
@@ -103,18 +169,39 @@ public final class SceneCollector {
                     object instanceof
                             objects.lighting.LightObject lightObject
             ) {
-                final LightData light = lightObject.getLight();
+                final LightData light =
+                        lightObject.getLight();
 
-                if (light != null && light.strength > 0.0) {
-                    if (light.type == LightType.DIRECTIONAL) {
-                        frame.lights.add(light);
+                if (
+                        light != null &&
+                                light.strength > 0.0
+                ) {
+                    if (
+                            light.type ==
+                                    LightType.DIRECTIONAL
+                    ) {
+                        frame.lights.add(
+                                light
+                        );
                     } else {
-                        final double deltaX = light.x - cameraX;
-                        final double deltaY = light.y - cameraY;
-                        final double deltaZ = light.z - cameraZ;
+                        final double deltaX =
+                                light.x -
+                                        cameraX;
+
+                        final double deltaY =
+                                light.y -
+                                        cameraY;
+
+                        final double deltaZ =
+                                light.z -
+                                        cameraZ;
+
                         final double maximum =
                                 farDistance +
-                                        Math.max(0.0, light.range);
+                                        Math.max(
+                                                0.0,
+                                                light.range
+                                        );
 
                         if (
                                 deltaX * deltaX +
@@ -122,27 +209,46 @@ public final class SceneCollector {
                                         deltaZ * deltaZ <=
                                         maximum * maximum
                         ) {
-                            frame.lights.add(light);
+                            frame.lights.add(
+                                    light
+                            );
                         }
                     }
                 }
             }
 
-            final Material material = object.getMaterial();
+            final Material material =
+                    object.getMaterial();
 
             if (
                     material != null &&
                             material.getEmissiveStrength() > 0.0 &&
                             material.getEmissiveRange() > 0.0
             ) {
-                final double worldX = object.getWorldX();
-                final double worldY = object.getWorldY();
-                final double worldZ = object.getWorldZ();
-                final double deltaX = worldX - cameraX;
-                final double deltaY = worldY - cameraY;
-                final double deltaZ = worldZ - cameraZ;
+                final double worldX =
+                        object.getWorldX();
+
+                final double worldY =
+                        object.getWorldY();
+
+                final double worldZ =
+                        object.getWorldZ();
+
+                final double deltaX =
+                        worldX -
+                                cameraX;
+
+                final double deltaY =
+                        worldY -
+                                cameraY;
+
+                final double deltaZ =
+                        worldZ -
+                                cameraZ;
+
                 final double maximum =
-                        farDistance + material.getEmissiveRange();
+                        farDistance +
+                                material.getEmissiveRange();
 
                 if (
                         deltaX * deltaX +
@@ -151,41 +257,69 @@ public final class SceneCollector {
                                 maximum * maximum
                 ) {
                     LightData light =
-                            emissiveLightCache.get(object);
+                            emissiveLightCache.get(
+                                    object
+                            );
 
                     if (light == null) {
-                        light = new LightData();
-                        emissiveLightCache.put(object, light);
+                        light =
+                                new LightData();
+
+                        emissiveLightCache.put(
+                                object,
+                                light
+                        );
                     }
 
-                    light.type = LightType.POINT;
+                    light.type =
+                            LightType.POINT;
+
                     light.x = worldX;
                     light.y = worldY;
                     light.z = worldZ;
-                    light.setColor(material.getEmissiveColor());
+
+                    light.setColor(
+                            material.getEmissiveColor()
+                    );
+
                     light.strength =
                             material.getEmissiveStrength();
-                    light.range = material.getEmissiveRange();
+
+                    light.range =
+                            material.getEmissiveRange();
+
                     light.attLinear = 0.0;
                     light.attQuadratic = 1.0;
+
                     /*
-                     * Aggressive: emissive materials do not cast shadows.
-                     * Point-light shadow maps (6 faces) are one of the
-                     * largest remaining CPU costs; disabling them here
-                     * yields large frame-time savings with only a modest
-                     * visual change for most scenes.
+                     * Emissive materials are real point-light sources.
+                     * Keep shadow casting enabled so the lighting pipeline
+                     * can process them exactly like explicitly placed lights.
                      */
-                    light.shadows = false;
+                    light.shadows = true;
                     light.owner = object;
-                    frame.lights.add(light);
+
+                    frame.lights.add(
+                            light
+                    );
                 }
             }
 
-            final List<GameObject> children = object.getChildren();
+            final List<GameObject> children =
+                    object.getChildren();
 
-            if (children != null && !children.isEmpty()) {
-                for (int i = children.size() - 1; i >= 0; i--) {
-                    final GameObject child = children.get(i);
+            if (
+                    children != null &&
+                            !children.isEmpty()
+            ) {
+                for (
+                        int i = children.size() - 1;
+                        i >= 0;
+                        i--
+                ) {
+                    final GameObject child =
+                            children.get(i);
+
                     if (child != null) {
                         stack.push(child);
                     }
@@ -194,7 +328,9 @@ public final class SceneCollector {
         }
 
         if (frame.lights.isEmpty()) {
-            frame.lights.add(FALLBACK_LIGHT);
+            frame.lights.add(
+                    FALLBACK_LIGHT
+            );
         }
     }
 
@@ -211,53 +347,150 @@ public final class SceneCollector {
             return false;
         }
 
-        final AABB bounds = object.getWorldAABB();
+        final AABB bounds =
+                object.getWorldAABB();
 
         if (bounds == null) {
             return false;
         }
 
-        final double centerX =
-                0.5 * (bounds.minX + bounds.maxX);
-        final double centerY =
-                0.5 * (bounds.minY + bounds.maxY);
-        final double centerZ =
-                0.5 * (bounds.minZ + bounds.maxZ);
-        final double halfX =
-                0.5 * (bounds.maxX - bounds.minX);
-        final double halfY =
-                0.5 * (bounds.maxY - bounds.minY);
-        final double halfZ =
-                0.5 * (bounds.maxZ - bounds.minZ);
-        final double worldX = centerX - cameraX;
-        final double worldY = centerY - cameraY;
-        final double worldZ = centerZ - cameraZ;
+        return passesBoundsCull(
+                bounds.minX,
+                bounds.minY,
+                bounds.minZ,
+                bounds.maxX,
+                bounds.maxY,
+                bounds.maxZ,
+                cameraX,
+                cameraY,
+                cameraZ,
+                farDistance,
+                tangentHalfFieldOfViewX,
+                tangentHalfFieldOfViewY
+        );
+    }
 
-        if (containsPoint(bounds, cameraX, cameraY, cameraZ)) {
+    public boolean passesChunkCull(
+            SceneChunk chunk,
+            double cameraX,
+            double cameraY,
+            double cameraZ,
+            double farDistance,
+            double tangentHalfFieldOfViewX,
+            double tangentHalfFieldOfViewY
+    ) {
+        return (
+                chunk != null &&
+                        chunk.hasBounds() &&
+                        passesBoundsCull(
+                                chunk.minimumX,
+                                chunk.minimumY,
+                                chunk.minimumZ,
+                                chunk.maximumX,
+                                chunk.maximumY,
+                                chunk.maximumZ,
+                                cameraX,
+                                cameraY,
+                                cameraZ,
+                                farDistance,
+                                tangentHalfFieldOfViewX,
+                                tangentHalfFieldOfViewY
+                        )
+        );
+    }
+
+    private boolean passesBoundsCull(
+            double minimumX,
+            double minimumY,
+            double minimumZ,
+            double maximumX,
+            double maximumY,
+            double maximumZ,
+            double cameraX,
+            double cameraY,
+            double cameraZ,
+            double farDistance,
+            double tangentHalfFieldOfViewX,
+            double tangentHalfFieldOfViewY
+    ) {
+        final double centerX =
+                minimumX +
+                        0.5 *
+                                (maximumX - minimumX);
+
+        final double centerY =
+                minimumY +
+                        0.5 *
+                                (maximumY - minimumY);
+
+        final double centerZ =
+                minimumZ +
+                        0.5 *
+                                (maximumZ - minimumZ);
+
+        final double halfX =
+                0.5 *
+                        (maximumX - minimumX);
+
+        final double halfY =
+                0.5 *
+                        (maximumY - minimumY);
+
+        final double halfZ =
+                0.5 *
+                        (maximumZ - minimumZ);
+
+        final double worldX =
+                centerX -
+                        cameraX;
+
+        final double worldY =
+                centerY -
+                        cameraY;
+
+        final double worldZ =
+                centerZ -
+                        cameraZ;
+
+        if (
+                cameraX >= minimumX &&
+                        cameraX <= maximumX &&
+                        cameraY >= minimumY &&
+                        cameraY <= maximumY &&
+                        cameraZ >= minimumZ &&
+                        cameraZ <= maximumZ
+        ) {
             return true;
         }
 
         final double rotatedX =
                 worldX * frame.cosineYaw +
                         worldZ * frame.sineYaw;
+
         final double rotatedZ =
                 -worldX * frame.sineYaw +
                         worldZ * frame.cosineYaw;
+
         final double rotatedY =
                 worldY * frame.cosinePitch +
                         rotatedZ * frame.sinePitch;
+
         final double forwardZ =
                 -worldY * frame.sinePitch +
                         rotatedZ * frame.cosinePitch;
+
         final double extentX =
                 frame.absoluteCosineYaw * halfX +
                         frame.absoluteSineYaw * halfZ;
+
         final double yawExtentZ =
                 frame.absoluteSineYaw * halfX +
                         frame.absoluteCosineYaw * halfZ;
+
         final double extentY =
                 frame.absoluteCosinePitch * halfY +
                         frame.absoluteSinePitch * yawExtentZ;
+
         final double extentZ =
                 frame.absoluteSinePitch * halfY +
                         frame.absoluteCosinePitch * yawExtentZ;
@@ -269,22 +502,37 @@ public final class SceneCollector {
             return false;
         }
 
-        final double depthForBounds = Math.max(forwardZ, 0.0);
-        final double maximumX =
-                depthForBounds * tangentHalfFieldOfViewX +
-                        extentX +
-                        extentZ * tangentHalfFieldOfViewX;
+        final double depthForBounds =
+                Math.max(
+                        forwardZ,
+                        0.0
+                );
 
-        if (rotatedX < -maximumX || rotatedX > maximumX) {
+        final double allowedX =
+                depthForBounds *
+                        tangentHalfFieldOfViewX +
+                        extentX +
+                        extentZ *
+                                tangentHalfFieldOfViewX;
+
+        if (
+                rotatedX < -allowedX ||
+                        rotatedX > allowedX
+        ) {
             return false;
         }
 
-        final double maximumY =
-                depthForBounds * tangentHalfFieldOfViewY +
+        final double allowedY =
+                depthForBounds *
+                        tangentHalfFieldOfViewY +
                         extentY +
-                        extentZ * tangentHalfFieldOfViewY;
+                        extentZ *
+                                tangentHalfFieldOfViewY;
 
-        return rotatedY >= -maximumY && rotatedY <= maximumY;
+        return (
+                rotatedY >= -allowedY &&
+                        rotatedY <= allowedY
+        );
     }
 
     public static boolean containsPoint(
@@ -293,19 +541,24 @@ public final class SceneCollector {
             double y,
             double z
     ) {
-        return x >= bounds.minX &&
-                x <= bounds.maxX &&
-                y >= bounds.minY &&
-                y <= bounds.maxY &&
-                z >= bounds.minZ &&
-                z <= bounds.maxZ;
+        return (
+                x >= bounds.minX &&
+                        x <= bounds.maxX &&
+                        y >= bounds.minY &&
+                        y <= bounds.maxY &&
+                        z >= bounds.minZ &&
+                        z <= bounds.maxZ
+        );
     }
 
     public static boolean isDescendantOrSelf(
             GameObject node,
             GameObject root
     ) {
-        if (node == null || root == null) {
+        if (
+                node == null ||
+                        root == null
+        ) {
             return false;
         }
 
@@ -323,13 +576,24 @@ public final class SceneCollector {
     }
 
     private static LightData createFallbackLight() {
-        final LightData light = new LightData();
+        final LightData light =
+                new LightData();
 
-        light.type = LightType.DIRECTIONAL;
+        light.type =
+                LightType.DIRECTIONAL;
+
         light.setDirection(
-                new Vector3(-0.35, -0.85, 0.40)
+                new Vector3(
+                        -0.35,
+                        -0.85,
+                        0.40
+                )
         );
-        light.setColor(java.awt.Color.WHITE);
+
+        light.setColor(
+                java.awt.Color.WHITE
+        );
+
         light.strength = 0.6;
         light.shadows = false;
         light.owner = null;
