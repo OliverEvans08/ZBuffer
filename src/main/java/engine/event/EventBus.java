@@ -7,8 +7,10 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
 
 /**
- * Exact-type event bus optimized for many publishes and relatively rare
- * subscription changes.
+ * Exact-type event bus optimized for frequent publication and relatively
+ * infrequent subscription changes.
+ *
+ * Publication is synchronous on the publishing thread.
  */
 public final class EventBus {
 
@@ -27,20 +29,30 @@ public final class EventBus {
         final Consumer<GameEvent> adapted =
                 event -> consumer.accept(eventType.cast(event));
 
-        final CopyOnWriteArrayList<Consumer<GameEvent>> subscribers =
-                listeners.computeIfAbsent(
-                        eventType,
-                        ignored -> new CopyOnWriteArrayList<>()
-                );
+        /*
+         * Add and remove under the same per-key map operation.
+         *
+         * Otherwise the final unsubscribe can detach a list while another
+         * thread is adding a new subscriber to that detached list.
+         */
+        listeners.compute(eventType, (ignored, current) -> {
+            if (current == null) {
+                current = new CopyOnWriteArrayList<>();
+            }
 
-        subscribers.add(adapted);
+            current.add(adapted);
+            return current;
+        });
 
-        return new Subscription(() ->
-                listeners.computeIfPresent(
+        return new Subscription(
+                () -> listeners.computeIfPresent(
                         eventType,
                         (ignored, current) -> {
                             current.remove(adapted);
-                            return current.isEmpty() ? null : current;
+
+                            return current.isEmpty()
+                                    ? null
+                                    : current;
                         }
                 )
         );
@@ -64,7 +76,11 @@ public final class EventBus {
             } catch (RuntimeException exception) {
                 if (firstFailure == null) {
                     firstFailure = exception;
-                } else {
+                } else if (exception != firstFailure) {
+                    /*
+                     * Multiple listeners may throw the same exception object.
+                     * Throwable rejects self-suppression.
+                     */
                     firstFailure.addSuppressed(exception);
                 }
             }
@@ -80,7 +96,10 @@ public final class EventBus {
     ) {
         final CopyOnWriteArrayList<Consumer<GameEvent>> subscribers =
                 listeners.get(
-                        Objects.requireNonNull(eventType, "eventType")
+                        Objects.requireNonNull(
+                                eventType,
+                                "eventType"
+                        )
                 );
 
         return subscribers == null ? 0 : subscribers.size();
@@ -90,8 +109,11 @@ public final class EventBus {
         listeners.clear();
     }
 
-    /** Idempotent subscription handle. */
+    /**
+     * Idempotent subscription handle.
+     */
     public static final class Subscription implements AutoCloseable {
+
         private final AtomicBoolean closed = new AtomicBoolean();
         private final Runnable unsubscribe;
 

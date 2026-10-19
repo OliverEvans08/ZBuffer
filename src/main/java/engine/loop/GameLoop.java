@@ -6,30 +6,48 @@ import engine.GameEngine;
 import engine.event.events.TickEvent;
 import engine.scene.Scene;
 import engine.ui.GamePanel;
+
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.LockSupport;
+
 import util.Transform;
 
 public final class GameLoop implements Runnable {
 
-    private static final System.Logger LOGGER = System.getLogger(GameEngine.class.getName());
+    private static final System.Logger LOGGER =
+            System.getLogger(GameEngine.class.getName());
 
     private final EngineContext context;
     private final Scene scene;
     private final GamePanel panel;
     private final FrameTiming frameTiming;
+
     private final AtomicBoolean running = new AtomicBoolean(true);
+    private final AtomicBoolean entered = new AtomicBoolean();
 
-    private Thread gameThread;
+    private volatile Thread gameThread;
 
-    public GameLoop(EngineContext context, GamePanel panel) {
+    public GameLoop(
+            EngineContext context,
+            GamePanel panel
+    ) {
         this.context = context;
-        scene = context.scene;
+        this.scene = context.scene;
         this.panel = panel;
-        frameTiming = panel.getFrameTiming();
+        this.frameTiming = panel.getFrameTiming();
     }
 
-    public void start() {
+    public synchronized void start() {
+        if (
+                gameThread != null
+                        || entered.get()
+                        || !running.get()
+        ) {
+            throw new IllegalStateException(
+                    "Game loop already started or stopped"
+            );
+        }
+
         gameThread = new Thread(this, "GameLoop");
         gameThread.start();
     }
@@ -64,36 +82,107 @@ public final class GameLoop implements Runnable {
 
     @Override
     public void run() {
+        if (!entered.compareAndSet(false, true)) {
+            return;
+        }
+
+        gameThread = Thread.currentThread();
+
         long lastTime = System.nanoTime();
-        long lastRepaintTime = lastTime;
+        long nextRepaint = lastTime;
+
+        final long repaintInterval = Math.max(
+                1L,
+                EngineSettings.MINIMUM_REPAINT_NANOSECONDS
+        );
 
         try {
-            while (running.get() && !Thread.currentThread().isInterrupted()) {
-                final long now = System.nanoTime();
-                final double elapsedSeconds = (now - lastTime) / 1_000_000_000.0;
+            while (
+                    running.get()
+                            && !Thread.currentThread().isInterrupted()
+            ) {
+                long now = System.nanoTime();
+
+                frameTiming.addElapsed(
+                        (now - lastTime) / 1_000_000_000.0
+                );
 
                 lastTime = now;
-                frameTiming.addElapsed(elapsedSeconds);
 
-                while (frameTiming.stepReady()) {
-                    final double delta = frameTiming.fixedDeltaSeconds();
+                while (
+                        running.get()
+                                && !Thread.currentThread().isInterrupted()
+                                && frameTiming.stepReady()
+                ) {
+                    double delta = frameTiming.fixedDeltaSeconds();
 
-                    context.eventBus.publish(new TickEvent(TickEvent.Phase.PRE, delta));
+                    context.eventBus.publish(
+                            new TickEvent(
+                                    TickEvent.Phase.PRE,
+                                    delta
+                            )
+                    );
+
                     fixedUpdate(delta);
-                    context.eventBus.publish(new TickEvent(TickEvent.Phase.POST, delta));
+
+                    context.eventBus.publish(
+                            new TickEvent(
+                                    TickEvent.Phase.POST,
+                                    delta
+                            )
+                    );
 
                     frameTiming.consumeStep();
                 }
 
-                if (now - lastRepaintTime >= EngineSettings.MINIMUM_REPAINT_NANOSECONDS && panel.requestRepaint()) {
-                    lastRepaintTime = now;
+                if (
+                        !running.get()
+                                || Thread.currentThread().isInterrupted()
+                ) {
+                    break;
                 }
 
-                LockSupport.parkNanos(EngineSettings.IDLE_PARK_NANOSECONDS);
+                now = System.nanoTime();
+
+                if (now - nextRepaint >= 0L) {
+                    panel.requestRepaint();
+
+                    /*
+                     * Advance even if Swing already has a repaint queued.
+                     * Preserve cadence without queuing catch-up frames.
+                     */
+                    nextRepaint += repaintInterval;
+
+                    if (now - nextRepaint >= 0L) {
+                        nextRepaint = now + repaintInterval;
+                    }
+                }
+
+                long afterWork = System.nanoTime();
+
+                /*
+                 * Account for time spent doing updates, because the clock
+                 * accumulator was sampled before that work began.
+                 */
+                long untilTick =
+                        frameTiming.nanosUntilNextStep()
+                                - (afterWork - lastTime);
+
+                long untilPaint = nextRepaint - afterWork;
+                long sleep = Math.min(untilTick, untilPaint);
+
+                if (sleep > 0L) {
+                    LockSupport.parkNanos(this, sleep);
+                }
             }
         } catch (RuntimeException exception) {
+            LOGGER.log(
+                    System.Logger.Level.ERROR,
+                    "Game loop terminated unexpectedly",
+                    exception
+            );
+        } finally {
             running.set(false);
-            LOGGER.log(System.Logger.Level.ERROR, "Game loop terminated unexpectedly", exception);
         }
     }
 
@@ -105,14 +194,21 @@ public final class GameLoop implements Runnable {
 
         final double strafeIntent = context.camera.dx;
         final double forwardIntent = context.camera.dz;
-        final double intentSpeed = Math.sqrt(strafeIntent * strafeIntent + forwardIntent * forwardIntent);
+
+        final double intentSpeed = Math.sqrt(
+                strafeIntent * strafeIntent
+                        + forwardIntent * forwardIntent
+        );
+
         final boolean movingIntent = intentSpeed > 1.0e-9;
 
         context.camera.update(delta);
 
         synchronizePlayerBodyToCamera();
 
-        context.playerBody.setModelVisible(context.camera.isThirdPerson());
+        context.playerBody.setModelVisible(
+                context.camera.isThirdPerson()
+        );
 
         context.inventorySystem.update(delta);
 
@@ -132,11 +228,13 @@ public final class GameLoop implements Runnable {
     }
 
     private void synchronizePlayerBodyToCamera() {
-        final Transform transform = context.playerBody.getTransform();
+        final Transform transform =
+                context.playerBody.getTransform();
 
         transform.position.x = context.camera.x;
         transform.position.y = context.camera.y;
         transform.position.z = context.camera.z;
+
         transform.rotation.y = -context.camera.getViewYaw();
     }
 }

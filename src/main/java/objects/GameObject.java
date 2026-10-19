@@ -1,7 +1,7 @@
 package objects;
 
-import engine.MeshData;
 import engine.animation.Animator;
+import engine.assets.mesh.MeshAsset;
 import engine.render.Material;
 import java.awt.Color;
 import java.util.List;
@@ -21,13 +21,11 @@ public abstract class GameObject {
     private static final double[][] EMPTY_VERTS = new double[0][0];
 
     private static final class FrameState {
-
-        private double wx;
-        private double wy;
-        private double wz;
-
+        private double wx, wy, wz;
         private AABB aabb = new AABB(0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
         private double[][] transformedVertices = EMPTY_VERTS;
+        private final Matrix4 worldMatrix = new Matrix4();
+        private long worldVersion = Long.MIN_VALUE;
     }
 
     public static int getPublishedFrameIndex() {
@@ -42,10 +40,7 @@ public abstract class GameObject {
         return HIERARCHY_VERSION.get();
     }
 
-    private final FrameState[] frames = {
-            new FrameState(),
-            new FrameState(),
-    };
+    private final FrameState[] frames = { new FrameState(), new FrameState() };
 
     private final String id = UUID.randomUUID().toString();
 
@@ -68,270 +63,184 @@ public abstract class GameObject {
 
     private volatile GameObject parent;
     private volatile Animator animator;
-    private volatile MeshData mesh;
+    private volatile MeshAsset meshAsset;   // primary (flat, BVH-ready)
+
+    // Legacy fallback only — prefer meshAsset
+    private volatile engine.MeshData legacyMesh;
 
     public GameObject() {
         transform = new Transform();
     }
 
-    public final void publishFrameData(int frameIndex, double worldX, double worldY, double worldZ, AABB worldAabb, double[][] transformedVertices) {
+    public final void publishFrameData(int frameIndex, double worldX, double worldY, double worldZ,
+                                       AABB worldAabb, double[][] transformedVertices) {
         final FrameState state = frames[frameIndex & 1];
-
         state.wx = worldX;
         state.wy = worldY;
         state.wz = worldZ;
-
         if (worldAabb != null) {
             state.aabb = worldAabb;
         } else {
             state.aabb.set(worldX, worldX, worldY, worldY, worldZ, worldZ);
         }
-
         state.transformedVertices = transformedVertices != null ? transformedVertices : EMPTY_VERTS;
     }
 
-    public MeshData getMesh() {
-        return mesh;
+    /** Call once per frame from the scene update pass (before render/collision). */
+    public void updateWorldTransform(int frameIndex) {
+        final FrameState state = frames[frameIndex & 1];
+        final long localVersion = transform.getVersion();
+        final GameObject p = parent;
+        final long parentWorldVersion = (p == null) ? 0L : p.getWorldVersion(frameIndex);
+
+        if (state.worldVersion == localVersion && (p == null || state.worldVersion == parentWorldVersion)) {
+            return; // clean
+        }
+
+        final Matrix4 local = transform.getTransformationMatrix();
+        if (p == null) {
+            state.worldMatrix.set(local);
+        } else {
+            p.updateWorldTransform(frameIndex); // ensure parent is current
+            p.frames[frameIndex & 1].worldMatrix.multiply(local, state.worldMatrix);
+        }
+        state.worldVersion = localVersion;
     }
 
-    public GameObject setMesh(MeshData mesh) {
-        this.mesh = mesh;
+    public long getWorldVersion(int frameIndex) {
+        return frames[frameIndex & 1].worldVersion;
+    }
+
+    public Matrix4 getWorldTransform() {
+        // Prefer the published frame; caller should have run updateWorldTransform first
+        return frames[PUBLISHED_FRAME].worldMatrix;
+    }
+
+    public MeshAsset getMeshAsset() {
+        return meshAsset;
+    }
+
+    public GameObject setMeshAsset(MeshAsset meshAsset) {
+        this.meshAsset = meshAsset;
+        return this;
+    }
+
+    // Legacy accessors — prefer MeshAsset path
+    public engine.MeshData getMesh() {
+        return legacyMesh;
+    }
+
+    public GameObject setMesh(engine.MeshData mesh) {
+        this.legacyMesh = mesh;
         return this;
     }
 
     public double[][] getVertices() {
-        final MeshData currentMesh = mesh;
-
-        return currentMesh != null ? currentMesh.getVertices() : EMPTY_VERTS;
+        if (meshAsset != null) {
+            // Adapter: convert flat float[] to double[][] only if absolutely required by old renderer
+            // Prefer changing the renderer to consume MeshAsset.vertices directly
+            return legacyMesh != null ? legacyMesh.getVertices() : EMPTY_VERTS;
+        }
+        return legacyMesh != null ? legacyMesh.getVertices() : EMPTY_VERTS;
     }
 
     public int[][] getFacesArray() {
-        final MeshData currentMesh = mesh;
-
-        return currentMesh != null ? currentMesh.getFaces() : null;
+        if (legacyMesh != null) return legacyMesh.getFaces();
+        return null; // MeshAsset uses flat int[] indices
     }
 
     public double[][] getUVs() {
-        final MeshData currentMesh = mesh;
-
-        return currentMesh != null ? currentMesh.getUVs() : null;
+        return legacyMesh != null ? legacyMesh.getUVs() : null;
     }
 
     public void addChild(GameObject child) {
-        if (child == null || child == this || child.parent == this) {
-            return;
-        }
-
+        if (child == null || child == this || child.parent == this) return;
         final GameObject oldParent = child.parent;
-
-        if (oldParent != null) {
-            oldParent.removeChild(child);
-        }
-
+        if (oldParent != null) oldParent.removeChild(child);
         child.parent = this;
         children.add(child);
-
         HIERARCHY_VERSION.incrementAndGet();
     }
 
     public void removeChild(GameObject child) {
-        if (child == null) {
-            return;
-        }
-
+        if (child == null) return;
         if (children.remove(child)) {
             child.parent = null;
             HIERARCHY_VERSION.incrementAndGet();
         }
     }
 
-    public GameObject getParent() {
-        return parent;
-    }
-
-    public List<GameObject> getChildren() {
-        return children;
-    }
-
-    public Transform getTransform() {
-        return transform;
-    }
+    public GameObject getParent() { return parent; }
+    public List<GameObject> getChildren() { return children; }
+    public Transform getTransform() { return transform; }
 
     public Vector3 getWorldPosition() {
         final FrameState state = frames[PUBLISHED_FRAME];
-
         return new Vector3(state.wx, state.wy, state.wz);
     }
 
     public void getWorldPosition(double[] output) {
-        if (output == null || output.length < 3) {
+        if (output == null || output.length < 3)
             throw new IllegalArgumentException("output must contain at least three elements");
-        }
-
         final FrameState state = frames[PUBLISHED_FRAME];
-
         output[0] = state.wx;
         output[1] = state.wy;
         output[2] = state.wz;
     }
 
-    public double getWorldX() {
-        return frames[PUBLISHED_FRAME].wx;
-    }
-
-    public double getWorldY() {
-        return frames[PUBLISHED_FRAME].wy;
-    }
-
-    public double getWorldZ() {
-        return frames[PUBLISHED_FRAME].wz;
-    }
-
-    public AABB getWorldAABB() {
-        return frames[PUBLISHED_FRAME].aabb;
-    }
-
+    public double getWorldX() { return frames[PUBLISHED_FRAME].wx; }
+    public double getWorldY() { return frames[PUBLISHED_FRAME].wy; }
+    public double getWorldZ() { return frames[PUBLISHED_FRAME].wz; }
+    public AABB getWorldAABB() { return frames[PUBLISHED_FRAME].aabb; }
     public double[][] getTransformedVertices() {
-        final double[][] transformed = frames[PUBLISHED_FRAME].transformedVertices;
-
-        return transformed != null ? transformed : EMPTY_VERTS;
-    }
-
-    public Matrix4 getWorldTransform() {
-        final Matrix4 local = transform.getTransformationMatrix();
-        final GameObject currentParent = parent;
-
-        if (currentParent == null) {
-            return local;
-        }
-
-        final Matrix4 parentWorld = currentParent.getWorldTransform();
-        final Matrix4 output = new Matrix4();
-
-        parentWorld.multiply(local, output);
-
-        return output;
+        final double[][] t = frames[PUBLISHED_FRAME].transformedVertices;
+        return t != null ? t : EMPTY_VERTS;
     }
 
     public abstract void update(double delta);
 
-    public boolean isActive() {
-        return active;
-    }
+    public boolean isActive() { return active; }
+    public void setActive(boolean active) { this.active = active; }
+    public boolean isVisible() { return visible; }
+    public void setVisible(boolean visible) { this.visible = visible; }
+    public boolean isSolid() { return solid; }
+    public void setSolid(boolean solid) { this.solid = solid; }
+    public boolean isWireframe() { return wireframe; }
+    public void setWireframe(boolean wireframe) { this.wireframe = wireframe; }
+    public boolean isRenderFull() { return !wireframe; }
+    public void setRenderFull(boolean full) { wireframe = !full; }
+    public boolean isFull() { return solid; }
+    public void setFull(boolean full) { solid = full; }
 
-    public void setActive(boolean active) {
-        this.active = active;
-    }
-
-    public boolean isVisible() {
-        return visible;
-    }
-
-    public void setVisible(boolean visible) {
-        this.visible = visible;
-    }
-
-    public boolean isSolid() {
-        return solid;
-    }
-
-    public void setSolid(boolean solid) {
-        this.solid = solid;
-    }
-
-    public boolean isWireframe() {
-        return wireframe;
-    }
-
-    public void setWireframe(boolean wireframe) {
-        this.wireframe = wireframe;
-    }
-
-    public boolean isRenderFull() {
-        return !wireframe;
-    }
-
-    public void setRenderFull(boolean full) {
-        wireframe = !full;
-    }
-
-    public boolean isFull() {
-        return solid;
-    }
-
-    public void setFull(boolean full) {
-        solid = full;
-    }
-
-    public Color getColor() {
-        return color;
-    }
-
+    public Color getColor() { return color; }
     public GameObject setColor(Color color) {
         this.color = color == null ? Color.WHITE : color;
         return this;
     }
 
-    public Material getMaterial() {
-        return material;
-    }
+    public Material getMaterial() { return material; }
+    public void setMaterial(Material material) { this.material = material; }
 
-    public void setMaterial(Material material) {
-        this.material = material;
-    }
-
-    public Animator getAnimator() {
-        return animator;
-    }
-
-    public void setAnimator(Animator animator) {
-        this.animator = animator;
-    }
+    public Animator getAnimator() { return animator; }
+    public void setAnimator(Animator animator) { this.animator = animator; }
 
     public Animator animate() {
-        Animator currentAnimator = animator;
-
-        if (currentAnimator == null) {
-            currentAnimator = new Animator(this);
-            animator = currentAnimator;
+        Animator current = animator;
+        if (current == null) {
+            current = new Animator(this);
+            animator = current;
         }
-
-        return currentAnimator;
+        return current;
     }
 
-    public boolean isIgnorePlayerCollisions() {
-        return ignorePlayerCollisions;
-    }
+    public boolean isIgnorePlayerCollisions() { return ignorePlayerCollisions; }
+    public void setIgnorePlayerCollisions(boolean ignore) { this.ignorePlayerCollisions = ignore; }
 
-    public void setIgnorePlayerCollisions(boolean ignorePlayerCollisions) {
-        this.ignorePlayerCollisions = ignorePlayerCollisions;
-    }
-
-    public String getId() {
-        return id;
-    }
-
-    public String getName() {
-        return name;
-    }
-
-    public void setName(String name) {
-        this.name = name != null ? name : "";
-    }
-
-    public String getTag() {
-        return tag;
-    }
-
-    public void setTag(String tag) {
-        this.tag = tag != null ? tag : "";
-    }
-
-    public int getLayer() {
-        return layer;
-    }
-
-    public void setLayer(int layer) {
-        this.layer = layer;
-    }
+    public String getId() { return id; }
+    public String getName() { return name; }
+    public void setName(String name) { this.name = name != null ? name : ""; }
+    public String getTag() { return tag; }
+    public void setTag(String tag) { this.tag = tag != null ? tag : ""; }
+    public int getLayer() { return layer; }
+    public void setLayer(int layer) { this.layer = layer; }
 }

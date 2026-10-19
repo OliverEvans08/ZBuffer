@@ -1,14 +1,15 @@
 package engine.scene;
 
 import engine.EngineSettings;
-import engine.loop.UpdateScheduler;
+import engine.concurrent.ParallelExecutor;
 import engine.spatial.SpatialIndexSynchronizer;
+
 import java.util.ArrayDeque;
 import java.util.Arrays;
 import java.util.List;
-import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.atomic.AtomicReference;
+
 import objects.GameObject;
 import util.AABB;
 import util.Matrix4;
@@ -20,13 +21,17 @@ public final class TransformPublisher {
 
     private final DerivedObjectCache derivedCache;
     private final SpatialIndexSynchronizer spatialIndexes;
-    private final ExecutorService updatePool;
+    private final ParallelExecutor vertexPhases;
     private final int maximumUpdateWorkers;
 
     private Matrix4[] worldMatrices = new Matrix4[0];
     private long[] worldVersions = new long[0];
     private AABB[] vertexPartialBounds = new AABB[0];
 
+    /*
+     * Retained for compatibility with callers of getWorkerFailure().
+     * Internal phase failures are now handled by ParallelExecutor.
+     */
     private final AtomicReference<Throwable> vertexFailure =
             new AtomicReference<>();
 
@@ -38,7 +43,12 @@ public final class TransformPublisher {
     ) {
         this.derivedCache = derivedCache;
         this.spatialIndexes = spatialIndexes;
-        this.updatePool = updatePool;
+
+        this.vertexPhases = new ParallelExecutor(
+                updatePool,
+                Math.max(1, maximumUpdateWorkers)
+        );
+
         this.maximumUpdateWorkers = maximumUpdateWorkers;
     }
 
@@ -48,11 +58,17 @@ public final class TransformPublisher {
 
     public void ensureWorldScratch(int required) {
         if (worldMatrices.length < required) {
-            worldMatrices = Arrays.copyOf(worldMatrices, required);
+            worldMatrices = Arrays.copyOf(
+                    worldMatrices,
+                    required
+            );
         }
 
         if (worldVersions.length < required) {
-            worldVersions = Arrays.copyOf(worldVersions, required);
+            worldVersions = Arrays.copyOf(
+                    worldVersions,
+                    required
+            );
         }
     }
 
@@ -66,7 +82,11 @@ public final class TransformPublisher {
     ) {
         final int writeFrame = context.writeFrame;
 
-        for (int indexPosition = start; indexPosition < end; indexPosition++) {
+        for (
+                int indexPosition = start;
+                indexPosition < end;
+                indexPosition++
+        ) {
             final int objectIndex = indexes[indexPosition];
             final GameObject object = graph.objects[objectIndex];
 
@@ -80,16 +100,25 @@ public final class TransformPublisher {
             final boolean renderable = active && visible;
 
             final Transform transform = object.getTransform();
-            final Matrix4 localMatrix =
-                    transform == null ? null : transform.getTransformationMatrix();
-            final long localVersion =
-                    transform == null ? 0L : transform.getCachedVersion();
+
+            final Matrix4 localMatrix = transform == null
+                    ? null
+                    : transform.getTransformationMatrix();
+
+            final long localVersion = transform == null
+                    ? 0L
+                    : transform.getCachedVersion();
 
             final int parentIndex = graph.parent[objectIndex];
-            final long parentVersion =
-                    parentIndex >= 0 ? worldVersions[parentIndex] : 0L;
-            final long worldVersion =
-                    mixWorldVersion(parentVersion, localVersion);
+
+            final long parentVersion = parentIndex >= 0
+                    ? worldVersions[parentIndex]
+                    : 0L;
+
+            final long worldVersion = mixWorldVersion(
+                    parentVersion,
+                    localVersion
+            );
 
             worldVersions[objectIndex] = worldVersion;
 
@@ -102,16 +131,22 @@ public final class TransformPublisher {
             }
 
             final Matrix4 worldMatrix = cache.worldMatrix;
+
             final boolean transformChanged =
-                    !cache.worldMatrixInitialized ||
-                            cache.lastWorldVersion != worldVersion;
+                    !cache.worldMatrixInitialized
+                            || cache.lastWorldVersion != worldVersion;
 
             final double worldX;
             final double worldY;
             final double worldZ;
 
             if (transformChanged) {
-                calculateWorldMatrix(parentIndex, localMatrix, worldMatrix);
+                calculateWorldMatrix(
+                        parentIndex,
+                        localMatrix,
+                        worldMatrix
+                );
+
                 worldMatrix.transformPoint(
                         0.0,
                         0.0,
@@ -132,8 +167,10 @@ public final class TransformPublisher {
 
             worldMatrices[objectIndex] = worldMatrix;
 
-            final double[][] localVertices =
-                    renderable || solid ? object.getVertices() : null;
+            final double[][] localVertices = renderable || solid
+                    ? object.getVertices()
+                    : null;
+
             final boolean hasVertices =
                     localVertices != null && localVertices.length > 0;
 
@@ -142,7 +179,10 @@ public final class TransformPublisher {
                     hasVertices ? localVertices : null
             );
 
-            if (cache.initialized && cache.lastWorldVersion == worldVersion) {
+            if (
+                    cache.initialized
+                            && cache.lastWorldVersion == worldVersion
+            ) {
                 cache.alignToWriteFrame(writeFrame);
             } else {
                 if (hasVertices) {
@@ -153,8 +193,10 @@ public final class TransformPublisher {
                             worldX,
                             worldY,
                             worldZ,
-                            allowVertexParallel &&
-                                    shouldParallelizeVertices(localVertices.length),
+                            allowVertexParallel
+                                    && shouldParallelizeVertices(
+                                    localVertices.length
+                            ),
                             cache.bounds[writeFrame]
                     );
                 } else {
@@ -166,6 +208,7 @@ public final class TransformPublisher {
                             worldZ,
                             worldZ
                     );
+
                     cache.transformedVertices[writeFrame] =
                             DerivedCacheEntry.EMPTY_TRANSFORMED_VERTICES;
                 }
@@ -173,6 +216,7 @@ public final class TransformPublisher {
                 cache.worldX[writeFrame] = worldX;
                 cache.worldY[writeFrame] = worldY;
                 cache.worldZ[writeFrame] = worldZ;
+
                 cache.lastWorldVersion = worldVersion;
                 cache.initialized = true;
                 cache.currentFrame = writeFrame;
@@ -244,10 +288,12 @@ public final class TransformPublisher {
             boolean allowParallel,
             AABB outputBounds
     ) {
-        if (worldMatrix == null ||
-                localVertices == null ||
-                localVertices.length == 0 ||
-                outputVertices == null) {
+        if (
+                worldMatrix == null
+                        || localVertices == null
+                        || localVertices.length == 0
+                        || outputVertices == null
+        ) {
             outputBounds.set(
                     worldX,
                     worldX,
@@ -256,14 +302,18 @@ public final class TransformPublisher {
                     worldZ,
                     worldZ
             );
+
             return;
         }
 
         final int vertexCount = localVertices.length;
 
-        if (!allowParallel ||
-                vertexCount < EngineSettings.VERTEX_PARALLEL_THRESHOLD ||
-                maximumUpdateWorkers <= 1) {
+        if (
+                !allowParallel
+                        || vertexCount
+                        < EngineSettings.VERTEX_PARALLEL_THRESHOLD
+                        || maximumUpdateWorkers <= 1
+        ) {
             calculateVertexRange(
                     worldMatrix,
                     localVertices,
@@ -275,13 +325,17 @@ public final class TransformPublisher {
                     worldY,
                     worldZ
             );
+
             return;
         }
 
         final int chunks = Math.min(
                 maximumUpdateWorkers,
-                (vertexCount + EngineSettings.VERTEX_PARALLEL_CHUNK - 1) /
-                        EngineSettings.VERTEX_PARALLEL_CHUNK
+                (
+                        vertexCount
+                                + EngineSettings.VERTEX_PARALLEL_CHUNK
+                                - 1
+                ) / EngineSettings.VERTEX_PARALLEL_CHUNK
         );
 
         if (chunks <= 1) {
@@ -296,45 +350,35 @@ public final class TransformPublisher {
                     worldY,
                     worldZ
             );
+
             return;
         }
 
-        final CountDownLatch latch = new CountDownLatch(chunks);
-        final AtomicReference<Throwable> failure = vertexFailure;
-
-        failure.set(null);
         ensureVertexPartialBounds(chunks);
 
         final AABB[] partialBounds = vertexPartialBounds;
 
-        for (int chunk = 0; chunk < chunks; chunk++) {
-            final int index = chunk;
-            final int start = (chunk * vertexCount) / chunks;
-            final int end = ((chunk + 1) * vertexCount) / chunks;
+        vertexPhases.execute(chunks, index -> {
+            int start = (int) (
+                    (long) index * vertexCount / chunks
+            );
 
-            updatePool.execute(() -> {
-                try {
-                    calculateVertexRange(
-                            worldMatrix,
-                            localVertices,
-                            outputVertices,
-                            start,
-                            end,
-                            partialBounds[index],
-                            worldX,
-                            worldY,
-                            worldZ
-                    );
-                } catch (Throwable throwable) {
-                    failure.compareAndSet(null, throwable);
-                } finally {
-                    latch.countDown();
-                }
-            });
-        }
+            int end = (int) (
+                    (long) (index + 1) * vertexCount / chunks
+            );
 
-        UpdateScheduler.awaitUninterruptibly(latch);
-        UpdateScheduler.rethrowWorkerFailure(failure.get());
+            calculateVertexRange(
+                    worldMatrix,
+                    localVertices,
+                    outputVertices,
+                    start,
+                    end,
+                    partialBounds[index],
+                    worldX,
+                    worldY,
+                    worldZ
+            );
+        });
 
         double minimumX = Double.POSITIVE_INFINITY;
         double maximumX = Double.NEGATIVE_INFINITY;
@@ -377,8 +421,14 @@ public final class TransformPublisher {
         );
 
         for (int i = oldLength; i < required; i++) {
-            vertexPartialBounds[i] =
-                    new AABB(0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+            vertexPartialBounds[i] = new AABB(
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0
+            );
         }
     }
 
@@ -454,7 +504,8 @@ public final class TransformPublisher {
             return;
         }
 
-        final ArrayDeque<SnapshotNode> stack = new ArrayDeque<>(256);
+        final ArrayDeque<SnapshotNode> stack =
+                new ArrayDeque<>(256);
 
         stack.push(new SnapshotNode(root, null, 0L));
 
@@ -469,10 +520,14 @@ public final class TransformPublisher {
             }
 
             final Transform transform = object.getTransform();
-            final Matrix4 localMatrix =
-                    transform == null ? null : transform.getTransformationMatrix();
-            final long localVersion =
-                    transform == null ? 0L : transform.getCachedVersion();
+
+            final Matrix4 localMatrix = transform == null
+                    ? null
+                    : transform.getTransformationMatrix();
+
+            final long localVersion = transform == null
+                    ? 0L
+                    : transform.getCachedVersion();
 
             final Matrix4 worldMatrix;
 
@@ -487,7 +542,11 @@ public final class TransformPublisher {
                 worldMatrix = node.parentWorld;
             } else {
                 worldMatrix = new Matrix4();
-                node.parentWorld.multiply(localMatrix, worldMatrix);
+
+                node.parentWorld.multiply(
+                        localMatrix,
+                        worldMatrix
+                );
             }
 
             worldMatrix.transformPoint(
@@ -500,12 +559,17 @@ public final class TransformPublisher {
             final double worldX = temporaryPoint[0];
             final double worldY = temporaryPoint[1];
             final double worldZ = temporaryPoint[2];
-            final long worldVersion =
-                    mixWorldVersion(node.parentWorldVersion, localVersion);
+
+            final long worldVersion = mixWorldVersion(
+                    node.parentWorldVersion,
+                    localVersion
+            );
 
             final double[][] localVertices = object.getVertices();
-            final int vertexCount =
-                    localVertices == null ? 0 : localVertices.length;
+
+            final int vertexCount = localVertices == null
+                    ? 0
+                    : localVertices.length;
 
             final DerivedCacheEntry cache =
                     derivedCache.cacheFor(object);
@@ -530,6 +594,7 @@ public final class TransformPublisher {
                 for (int i = 0; i < vertexCount; i++) {
                     final double[] source =
                             cache.transformedVertices[0][i];
+
                     final double[] destination =
                             cache.transformedVertices[1][i];
 
@@ -548,17 +613,21 @@ public final class TransformPublisher {
                         worldZ,
                         worldZ
                 );
+
                 cache.bounds[1].setFrom(cache.bounds[0]);
             }
 
             cache.worldX[0] = worldX;
             cache.worldY[0] = worldY;
             cache.worldZ[0] = worldZ;
+
             cache.worldX[1] = worldX;
             cache.worldY[1] = worldY;
             cache.worldZ[1] = worldZ;
+
             cache.lastWorldVersion = worldVersion;
             cache.initialized = true;
+
             cache.worldMatrix.set(worldMatrix);
             cache.worldMatrixInitialized = true;
             cache.currentFrame = 0;
@@ -602,20 +671,20 @@ public final class TransformPublisher {
     }
 
     private boolean shouldParallelizeVertices(int vertexCount) {
-        return vertexCount >= EngineSettings.VERTEX_PARALLEL_THRESHOLD &&
-                maximumUpdateWorkers > 1 &&
-                !Thread.currentThread()
-                        .getName()
-                        .startsWith("EngineWorker-");
+        return vertexCount >= EngineSettings.VERTEX_PARALLEL_THRESHOLD
+                && maximumUpdateWorkers > 1
+                && !Thread.currentThread()
+                .getName()
+                .startsWith("EngineWorker-");
     }
 
     private static long mixWorldVersion(long parent, long local) {
         long value = parent;
 
-        value ^= local +
-                0x9E3779B97F4A7C15L +
-                (value << 6) +
-                (value >>> 2);
+        value ^= local
+                + 0x9E3779B97F4A7C15L
+                + (value << 6)
+                + (value >>> 2);
 
         return value;
     }
@@ -624,5 +693,6 @@ public final class TransformPublisher {
             GameObject object,
             Matrix4 parentWorld,
             long parentWorldVersion
-    ) {}
+    ) {
+    }
 }
