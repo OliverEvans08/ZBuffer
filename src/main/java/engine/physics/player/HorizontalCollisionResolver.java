@@ -53,13 +53,10 @@ public final class HorizontalCollisionResolver {
 
         double sweptMinimumX =
                 Math.min(previousX, camera.x) - RADIUS;
-
         double sweptMaximumX =
                 Math.max(previousX, camera.x) + RADIUS;
-
         double sweptMinimumZ =
                 Math.min(previousZ, camera.z) - RADIUS;
-
         double sweptMaximumZ =
                 Math.max(previousZ, camera.z) + RADIUS;
 
@@ -91,11 +88,6 @@ public final class HorizontalCollisionResolver {
                             || bounds.maxZ < sweptMinimumZ
                             || bounds.minZ > sweptMaximumZ
                             || camera.y + HEIGHT <= bounds.minY
-                            /*
-                             * A support face or tiny seam at foot height
-                             * must not behave like a vertical wall. The
-                             * vertical/step pass will put the feet on it.
-                             */
                             || camera.y
                             >= bounds.maxY - supportTolerance
                             || collisionFilter
@@ -111,9 +103,20 @@ public final class HorizontalCollisionResolver {
             MeshCollider collider =
                     meshColliderCache.get(object, bounds);
 
-            if (collider != null && collider.wallBvh != null) {
-                resolveHorizontalAgainstMesh(camera, collider);
+            if (collider != null) {
+                /*
+                 * A valid mesh with no wall triangles has no horizontal
+                 * walls to resolve. Its bounding box is only a broad-phase
+                 * bound and must never become a solid obstacle.
+                 */
+                if (collider.wallBvh != null) {
+                    resolveHorizontalAgainstMesh(camera, collider);
+                }
             } else {
+                /*
+                 * Use box collision only when detailed collision geometry
+                 * is unavailable.
+                 */
                 resolveCapsuleAgainstAabb(camera, bounds);
             }
         }
@@ -124,6 +127,7 @@ public final class HorizontalCollisionResolver {
             MeshCollider collider
     ) {
         MeshBvh bvh = collider.wallBvh;
+
         double supportTolerance =
                 camera.onGround ? VERT_SNAP_EPS : 0.0;
 
@@ -138,19 +142,15 @@ public final class HorizontalCollisionResolver {
             if (
                     bvh.maxX[node] + HORIZONTAL_TRI_PAD
                             < camera.x - RADIUS
-                            || bvh.minX[node]
-                            - HORIZONTAL_TRI_PAD
+                            || bvh.minX[node] - HORIZONTAL_TRI_PAD
                             > camera.x + RADIUS
                             || bvh.maxY[node]
                             <= camera.y + supportTolerance
-                            || bvh.minY[node]
-                            - HORIZONTAL_TRI_PAD
+                            || bvh.minY[node] - HORIZONTAL_TRI_PAD
                             >= camera.y + HEIGHT
-                            || bvh.maxZ[node]
-                            + HORIZONTAL_TRI_PAD
+                            || bvh.maxZ[node] + HORIZONTAL_TRI_PAD
                             < camera.z - RADIUS
-                            || bvh.minZ[node]
-                            - HORIZONTAL_TRI_PAD
+                            || bvh.minZ[node] - HORIZONTAL_TRI_PAD
                             > camera.z + RADIUS
             ) {
                 continue;
@@ -176,8 +176,7 @@ public final class HorizontalCollisionResolver {
                                     - HORIZONTAL_TRI_PAD
                                     > camera.x + RADIUS
                                     || collider.maxY[triangle]
-                                    <= camera.y
-                                    + supportTolerance
+                                    <= camera.y + supportTolerance
                                     || collider.minY[triangle]
                                     - HORIZONTAL_TRI_PAD
                                     >= camera.y + HEIGHT

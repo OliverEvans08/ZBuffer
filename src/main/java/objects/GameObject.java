@@ -15,7 +15,20 @@ import util.Vector3;
 
 public abstract class GameObject {
 
-    private static volatile int PUBLISHED_FRAME;
+    public static final class FramePublication {
+        private volatile int index;
+
+        public int getIndex() {
+            return index;
+        }
+
+        public void setIndex(int index) {
+            this.index = index & 1;
+        }
+    }
+
+    // Compatibility for objects managed outside an engine Scene.
+    private static final FramePublication LEGACY_PUBLICATION = new FramePublication();
     private static final AtomicLong HIERARCHY_VERSION = new AtomicLong();
 
     private static final double[][] EMPTY_VERTS = new double[0][0];
@@ -29,15 +42,21 @@ public abstract class GameObject {
     }
 
     public static int getPublishedFrameIndex() {
-        return PUBLISHED_FRAME;
+        return LEGACY_PUBLICATION.getIndex();
     }
 
     public static void setPublishedFrameIndex(int index) {
-        PUBLISHED_FRAME = index & 1;
+        LEGACY_PUBLICATION.setIndex(index);
     }
 
     public static long getHierarchyVersion() {
         return HIERARCHY_VERSION.get();
+    }
+
+    private volatile FramePublication framePublication = LEGACY_PUBLICATION;
+
+    public final void setFramePublication(FramePublication publication) {
+        framePublication = java.util.Objects.requireNonNull(publication);
     }
 
     private final FrameState[] frames = { new FrameState(), new FrameState() };
@@ -113,7 +132,7 @@ public abstract class GameObject {
 
     public Matrix4 getWorldTransform() {
         // Prefer the published frame; caller should have run updateWorldTransform first
-        return frames[PUBLISHED_FRAME].worldMatrix;
+        return frames[framePublication.getIndex()].worldMatrix;
     }
 
     public MeshAsset getMeshAsset() {
@@ -175,25 +194,25 @@ public abstract class GameObject {
     public Transform getTransform() { return transform; }
 
     public Vector3 getWorldPosition() {
-        final FrameState state = frames[PUBLISHED_FRAME];
+        final FrameState state = frames[framePublication.getIndex()];
         return new Vector3(state.wx, state.wy, state.wz);
     }
 
     public void getWorldPosition(double[] output) {
         if (output == null || output.length < 3)
             throw new IllegalArgumentException("output must contain at least three elements");
-        final FrameState state = frames[PUBLISHED_FRAME];
+        final FrameState state = frames[framePublication.getIndex()];
         output[0] = state.wx;
         output[1] = state.wy;
         output[2] = state.wz;
     }
 
-    public double getWorldX() { return frames[PUBLISHED_FRAME].wx; }
-    public double getWorldY() { return frames[PUBLISHED_FRAME].wy; }
-    public double getWorldZ() { return frames[PUBLISHED_FRAME].wz; }
-    public AABB getWorldAABB() { return frames[PUBLISHED_FRAME].aabb; }
+    public double getWorldX() { return frames[framePublication.getIndex()].wx; }
+    public double getWorldY() { return frames[framePublication.getIndex()].wy; }
+    public double getWorldZ() { return frames[framePublication.getIndex()].wz; }
+    public AABB getWorldAABB() { return frames[framePublication.getIndex()].aabb; }
     public double[][] getTransformedVertices() {
-        final double[][] t = frames[PUBLISHED_FRAME].transformedVertices;
+        final double[][] t = frames[framePublication.getIndex()].transformedVertices;
         return t != null ? t : EMPTY_VERTS;
     }
 

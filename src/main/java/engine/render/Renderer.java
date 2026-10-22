@@ -31,7 +31,7 @@ public final class Renderer implements AutoCloseable {
     private final GameEngine gameEngine;
     private final Camera camera;
 
-    private final RenderSettings settings = new RenderSettings();
+    private final RenderSettings settings;
     private final RenderFrame frame = new RenderFrame();
     private final FrameBuffer frameBuffer = new FrameBuffer();
     private final FxaaProcessor fxaaProcessor = new FxaaProcessor();
@@ -78,6 +78,7 @@ public final class Renderer implements AutoCloseable {
             int sharedWorkers
     ) {
         this.camera = camera;
+        this.settings = camera.getRenderSettings();
         this.gameEngine = gameEngine;
 
         sceneCollector =
@@ -265,7 +266,7 @@ public final class Renderer implements AutoCloseable {
         );
 
         final double fieldOfView =
-                gameEngine.getFovRadians();
+                camera.getFovRadians();
 
         final double tangentHalfFieldOfView =
                 Math.tan(
@@ -273,7 +274,7 @@ public final class Renderer implements AutoCloseable {
                 );
 
         final double farDistance =
-                gameEngine.getRenderDistance();
+                camera.getRenderDistance();
 
         final double projectionScale =
                 (0.5 * width) /
@@ -584,7 +585,7 @@ public final class Renderer implements AutoCloseable {
         triangleBuildTimings.reset();
 
         final boolean firstPerson =
-                gameEngine.isFirstPerson();
+                camera == gameEngine.camera && camera.isFirstPerson();
 
         final GameObject playerBody =
                 gameEngine.getPlayerBody();

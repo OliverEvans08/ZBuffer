@@ -64,10 +64,9 @@ public final class PlayerCollisionResolver {
     }
 
     /**
-     * Resolves requested ground movement and retries a blocked move from a
-     * bounded raised position. The raised result is accepted only when it
-     * makes more progress and lands on a floor inside the configured step
-     * range. The vertical pass handles the matching step-down probe.
+     * Follows support surfaces during grounded movement, including slopes.
+     * A raised retry must retain horizontal progress, land within the step
+     * range, and have sufficient headroom.
      */
     public void resolveGroundMovement(
             Camera camera,
@@ -85,19 +84,21 @@ public final class PlayerCollisionResolver {
                 previousZ
         );
 
-        if (
-                !wasOnGround
-                        || camera.yVelocity > 0.0
-        ) {
+        /*
+         * Airborne movement and jumping must not be snapped onto nearby
+         * floors by the grounded support probe.
+         */
+        if (!wasOnGround || camera.yVelocity > 0.0) {
             return;
         }
 
         double requestX = requestedX - previousX;
         double requestZ = requestedZ - previousZ;
+
         double requestedDistance2 =
                 requestX * requestX + requestZ * requestZ;
 
-        if (requestedDistance2 <= STEP_PROGRESS_EPS) {
+        if (requestedDistance2 <= 1e-12) {
             return;
         }
 
@@ -117,85 +118,88 @@ public final class PlayerCollisionResolver {
                 requestedDistance2
         );
 
-        boolean steppedUp = false;
+        /*
+         * Probe support on every grounded move.
+         *
+         * A walkable slope does not block horizontal movement. Nevertheless,
+         * its floor at the destination can be above the previous feet
+         * position, so a normal downward gravity sweep would miss it.
+         *
+         * Temporarily raise the feet, resolve horizontal obstacles there,
+         * then sweep down to find a supported destination.
+         */
+        camera.x = requestedX;
+        camera.y = previousY + MAX_STEP_UP;
+        camera.z = requestedZ;
+        camera.yVelocity = 0.0;
+        camera.onGround = false;
+
+        horizontalResolver.resolve(
+                camera,
+                previousX,
+                previousZ
+        );
+
+        double raisedProgress = movementProgress(
+                previousX,
+                previousZ,
+                camera.x,
+                camera.z,
+                requestX,
+                requestZ,
+                requestedDistance2
+        );
 
         /*
-         * Do the more expensive raised retry only if ordinary horizontal
-         * collision materially shortened the requested move.
+         * Equal progress is valid: it is the ordinary case when walking
+         * along an unobstructed slope. A step may improve progress.
          */
-        if (normalProgress < 1.0 - STEP_PROGRESS_EPS) {
-            camera.x = requestedX;
-            camera.y = previousY + MAX_STEP_UP;
-            camera.z = requestedZ;
-            camera.yVelocity = 0.0;
-            camera.onGround = false;
+        if (raisedProgress >= normalProgress - STEP_PROGRESS_EPS) {
+            double raisedY = camera.y;
 
-            horizontalResolver.resolve(
+            camera.y = previousY - MAX_STEP_DOWN;
+
+            verticalResolver.resolve(
                     camera,
                     previousX,
+                    raisedY,
                     previousZ
             );
 
-            double raisedProgress = movementProgress(
-                    previousX,
-                    previousZ,
-                    camera.x,
-                    camera.z,
-                    requestX,
-                    requestZ,
-                    requestedDistance2
-            );
+            double landedY = camera.y;
 
             if (
-                    raisedProgress
-                            > normalProgress + STEP_PROGRESS_EPS
+                    camera.onGround
+                            && landedY
+                            <= previousY + MAX_STEP_UP + STEP_RANGE_EPS
+                            && landedY
+                            >= previousY - MAX_STEP_DOWN - STEP_RANGE_EPS
+                            && hasStepUpHeadroom(
+                            camera,
+                            previousY,
+                            landedY
+                    )
             ) {
-                double raisedY = camera.y;
-
-                camera.y = previousY - MAX_STEP_DOWN;
-
-                verticalResolver.resolve(
-                        camera,
-                        previousX,
-                        raisedY,
-                        previousZ
-                );
-
-                double landedY = camera.y;
-
-                if (
-                        camera.onGround
-                                && landedY
-                                <= previousY
-                                + MAX_STEP_UP
-                                + STEP_RANGE_EPS
-                                && landedY
-                                >= previousY
-                                - MAX_STEP_DOWN
-                                - STEP_RANGE_EPS
-                                && hasStepUpHeadroom(
-                                camera,
-                                previousY,
-                                landedY
-                        )
-                ) {
-                    camera.y = landedY;
-                    camera.yVelocity = 0.0;
-                    camera.onGround = true;
-                    steppedUp = true;
-                }
+                camera.y = landedY;
+                camera.yVelocity = 0.0;
+                camera.onGround = true;
+                return;
             }
         }
 
-        if (steppedUp) {
-            return;
-        }
-
+        /*
+         * No acceptable supported destination was found. Restore ordinary
+         * horizontal movement and let the normal vertical pass handle
+         * gravity, ceilings, and walking off a ledge.
+         *
+         * The probe distance must never become an unconditional drop.
+         */
         camera.x = normalX;
         camera.y = normalY;
         camera.z = normalZ;
         camera.yVelocity = normalVelocity;
         camera.onGround = normalOnGround;
+
         verticalResolver.clearFloorCache();
     }
 
@@ -215,6 +219,7 @@ public final class PlayerCollisionResolver {
          * the capsule through a low ceiling.
          */
         camera.y = landedY;
+
         verticalResolver.resolve(
                 camera,
                 camera.x,
@@ -328,15 +333,11 @@ public final class PlayerCollisionResolver {
 
             if (
                     bvh.maxX[node] < camera.x - RADIUS
-                            || bvh.minX[node]
-                            > camera.x + RADIUS
+                            || bvh.minX[node] > camera.x + RADIUS
                             || bvh.maxY[node] <= camera.y
-                            || bvh.minY[node]
-                            >= camera.y + HEIGHT
-                            || bvh.maxZ[node]
-                            < camera.z - RADIUS
-                            || bvh.minZ[node]
-                            > camera.z + RADIUS
+                            || bvh.minY[node] >= camera.y + HEIGHT
+                            || bvh.maxZ[node] < camera.z - RADIUS
+                            || bvh.minZ[node] > camera.z + RADIUS
             ) {
                 continue;
             }
@@ -379,7 +380,6 @@ public final class PlayerCollisionResolver {
 
                     double offsetX =
                             camera.x - closestXZ[0];
-
                     double offsetZ =
                             camera.z - closestXZ[1];
 

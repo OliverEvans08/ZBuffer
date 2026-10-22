@@ -11,7 +11,7 @@ import engine.render.Renderer;
 import engine.ui.GamePanel;
 import gui.ClickGUI;
 
-import java.awt.*;
+import java.awt.Graphics;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -19,11 +19,10 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+
 import objects.GameObject;
 import objects.dynamic.Body;
-import objects.lighting.LightObject;
 import sound.SoundEngine;
-import util.Vector3;
 
 public class GameEngine extends GamePanel implements Runnable {
 
@@ -38,14 +37,18 @@ public class GameEngine extends GamePanel implements Runnable {
     public final Renderer renderer;
     public final SoundEngine soundEngine;
     public final ClickGUI clickGUI;
+
     public final CopyOnWriteArrayList<GameObject> rootObjects;
+
     public final InventorySystem inventorySystem;
     public final InventoryUI inventoryUI;
     public final AssetManager assetManager;
 
     private final EngineContext context;
     private final GameLoop gameLoop;
-    private final AtomicBoolean shutdownStarted = new AtomicBoolean();
+
+    private final AtomicBoolean shutdownStarted =
+            new AtomicBoolean();
 
     public GameEngine() {
         context = new EngineContext(this);
@@ -55,33 +58,67 @@ public class GameEngine extends GamePanel implements Runnable {
 
         rootObjects = new CopyOnWriteArrayList<>();
 
-        camera = new Camera(0.0, 0.0, 0.0, 0.0, 0.0, this);
+        camera = new Camera(
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                this,
+                context.settings
+        );
+
         context.camera = camera;
 
-        final int processors = Runtime.getRuntime().availableProcessors();
-        context.maximumUpdateWorkers = Math.max(1, processors - 2);
+        final int processors =
+                Runtime.getRuntime().availableProcessors();
 
-        final ThreadFactory updateThreadFactory = new ThreadFactory() {
-            private final ThreadFactory delegate = Executors.defaultThreadFactory();
-            private final AtomicInteger nextId = new AtomicInteger(1);
+        context.maximumUpdateWorkers =
+                Math.max(1, processors - 2);
 
-            @Override
-            public Thread newThread(Runnable task) {
-                final Thread thread = delegate.newThread(task);
+        final ThreadFactory updateThreadFactory =
+                new ThreadFactory() {
 
-                thread.setName("EngineWorker-" + nextId.getAndIncrement());
-                thread.setDaemon(true);
+                    private final ThreadFactory delegate =
+                            Executors.defaultThreadFactory();
 
-                return thread;
-            }
-        };
+                    private final AtomicInteger nextId =
+                            new AtomicInteger(1);
 
-        context.updatePool = Executors.newFixedThreadPool(context.maximumUpdateWorkers, updateThreadFactory);
+                    @Override
+                    public Thread newThread(Runnable task) {
+                        final Thread thread =
+                                delegate.newThread(task);
 
-        renderer = new Renderer(camera, this, context.updatePool, context.maximumUpdateWorkers);
+                        thread.setName(
+                                "EngineWorker-"
+                                        + nextId.getAndIncrement()
+                        );
+
+                        thread.setDaemon(true);
+
+                        return thread;
+                    }
+                };
+
+        context.updatePool = Executors.newFixedThreadPool(
+                context.maximumUpdateWorkers,
+                updateThreadFactory
+        );
+
+        renderer = new Renderer(
+                camera,
+                this,
+                context.updatePool,
+                context.maximumUpdateWorkers
+        );
+
         context.renderer = renderer;
 
-        soundEngine = new SoundEngine("./src/main/java/sound/wavs");
+        soundEngine = new SoundEngine(
+                "./src/main/java/sound/wavs"
+        );
+
         soundEngine.setMasterVolume(0.25);
         context.soundEngine = soundEngine;
 
@@ -95,20 +132,43 @@ public class GameEngine extends GamePanel implements Runnable {
         assetManager.loadAllMeshes();
         context.assetManager = assetManager;
 
-        GameObject.setPublishedFrameIndex(0);
+        context.playerBody = new Body(
+                Camera.WIDTH,
+                Camera.HEIGHT
+        );
 
-        context.playerBody = new Body(Camera.WIDTH, Camera.HEIGHT);
         context.playerBody.setFull(false);
-        context.playerBody.getTransform().position.x = camera.x;
-        context.playerBody.getTransform().position.y = camera.y;
-        context.playerBody.getTransform().position.z = camera.z;
 
-        context.scene = new engine.scene.Scene(context, rootObjects);
-        context.scene.addRootObjectImmediate(context.playerBody);
+        context.playerBody.getTransform().position.x =
+                camera.x;
 
-        context.playerController = new engine.systems.PlayerController(camera, eventBus, context.playerBody);
+        context.playerBody.getTransform().position.y =
+                camera.y;
 
-        inventorySystem = new InventorySystem(this, eventBus);
+        context.playerBody.getTransform().position.z =
+                camera.z;
+
+        context.scene = new engine.scene.Scene(
+                context,
+                rootObjects
+        );
+
+        context.scene.addRootObjectImmediate(
+                context.playerBody
+        );
+
+        context.playerController =
+                new engine.systems.PlayerController(
+                        camera,
+                        eventBus,
+                        context.playerBody
+                );
+
+        inventorySystem = new InventorySystem(
+                this,
+                eventBus
+        );
+
         context.inventorySystem = inventorySystem;
 
         inventoryUI = inventorySystem.getUI();
@@ -121,16 +181,45 @@ public class GameEngine extends GamePanel implements Runnable {
         context.scene.initializeGameObjects();
 
         context.addSubscription(
-                eventBus.subscribe(GuiToggleRequestedEvent.class, event -> {
-                    clickGUI.setOpen(!clickGUI.isOpen());
-                    onGuiToggled(clickGUI.isOpen());
-                })
+                eventBus.subscribe(
+                        GuiToggleRequestedEvent.class,
+                        event -> {
+                            clickGUI.setOpen(
+                                    !clickGUI.isOpen()
+                            );
+
+                            onGuiToggled(clickGUI.isOpen());
+                        }
+                )
         );
 
-        context.addSubscription(eventBus.subscribe(InventoryOpenChangedEvent.class, event -> onInventoryToggled(event.open)));
+        context.addSubscription(
+                eventBus.subscribe(
+                        InventoryOpenChangedEvent.class,
+                        event -> onInventoryToggled(event.open)
+                )
+        );
 
         gameLoop = new GameLoop(context, this);
         gameLoop.start();
+    }
+
+    @Override
+    protected void paintComponent(Graphics graphics) {
+        /*
+         * GameLoop holds this same monitor for an entire fixed tick.
+         *
+         * Keep it for the complete scene paint, including all renderer
+         * worker phases. Camera values, published object frame indices,
+         * bounds, and transformed vertices must remain unchanged until
+         * this paint has finished reading them.
+         *
+         * Locking only publication or only individual getters would
+         * still allow a paint to combine different simulation ticks.
+         */
+        synchronized (this) {
+            super.paintComponent(graphics);
+        }
     }
 
     public void shutdown() {
@@ -138,6 +227,10 @@ public class GameEngine extends GamePanel implements Runnable {
             return;
         }
 
+        /*
+         * Do not hold the render/update monitor while joining the loop.
+         * The game thread may need that monitor before it can finish.
+         */
         gameLoop.shutdown();
         context.shutdown();
     }
@@ -156,19 +249,19 @@ public class GameEngine extends GamePanel implements Runnable {
     }
 
     public double getFovRadians() {
-        return context.settings.getFieldOfViewRadians();
+        return camera.getFovRadians();
     }
 
     public void setFovDegrees(double degrees) {
-        context.settings.setFieldOfViewDegrees(degrees);
+        camera.setFovDegrees(degrees);
     }
 
     public double getRenderDistance() {
-        return context.settings.getRenderDistance();
+        return camera.getRenderDistance();
     }
 
     public void setRenderDistance(double distance) {
-        context.settings.setRenderDistance(distance);
+        camera.setRenderDistance(distance);
     }
 
     public void addRootObject(GameObject object) {
@@ -179,12 +272,36 @@ public class GameEngine extends GamePanel implements Runnable {
         context.scene.removeRootObject(object);
     }
 
-    public void queryNearbyCollidersXZ(double minX, double maxX, double minZ, double maxZ, ArrayList<GameObject> output) {
-        context.scene.queryNearbyCollidersXZ(minX, maxX, minZ, maxZ, output);
+    public void queryNearbyCollidersXZ(
+            double minX,
+            double maxX,
+            double minZ,
+            double maxZ,
+            ArrayList<GameObject> output
+    ) {
+        context.scene.queryNearbyCollidersXZ(
+                minX,
+                maxX,
+                minZ,
+                maxZ,
+                output
+        );
     }
 
-    public void queryNearbyRenderablesXZ(double minX, double maxX, double minZ, double maxZ, ArrayList<GameObject> output) {
-        context.scene.queryNearbyRenderablesXZ(minX, maxX, minZ, maxZ, output);
+    public void queryNearbyRenderablesXZ(
+            double minX,
+            double maxX,
+            double minZ,
+            double maxZ,
+            ArrayList<GameObject> output
+    ) {
+        context.scene.queryNearbyRenderablesXZ(
+                minX,
+                maxX,
+                minZ,
+                maxZ,
+                output
+        );
     }
 
     public List<GameObject> getColliders() {

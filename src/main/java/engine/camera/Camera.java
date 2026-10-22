@@ -1,6 +1,8 @@
 package engine.camera;
 
 import engine.GameEngine;
+import engine.EngineSettings;
+import engine.render.RenderSettings;
 import engine.physics.collision.MeshColliderCache;
 import engine.physics.player.CollisionFilter;
 import engine.physics.player.PlayerCapsule;
@@ -42,6 +44,9 @@ public class Camera {
 
     final GameEngine gameEngine;
 
+    private final EngineSettings viewSettings;
+    private final RenderSettings renderSettings = new RenderSettings();
+
     private final CameraPose pose = new CameraPose();
     private final CameraBasis basis = new CameraBasis();
     private final HeadBob headBob = new HeadBob();
@@ -64,6 +69,19 @@ public class Camera {
             double yaw,
             GameEngine gameEngine
     ) {
+        this(x, y, z, pitch, yaw, gameEngine, new EngineSettings());
+    }
+
+    public Camera(
+            double x,
+            double y,
+            double z,
+            double pitch,
+            double yaw,
+            GameEngine gameEngine,
+            EngineSettings viewSettings
+    ) {
+        this.viewSettings = java.util.Objects.requireNonNull(viewSettings);
         this.x = x;
         this.y = y;
         this.z = z;
@@ -100,6 +118,26 @@ public class Camera {
         );
 
         recomputeViewOrigin(0.0);
+    }
+
+    public double getFovRadians() {
+        return viewSettings.getFieldOfViewRadians();
+    }
+
+    public void setFovDegrees(double degrees) {
+        viewSettings.setFieldOfViewDegrees(degrees);
+    }
+
+    public double getRenderDistance() {
+        return viewSettings.getRenderDistance();
+    }
+
+    public void setRenderDistance(double distance) {
+        viewSettings.setRenderDistance(distance);
+    }
+
+    public RenderSettings getRenderSettings() {
+        return renderSettings;
     }
 
     public CameraMode getMode() {

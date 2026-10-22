@@ -22,8 +22,11 @@ public final class GameLoop implements Runnable {
     private final GamePanel panel;
     private final FrameTiming frameTiming;
 
-    private final AtomicBoolean running = new AtomicBoolean(true);
-    private final AtomicBoolean entered = new AtomicBoolean();
+    private final AtomicBoolean running =
+            new AtomicBoolean(true);
+
+    private final AtomicBoolean entered =
+            new AtomicBoolean();
 
     private volatile Thread gameThread;
 
@@ -97,10 +100,7 @@ public final class GameLoop implements Runnable {
         );
 
         try {
-            while (
-                    running.get()
-                            && !Thread.currentThread().isInterrupted()
-            ) {
+            while (isRunning()) {
                 long now = System.nanoTime();
 
                 frameTiming.addElapsed(
@@ -110,47 +110,61 @@ public final class GameLoop implements Runnable {
                 lastTime = now;
 
                 while (
-                        running.get()
-                                && !Thread.currentThread().isInterrupted()
+                        isRunning()
                                 && frameTiming.stepReady()
                 ) {
-                    double delta = frameTiming.fixedDeltaSeconds();
+                    final double delta =
+                            frameTiming.fixedDeltaSeconds();
 
-                    context.eventBus.publish(
-                            new TickEvent(
-                                    TickEvent.Phase.PRE,
-                                    delta
-                            )
-                    );
+                    /*
+                     * GameEngine.paintComponent holds this same monitor
+                     * for its entire scene render.
+                     *
+                     * PRE must be inside the lock: CarMod advances the
+                     * car and changes the camera during that callback.
+                     *
+                     * Keep camera updates, derived geometry publication,
+                     * and POST callbacks in the same transaction so the
+                     * renderer only sees completed simulation ticks.
+                     */
+                    synchronized (context.engine) {
+                        if (!isRunning()) {
+                            break;
+                        }
 
-                    fixedUpdate(delta);
+                        context.eventBus.publish(
+                                new TickEvent(
+                                        TickEvent.Phase.PRE,
+                                        delta
+                                )
+                        );
 
-                    context.eventBus.publish(
-                            new TickEvent(
-                                    TickEvent.Phase.POST,
-                                    delta
-                            )
-                    );
+                        fixedUpdate(delta);
 
-                    frameTiming.consumeStep();
+                        context.eventBus.publish(
+                                new TickEvent(
+                                        TickEvent.Phase.POST,
+                                        delta
+                                )
+                        );
+
+                        frameTiming.consumeStep();
+                    }
                 }
 
-                if (
-                        !running.get()
-                                || Thread.currentThread().isInterrupted()
-                ) {
+                if (!isRunning()) {
                     break;
                 }
 
                 now = System.nanoTime();
 
                 if (now - nextRepaint >= 0L) {
+                    /*
+                     * Queue Swing painting after releasing the scene
+                     * monitor. Never wait for the EDT while holding it.
+                     */
                     panel.requestRepaint();
 
-                    /*
-                     * Advance even if Swing already has a repaint queued.
-                     * Preserve cadence without queuing catch-up frames.
-                     */
                     nextRepaint += repaintInterval;
 
                     if (now - nextRepaint >= 0L) {
@@ -158,18 +172,21 @@ public final class GameLoop implements Runnable {
                     }
                 }
 
-                long afterWork = System.nanoTime();
+                final long afterWork = System.nanoTime();
 
                 /*
-                 * Account for time spent doing updates, because the clock
-                 * accumulator was sampled before that work began.
+                 * Include update time and any time spent waiting for a
+                 * render to finish when calculating the next wake-up.
                  */
-                long untilTick =
+                final long untilTick =
                         frameTiming.nanosUntilNextStep()
                                 - (afterWork - lastTime);
 
-                long untilPaint = nextRepaint - afterWork;
-                long sleep = Math.min(untilTick, untilPaint);
+                final long untilPaint =
+                        nextRepaint - afterWork;
+
+                final long sleep =
+                        Math.min(untilTick, untilPaint);
 
                 if (sleep > 0L) {
                     LockSupport.parkNanos(this, sleep);
@@ -186,6 +203,11 @@ public final class GameLoop implements Runnable {
         }
     }
 
+    private boolean isRunning() {
+        return running.get()
+                && !Thread.currentThread().isInterrupted();
+    }
+
     private void fixedUpdate(double delta) {
         scene.drainRootOperations();
 
@@ -200,7 +222,8 @@ public final class GameLoop implements Runnable {
                         + forwardIntent * forwardIntent
         );
 
-        final boolean movingIntent = intentSpeed > 1.0e-9;
+        final boolean movingIntent =
+                intentSpeed > 1.0e-9;
 
         context.camera.update(delta);
 
@@ -224,6 +247,7 @@ public final class GameLoop implements Runnable {
         );
 
         scene.runTwoPhaseUpdate(delta);
+
         context.soundEngine.tick();
     }
 
@@ -235,6 +259,7 @@ public final class GameLoop implements Runnable {
         transform.position.y = context.camera.y;
         transform.position.z = context.camera.z;
 
-        transform.rotation.y = -context.camera.getViewYaw();
+        transform.rotation.y =
+                -context.camera.getViewYaw();
     }
 }
