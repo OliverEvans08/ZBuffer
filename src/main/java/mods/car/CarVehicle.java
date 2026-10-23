@@ -2,12 +2,11 @@ package mods.car;
 
 import engine.GameEngine;
 import objects.GameObject;
-
 import java.util.ArrayList;
 
 public final class CarVehicle extends GameObject {
-    private static final double MASS = 1839.0;
-    private static final double INV_MASS = 1.0 / MASS;
+    private static final double MASS = 1839;
+    private static final double INV_MASS = 1 / MASS;
     private static final double G = 9.81;
 
     private static final double WHEELBASE = 2.875;
@@ -15,7 +14,6 @@ public final class CarVehicle extends GameObject {
     private static final double REAR_TRACK = 1.560;
     private static final double FRONT_WEIGHT = .48;
     private static final double REAR_WEIGHT = .52;
-
     private static final double FRONT_RADIUS = .254 + .235 * .35;
     private static final double REAR_RADIUS = .254 + .275 * .30;
 
@@ -76,7 +74,6 @@ public final class CarVehicle extends GameObject {
     private final double[] omega = new double[4];
     private final double[] travel = new double[4];
     private final double[] springLoad = new double[4];
-
     private final double[] mountX = new double[4];
     private final double[] mountY = new double[4];
     private final double[] mountZ = new double[4];
@@ -92,7 +89,6 @@ public final class CarVehicle extends GameObject {
     private double cx, cy, cz;
     private double vx, vy, vz;
     private double wx, wy, wz;
-
     private double qw = 1;
     private double qx, qy, qz;
 
@@ -105,8 +101,22 @@ public final class CarVehicle extends GameObject {
     private volatile double speed;
     private volatile double heading;
 
+    private double pendingSteer = Double.NaN;
+    private double pendingAcceleration = Double.NaN;
+    private double autoSteer = Double.NaN;
+    private double autoAcceleration = Double.NaN;
+
     private boolean initialized;
     private boolean serviceBrake;
+
+    /**
+     * One fixed-update command, consumed by the next drive() call.
+     * NaN leaves an axis under keyboard control.
+     */
+    void commandAutonomy(double steerRadians, double acceleration) {
+        pendingSteer = steerRadians;
+        pendingAcceleration = acceleration;
+    }
 
     public CarVehicle(double x, double z) {
         setName("Model 3 Performance-inspired vehicle");
@@ -125,7 +135,6 @@ public final class CarVehicle extends GameObject {
         reset();
     }
 
-    // The physics root must never render a default GameObject cube.
     @Override
     public double[][] getVertices() {
         return EMPTY_VERTICES;
@@ -192,10 +201,8 @@ public final class CarVehicle extends GameObject {
     }
 
     public boolean owns(GameObject object) {
-        for (GameObject p = object; p != null; p = p.getParent()) {
-            if (p == this) {
-                return true;
-            }
+        for (GameObject parent = object; parent != null; parent = parent.getParent()) {
+            if (parent == this) return true;
         }
         return false;
     }
@@ -205,6 +212,7 @@ public final class CarVehicle extends GameObject {
 
         vx = vy = vz = wx = wy = wz = 0;
         speed = steering = throttle = 0;
+        pendingSteer = pendingAcceleration = autoSteer = autoAcceleration = Double.NaN;
 
         qw = Math.cos(yaw * .5);
         qx = qz = 0;
@@ -228,7 +236,6 @@ public final class CarVehicle extends GameObject {
         double x = transform.position.x;
         double z = transform.position.z;
         double oldY = transform.position.y;
-
         double yaw = Double.isFinite(heading) ? heading : 0;
         double sine = Math.sin(yaw);
         double cosine = Math.cos(yaw);
@@ -241,58 +248,45 @@ public final class CarVehicle extends GameObject {
             for (int xi = -2; xi <= 2; xi++) {
                 double lx = xi * .5;
                 double lz = zi * .5;
-
                 double surface = terrain.height(
                         x + lx * cosine + lz * sine,
                         z - lx * sine + lz * cosine,
-                        oldY - 6,
-                        oldY + 6
+                        oldY - 6, oldY + 6
                 );
 
-                if (Double.isFinite(surface)) {
-                    highest = Math.max(highest, surface);
-                }
+                if (Double.isFinite(surface)) highest = Math.max(highest, surface);
             }
         }
 
         reset();
 
-        if (Double.isFinite(highest)) {
-            transform.position.y = highest + .12;
-        }
+        if (Double.isFinite(highest)) transform.position.y = highest + .12;
 
         initialized = true;
         updateVisuals();
     }
 
     public void drive(
-            GameEngine engine,
-            double dt,
-            boolean forward,
-            boolean backward,
-            boolean left,
-            boolean right,
-            boolean brake
+            GameEngine engine, double dt,
+            boolean forward, boolean backward,
+            boolean left, boolean right, boolean brake
     ) {
-        if (!Double.isFinite(dt) || dt <= 0) {
-            return;
-        }
+        autoSteer = pendingSteer;
+        autoAcceleration = pendingAcceleration;
+        pendingSteer = pendingAcceleration = Double.NaN;
+
+        if (!Double.isFinite(dt) || dt <= 0) return;
 
         dt = Math.min(.20, dt);
         terrain.prepare(engine, this, 7 + getGroundSpeed() * dt);
 
         if (!initialized) {
             double floor = terrain.height(
-                    transform.position.x,
-                    transform.position.z,
-                    transform.position.y - 3,
-                    transform.position.y + 3
+                    transform.position.x, transform.position.z,
+                    transform.position.y - 3, transform.position.y + 3
             );
 
-            if (Double.isFinite(floor)) {
-                transform.position.y = floor;
-            }
-
+            if (Double.isFinite(floor)) transform.position.y = floor;
             initialized = true;
         }
 
@@ -301,13 +295,13 @@ public final class CarVehicle extends GameObject {
         cz = transform.position.z + r21 * COM_HEIGHT;
 
         while (dt > 1e-8) {
-            double h = Math.min(
+            double step = Math.min(
                     dt,
                     Math.min(1.0 / 240.0, .20 / Math.max(1, getGroundSpeed()))
             );
 
-            dt -= h;
-            tickPhysics(h, forward, backward, left, right, brake);
+            dt -= step;
+            tickPhysics(step, forward, backward, left, right, brake);
         }
 
         syncRoot();
@@ -315,32 +309,28 @@ public final class CarVehicle extends GameObject {
     }
 
     private void tickPhysics(
-            double dt,
-            boolean forward,
-            boolean backward,
-            boolean left,
-            boolean right,
-            boolean brake
+            double dt, boolean forward, boolean backward,
+            boolean left, boolean right, boolean brake
     ) {
         double roadSpeed = Math.hypot(vx, vz);
         double steerInput = (right ? 1 : 0) - (left ? 1 : 0);
         double longitudinalSpeed = Math.abs(vx * r02 + vz * r22);
-
-        // Keyboard steering aid: full lock when parking, progressively
-        // smaller requested angles at speed. Tyre forces still turn the car.
         double wheelSpeed = Math.max(2, longitudinalSpeed);
-        double speedLimit = Math.atan(
-                STEER_LAT_ACCEL * WHEELBASE / (wheelSpeed * wheelSpeed)
-        );
+
+        double speedLimit =
+                Math.atan(STEER_LAT_ACCEL * WHEELBASE / (wheelSpeed * wheelSpeed));
 
         double target = steerInput * Math.min(MAX_STEER, speedLimit);
-        double response = steerInput == 0 ? 5.5 : 4.0;
-        double requested = (target - steering) * (1 - Math.exp(-response * dt));
 
-        // Finite steering rack speed prevents instantaneous lock changes.
-        double rackSpeed = Math.toRadians(
-                steerInput == 0 ? 65 : 48
-        );
+        if (Double.isFinite(autoSteer)) {
+            target = clamp(autoSteer, -MAX_STEER, MAX_STEER);
+        }
+
+        double response =
+                Double.isFinite(autoSteer) ? 10 : steerInput == 0 ? 5.5 : 4.0;
+
+        double requested = (target - steering) * (1 - Math.exp(-response * dt));
+        double rackSpeed = Math.toRadians(steerInput == 0 ? 65 : 48);
 
         steering += clamp(requested, -rackSpeed * dt, rackSpeed * dt);
         steering = clamp(steering, -MAX_STEER, MAX_STEER);
@@ -396,19 +386,14 @@ public final class CarVehicle extends GameObject {
             contact[i] = false;
             travel[i] = MAX_TRAVEL;
 
-            if (upY < .35) {
-                continue;
-            }
+            if (upY < .35) continue;
 
             double x = wheelX(i);
             double z = wheelZ(i);
 
-            mountX[i] = cx + r00 * x
-                    + r01 * (SUSP_MOUNT - COM_HEIGHT) + r02 * z;
-            mountY[i] = cy + r10 * x
-                    + r11 * (SUSP_MOUNT - COM_HEIGHT) + r12 * z;
-            mountZ[i] = cz + r20 * x
-                    + r21 * (SUSP_MOUNT - COM_HEIGHT) + r22 * z;
+            mountX[i] = cx + r00 * x + r01 * (SUSP_MOUNT - COM_HEIGHT) + r02 * z;
+            mountY[i] = cy + r10 * x + r11 * (SUSP_MOUNT - COM_HEIGHT) + r12 * z;
+            mountZ[i] = cz + r20 * x + r21 * (SUSP_MOUNT - COM_HEIGHT) + r22 * z;
 
             double probeX = mountX[i] - r01 * .30;
             double probeZ = mountZ[i] - r21 * .30;
@@ -420,15 +405,10 @@ public final class CarVehicle extends GameObject {
                     radius(i), bottom, top
             );
 
-            if (!Double.isFinite(surface)) {
-                continue;
-            }
+            if (!Double.isFinite(surface)) continue;
 
             double clearance = (mountY[i] - surface) / upY;
-
-            if (clearance > MAX_TRAVEL + .015) {
-                continue;
-            }
+            if (clearance > MAX_TRAVEL + .015) continue;
 
             contact[i] = true;
             surfaceY[i] = surface;
@@ -442,6 +422,7 @@ public final class CarVehicle extends GameObject {
 
             slopeX[i] = Double.isFinite(y0) && Double.isFinite(y1)
                     ? clamp((y1 - y0) / (2 * epsilon), -2, 2) : 0;
+
             slopeZ[i] = Double.isFinite(z0) && Double.isFinite(z1)
                     ? clamp((z1 - z0) / (2 * epsilon), -2, 2) : 0;
         }
@@ -450,10 +431,7 @@ public final class CarVehicle extends GameObject {
     private void suspension(double dt) {
         for (int i = 0; i < 4; i++) {
             springLoad[i] = 0;
-
-            if (!contact[i]) {
-                continue;
-            }
+            if (!contact[i]) continue;
 
             double rx = mountX[i] - cx;
             double ry = mountY[i] - cy;
@@ -471,9 +449,7 @@ public final class CarVehicle extends GameObject {
             double force = springK(i) * (restLength(i) - length)
                     - damperC(i) * along;
 
-            if (length < MIN_TRAVEL) {
-                force += BUMP_K * (MIN_TRAVEL - length);
-            }
+            if (length < MIN_TRAVEL) force += BUMP_K * (MIN_TRAVEL - length);
 
             springLoad[i] = clamp(force, 0, MAX_SUSP_FORCE);
         }
@@ -481,26 +457,17 @@ public final class CarVehicle extends GameObject {
         for (int axle = 0; axle < 2; axle++) {
             int left = axle * 2;
             int right = left + 1;
-
-            if (!contact[left] || !contact[right]) {
-                continue;
-            }
+            if (!contact[left] || !contact[right]) continue;
 
             double stiffness = axle == 0 ? FRONT_ANTIROLL : REAR_ANTIROLL;
             double transfer = stiffness * (travel[right] - travel[left]);
 
-            springLoad[left] = clamp(
-                    springLoad[left] + transfer, 0, MAX_SUSP_FORCE
-            );
-            springLoad[right] = clamp(
-                    springLoad[right] - transfer, 0, MAX_SUSP_FORCE
-            );
+            springLoad[left] = clamp(springLoad[left] + transfer, 0, MAX_SUSP_FORCE);
+            springLoad[right] = clamp(springLoad[right] - transfer, 0, MAX_SUSP_FORCE);
         }
 
         for (int i = 0; i < 4; i++) {
-            if (!contact[i] || springLoad[i] <= 0) {
-                continue;
-            }
+            if (!contact[i] || springLoad[i] <= 0) continue;
 
             double nx = -slopeX[i];
             double nz = -slopeZ[i];
@@ -514,12 +481,7 @@ public final class CarVehicle extends GameObject {
         }
     }
 
-    private void tyresStep(
-            double dt,
-            boolean forward,
-            boolean backward,
-            boolean brake
-    ) {
+    private void tyresStep(double dt, boolean forward, boolean backward, boolean brake) {
         double alongCar = vx * r02 + vz * r22;
         double acrossCar = vx * r00 + vz * r20;
         double roadSpeed = Math.hypot(vx, vz);
@@ -530,17 +492,36 @@ public final class CarVehicle extends GameObject {
         serviceBrake = brake || forward && backward || opposing;
         boolean drive = direction != 0 && !serviceBrake;
 
-        throttle = smooth(throttle, drive ? 1 : 0, 1 / .09, dt);
+        boolean automatic = Double.isFinite(autoAcceleration);
+        double automaticForce = 0;
+
+        if (automatic) {
+            automaticForce = MASS * (autoAcceleration + G * r12)
+                    + DRAG * alongCar * Math.abs(alongCar)
+                    + ROLLING_RESISTANCE * MASS * G * Math.signum(alongCar);
+
+            direction = 1;
+            serviceBrake = brake || autoAcceleration <= -8 || automaticForce < 0;
+            drive = !serviceBrake;
+        }
+
+        double pedal = automatic
+                ? clamp(
+                automaticForce
+                        / Math.max(1, driveForce(Math.max(0, alongCar), 1)),
+                0, 1
+        )
+                : drive ? 1 : 0;
+
+        throttle = smooth(throttle, drive ? pedal : 0, 1 / .09, dt);
 
         int supported = 0;
         for (int i = 0; i < 4; i++) {
-            if (contact[i] && springLoad[i] > 250) {
-                supported++;
-            }
+            if (contact[i] && springLoad[i] > 250) supported++;
         }
 
-        boolean escEnabled = supported >= 3
-                && r11 > .65 && alongCar > 5 && roadSpeed > 5;
+        boolean escEnabled =
+                supported >= 3 && r11 > .65 && alongCar > 5 && roadSpeed > 5;
 
         double yawError = 0;
         double escFactor = 0;
@@ -565,9 +546,9 @@ public final class CarVehicle extends GameObject {
                     && Math.signum(yawError) == Math.signum(steering);
 
             double track = (FRONT_TRACK + REAR_TRACK) * .5;
+
             escBraking = clamp(
-                    IYY * excess * 3.2 / (track * .5),
-                    0, .65 * MASS * G
+                    IYY * excess * 3.2 / (track * .5), 0, .65 * MASS * G
             );
         }
 
@@ -577,7 +558,14 @@ public final class CarVehicle extends GameObject {
                 : 0;
 
         double braking = serviceBrake ? MASS * BRAKE_ACCEL : 0;
-        double regen = !drive && !serviceBrake && roadSpeed > .08
+
+        if (automatic && !brake && autoAcceleration > -8) {
+            braking = clamp(-automaticForce, 0, MASS * BRAKE_ACCEL);
+        }
+
+        // Autonomous coast/braking is commanded continuously; it must not
+        // accidentally trigger full regeneration whenever throttle becomes zero.
+        double regen = !automatic && !drive && !serviceBrake && roadSpeed > .08
                 ? Math.min(MASS * REGEN_ACCEL, REGEN_POWER / Math.max(2, roadSpeed))
                 : 0;
 
@@ -588,9 +576,9 @@ public final class CarVehicle extends GameObject {
         double sampleWz = wz;
 
         for (int i = 0; i < 4; i++) {
-            double r = radius(i);
+            double radius = radius(i);
             double share = i < 2 ? FRONT_DRIVE : REAR_DRIVE;
-            double torque = direction * demand * share * .5 * r;
+            double torque = direction * demand * share * .5 * radius;
 
             if (!contact[i] || springLoad[i] < 1) {
                 omega[i] = clamp(
@@ -598,12 +586,13 @@ public final class CarVehicle extends GameObject {
                                 * Math.exp(-.7 * dt),
                         -250, 250
                 );
+
                 spin[i] = wrap(spin[i] + omega[i] * dt);
                 continue;
             }
 
             double patchX = mountX[i] - r01 * travel[i];
-            double patchY = mountY[i] - r11 * travel[i] - r;
+            double patchY = mountY[i] - r11 * travel[i] - radius;
             double patchZ = mountZ[i] - r21 * travel[i];
 
             double rx = patchX - cx;
@@ -614,13 +603,13 @@ public final class CarVehicle extends GameObject {
             double pvz = sampleVz + sampleWx * ry - sampleWy * rx;
 
             double angle = wheelSteer(i);
-            double sn = Math.sin(angle);
-            double cs = Math.cos(angle);
+            double sine = Math.sin(angle);
+            double cosine = Math.cos(angle);
 
-            double fxDir = r00 * sn + r02 * cs;
-            double fzDir = r20 * sn + r22 * cs;
-            double sxDir = r00 * cs - r02 * sn;
-            double szDir = r20 * cs - r22 * sn;
+            double fxDir = r00 * sine + r02 * cosine;
+            double fzDir = r20 * sine + r22 * cosine;
+            double sxDir = r00 * cosine - r02 * sine;
+            double szDir = r20 * cosine - r22 * sine;
 
             double along = pvx * fxDir + pvz * fzDir;
             double across = pvx * sxDir + pvz * szDir;
@@ -630,7 +619,7 @@ public final class CarVehicle extends GameObject {
             double slipAngle = Math.atan2(across, Math.max(1.5, Math.abs(along)));
             double corner = i < 2 ? FRONT_CORNER : REAR_CORNER;
 
-            double fy = -lateralLimit * Math.tanh(
+            double lateral = -lateralLimit * Math.tanh(
                     corner * slipAngle / Math.max(1, lateralLimit)
             );
 
@@ -638,11 +627,11 @@ public final class CarVehicle extends GameObject {
 
             if (serviceBrake || regen > 0) {
                 double brakeShare = i < 2 ? .64 : .36;
-                double brakeTorque = (serviceBrake ? braking : regen)
-                        * brakeShare * .5 * r;
+                double brakeTorque =
+                        (serviceBrake ? braking : regen) * brakeShare * .5 * radius;
 
                 if (Math.abs(along) > 2
-                        && sign * omega[i] * r < Math.abs(along) * .82) {
+                        && sign * omega[i] * radius < Math.abs(along) * .82) {
                     brakeTorque *= .25;
                 }
 
@@ -650,12 +639,11 @@ public final class CarVehicle extends GameObject {
             }
 
             if (drive) {
-                double driveSlip = direction * (omega[i] * r - along)
-                        / Math.max(2, Math.abs(along));
+                double driveSlip =
+                        direction * (omega[i] * radius - along)
+                                / Math.max(2, Math.abs(along));
 
-                if (driveSlip > .09) {
-                    torque *= clamp(.09 / driveSlip, .18, 1);
-                }
+                if (driveSlip > .09) torque *= clamp(.09 / driveSlip, .18, 1);
             }
 
             if (escBraking > 0 && Math.abs(along) > 2
@@ -663,23 +651,26 @@ public final class CarVehicle extends GameObject {
                 boolean frontAxle = i < 2;
                 double portion = frontAxle == escOversteer ? .80 : .20;
                 double force = Math.min(escBraking * portion, .68 * limit);
-                torque -= Math.signum(along) * force * r;
+                torque -= Math.signum(along) * force * radius;
             }
 
             double freeOmega = omega[i] + torque * dt / WHEEL_INERTIA;
 
-            double longitudinal = LONG_STIFFNESS * (freeOmega * r - along)
-                    / (1 + LONG_STIFFNESS * dt * r * r / WHEEL_INERTIA);
+            double longitudinal =
+                    LONG_STIFFNESS * (freeOmega * radius - along)
+                            / (1 + LONG_STIFFNESS * dt
+                            * radius * radius / WHEEL_INERTIA);
 
-            double lateralUsage = fy / LATERAL_GRIP_RATIO;
-            double allowable = Math.sqrt(Math.max(
-                    0, limit * limit - lateralUsage * lateralUsage
-            ));
+            double lateralUsage = lateral / LATERAL_GRIP_RATIO;
+
+            double allowable = Math.sqrt(
+                    Math.max(0, limit * limit - lateralUsage * lateralUsage)
+            );
 
             longitudinal = clamp(longitudinal, -allowable, allowable);
 
             omega[i] = clamp(
-                    freeOmega - longitudinal * r * dt / WHEEL_INERTIA,
+                    freeOmega - longitudinal * radius * dt / WHEEL_INERTIA,
                     -250, 250
             );
 
@@ -689,18 +680,16 @@ public final class CarVehicle extends GameObject {
 
             applyImpulse(
                     patchX, patchY, patchZ,
-                    (longitudinal * fxDir + fy * sxDir) * dt,
+                    (longitudinal * fxDir + lateral * sxDir) * dt,
                     0,
-                    (longitudinal * fzDir + fy * szDir) * dt
+                    (longitudinal * fzDir + lateral * szDir) * dt
             );
 
             spin[i] = wrap(spin[i] + omega[i] * dt);
         }
 
         double totalLoad = 0;
-        for (double load : springLoad) {
-            totalLoad += load;
-        }
+        for (double load : springLoad) totalLoad += load;
 
         if (roadSpeed > .01 && totalLoad > 0) {
             double resistance = ROLLING_RESISTANCE * totalLoad * dt * INV_MASS;
@@ -710,36 +699,42 @@ public final class CarVehicle extends GameObject {
         }
     }
 
-    private void resolveBodyContact(CarTerrain.Contact c, double dt) {
-        double rx = c.x - cx;
-        double ry = c.y - cy;
-        double rz = c.z - cz;
+    private void resolveBodyContact(CarTerrain.Contact contact, double dt) {
+        double rx = contact.x - cx;
+        double ry = contact.y - cy;
+        double rz = contact.z - cz;
 
         double pvx = vx + wy * rz - wz * ry;
         double pvy = vy + wz * rx - wx * rz;
         double pvz = vz + wx * ry - wy * rx;
 
-        double normalSpeed = pvx * c.nx + pvy * c.ny + pvz * c.nz;
+        double normalSpeed =
+                pvx * contact.nx + pvy * contact.ny + pvz * contact.nz;
 
         double inverse = effectiveInverseMass(
-                rx, ry, rz, c.nx, c.ny, c.nz
+                rx, ry, rz, contact.nx, contact.ny, contact.nz
         );
 
-        double bias = Math.min(3, Math.max(0, c.depth - .003) * .17 / dt);
+        double bias = Math.min(3, Math.max(0, contact.depth - .003) * .17 / dt);
         double restitution = normalSpeed < -2 ? .04 : 0;
-        double j = Math.max(0, (-(1 + restitution) * normalSpeed + bias) / inverse);
 
-        if (j > 0) {
-            applyImpulse(c.x, c.y, c.z, j * c.nx, j * c.ny, j * c.nz);
+        double impulse =
+                Math.max(0, (-(1 + restitution) * normalSpeed + bias) / inverse);
+
+        if (impulse > 0) {
+            applyImpulse(
+                    contact.x, contact.y, contact.z,
+                    impulse * contact.nx, impulse * contact.ny, impulse * contact.nz
+            );
 
             pvx = vx + wy * rz - wz * ry;
             pvy = vy + wz * rx - wx * rz;
             pvz = vz + wx * ry - wy * rx;
 
-            double vn = pvx * c.nx + pvy * c.ny + pvz * c.nz;
-            double tx = pvx - vn * c.nx;
-            double ty = pvy - vn * c.ny;
-            double tz = pvz - vn * c.nz;
+            double normal = pvx * contact.nx + pvy * contact.ny + pvz * contact.nz;
+            double tx = pvx - normal * contact.nx;
+            double ty = pvy - normal * contact.ny;
+            double tz = pvz - normal * contact.nz;
             double tangentSpeed = Math.sqrt(tx * tx + ty * ty + tz * tz);
 
             if (tangentSpeed > 1e-6) {
@@ -747,19 +742,22 @@ public final class CarVehicle extends GameObject {
                 ty /= tangentSpeed;
                 tz /= tangentSpeed;
 
-                double jt = Math.min(
-                        .55 * j,
+                double friction = Math.min(
+                        .55 * impulse,
                         tangentSpeed / effectiveInverseMass(rx, ry, rz, tx, ty, tz)
                 );
 
-                applyImpulse(c.x, c.y, c.z, -jt * tx, -jt * ty, -jt * tz);
+                applyImpulse(
+                        contact.x, contact.y, contact.z,
+                        -friction * tx, -friction * ty, -friction * tz
+                );
             }
         }
 
-        double correction = Math.max(0, c.depth - .004) * .25;
-        cx += c.nx * correction;
-        cy += c.ny * correction;
-        cz += c.nz * correction;
+        double correction = Math.max(0, contact.depth - .004) * .25;
+        cx += contact.nx * correction;
+        cy += contact.ny * correction;
+        cz += contact.nz * correction;
     }
 
     private double effectiveInverseMass(
@@ -804,39 +802,34 @@ public final class CarVehicle extends GameObject {
 
     private void integrateRotation(double dt) {
         double magnitude = Math.sqrt(wx * wx + wy * wy + wz * wz);
-
-        if (magnitude < 1e-12) {
-            return;
-        }
+        if (magnitude < 1e-12) return;
 
         double halfAngle = .5 * magnitude * dt;
-        double s = Math.sin(halfAngle) / magnitude;
+        double sine = Math.sin(halfAngle) / magnitude;
         double a = Math.cos(halfAngle);
-        double b = wx * s;
-        double c = wy * s;
-        double d = wz * s;
+        double b = wx * sine;
+        double c = wy * sine;
+        double d = wz * sine;
 
         double nw = a * qw - b * qx - c * qy - d * qz;
         double nx = a * qx + b * qw + c * qz - d * qy;
         double ny = a * qy - b * qz + c * qw + d * qx;
         double nz = a * qz + b * qy - c * qx + d * qw;
 
-        double inv = 1 / Math.sqrt(nw * nw + nx * nx + ny * ny + nz * nz);
-        qw = nw * inv;
-        qx = nx * inv;
-        qy = ny * inv;
-        qz = nz * inv;
+        double inverse = 1 / Math.sqrt(nw * nw + nx * nx + ny * ny + nz * nz);
+        qw = nw * inverse;
+        qx = nx * inverse;
+        qy = ny * inverse;
+        qz = nz * inverse;
     }
 
     private void updateMatrix() {
         r00 = 1 - 2 * (qy * qy + qz * qz);
         r01 = 2 * (qx * qy - qw * qz);
         r02 = 2 * (qx * qz + qw * qy);
-
         r10 = 2 * (qx * qy + qw * qz);
         r11 = 1 - 2 * (qx * qx + qz * qz);
         r12 = 2 * (qy * qz - qw * qx);
-
         r20 = 2 * (qx * qz - qw * qy);
         r21 = 2 * (qy * qz + qw * qx);
         r22 = 1 - 2 * (qx * qx + qy * qy);
@@ -863,35 +856,23 @@ public final class CarVehicle extends GameObject {
         transform.rotation.z = roll;
         transform.invalidate();
 
-        for (int i = 0; i < 4; i++) {
-            visualSteering[i] = wheelSteer(i);
-        }
+        for (int i = 0; i < 4; i++) visualSteering[i] = wheelSteer(i);
 
         model.animate(
-                steering,
-                visualWheelX,
-                visualWheelZ,
-                travel,
-                visualSteering,
-                spin
+                steering, visualWheelX, visualWheelZ,
+                travel, visualSteering, spin
         );
     }
 
     public double exitGroundHeight(GameEngine engine, double x, double z) {
         terrain.prepare(engine, this, 7);
         return terrain.height(
-                x, z,
-                transform.position.y - 2,
-                transform.position.y + .65
+                x, z, transform.position.y - 2, transform.position.y + .65
         );
     }
 
     private double wheelSteer(int i) {
-        if (i >= 2 || Math.abs(steering) < 1e-6) {
-            return 0;
-        }
-
-        // Inside front tyre turns more tightly than the outside tyre.
+        if (i >= 2 || Math.abs(steering) < 1e-6) return 0;
         return Math.atan(
                 WHEELBASE / (WHEELBASE / Math.tan(steering) - wheelX(i))
         );
@@ -905,10 +886,7 @@ public final class CarVehicle extends GameObject {
         double demand = Math.min(force, power / Math.max(1, velocity));
         double drag = DRAG * velocity * velocity + ROLLING_RESISTANCE * MASS * G;
 
-        return clamp(
-                demand, 0,
-                Math.max(0, drag + MASS * 1.8 * (top - velocity))
-        );
+        return clamp(demand, 0, Math.max(0, drag + MASS * 1.8 * (top - velocity)));
     }
 
     private static double[][] makeHull() {
@@ -924,11 +902,9 @@ public final class CarVehicle extends GameObject {
             for (double z : new double[]{-2.20, -1.10, 0, 1.10, 2.20}) {
                 spheres.add(new double[]{x, .57, z, .15});
             }
-
             for (double z : new double[]{-1, 0, 1}) {
                 spheres.add(new double[]{x, .85, z, .14});
             }
-
             for (double z : new double[]{-.95, .60}) {
                 spheres.add(new double[]{x * .86, 1.30, z, .13});
             }
@@ -944,8 +920,7 @@ public final class CarVehicle extends GameObject {
     }
 
     private static double wheelX(int i) {
-        return (i % 2 == 0 ? -.5 : .5)
-                * (i < 2 ? FRONT_TRACK : REAR_TRACK);
+        return (i % 2 == 0 ? -.5 : .5) * (i < 2 ? FRONT_TRACK : REAR_TRACK);
     }
 
     private static double wheelZ(int i) {
@@ -973,12 +948,12 @@ public final class CarVehicle extends GameObject {
         return SUSP_MOUNT - radius(i) + corner / springK(i);
     }
 
-    private static double clamp(double x, double min, double max) {
-        return Math.max(min, Math.min(max, x));
+    private static double clamp(double value, double minimum, double maximum) {
+        return Math.max(minimum, Math.min(maximum, value));
     }
 
-    private static double smooth(double x, double target, double rate, double dt) {
-        return x + (target - x) * (1 - Math.exp(-rate * dt));
+    private static double smooth(double value, double target, double rate, double dt) {
+        return value + (target - value) * (1 - Math.exp(-rate * dt));
     }
 
     private static double wrap(double angle) {
