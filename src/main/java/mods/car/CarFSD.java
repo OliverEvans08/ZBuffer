@@ -4,50 +4,33 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.Locale;
 
-/**
- * Camera-guided driving for the simulated car.
- *
- * The navigation polyline is a GOAL, not a wall. In particular, its first
- * segment can cross unmapped ground to reach a mapped road. A vehicle cannot
- * follow that segment perfectly while turning from an arbitrary initial pose.
- * We prefer the route but only measured hazards can force an obstacle stop.
- */
+/** Stereo-based route following with persistent, replanning obstacle detours. */
 final class CarFSD {
     private static final double WHEELBASE = 2.875;
-    private static final double MAX_STEER = 0.50;
-    private static final double FRONT_OVERHANG = 2.65;
+    private static final double MAX_STEER = .50;
     private static final double HALF_WIDTH = 1.08;
-    private static final double STEP = 1.25;
-    private static final double MIN_CLEARANCE = 1.8;
+    private static final double HALF_LENGTH = 2.65;
     private static final double BRAKE = 5.2;
     private static final double LATERAL_ACCEL = 3.1;
-    private static final double ROAD_SPEED = 60.0 / 3.6;
-    private static final double TERRAIN_SPEED = 22.0 / 3.6;
-    private static final double UNKNOWN_SPEED = 10.0 / 3.6;
-    private static final double MAX_GRADIENT = 0.90;
+    private static final double ROAD_SPEED = 60 / 3.6;
+    private static final double TERRAIN_SPEED = 34 / 3.6;
+    private static final double SURVEY_SPEED = 22 / 3.6;
+    private static final double REVERSE_SPEED = 11 / 3.6;
+    private static final double MIN_CLEARANCE = .65;
+    private static final double STEP = .8;
 
-    // Vehicle steering takes time to move, and its yaw persists afterward.
-    // Predict both before selecting a correction rather than chasing today's
-    // cross-track error. These values describe the simulated vehicle only.
-    private static final double POSITION_FILTER_SECONDS = .16;
-    private static final double YAW_FILTER_SECONDS = .14;
-    private static final double STEERING_PREVIEW_SECONDS = .28;
-    private static final double STEERING_PREVIEW_PER_SPEED = .018;
-    private static final double MAX_PREVIEW_SECONDS = .65;
-
-    // Lane following is primary. Only a measured blocked path may cause an
-    // evasive arc; limited stereo range on its own slows the car instead.
-    private static final double STEER_FINE = .045;
-    private static final double STEER_MEDIUM = .15;
-    private static final double STEER_LARGE = .30;
+    // Keep the controller stable through one delayed/low-texture stereo update.
+    // Grace is both time- and distance-limited; it never replaces obstacle checks.
+    private static final double SENSOR_MAX_AGE = 2.6;
+    private static final double SENSOR_GRACE = .45;
+    private static final double SENSOR_GRACE_TRAVEL = 1.5;
 
     static final class Controls {
-        static final Controls STOP =
-                new Controls(false, false, false, false, true);
+        static final Controls STOP = new Controls(false, false, false, false, true);
         final boolean forward, backward, left, right, brake;
 
-        Controls(boolean forward, boolean backward, boolean left,
-                 boolean right, boolean brake) {
+        Controls(boolean forward, boolean backward, boolean left, boolean right,
+                 boolean brake) {
             this.forward = forward;
             this.backward = backward;
             this.left = left;
@@ -56,7 +39,7 @@ final class CarFSD {
         }
     }
 
-    // Kept compatible with CarFsdWindow and CarMod.
+    /** Retains the interface used by CarMod and CarFsdWindow. */
     static final class Visualization {
         final float[] mapX, mapY, mapZ;
         final byte[] mapType, source;
@@ -74,8 +57,8 @@ final class CarFSD {
                       int[] pathDirections, double chosenAngle,
                       double chosenDistance, double targetSpeed, double speed,
                       int direction, double[] ages, boolean enabled,
-                      boolean steerManual, boolean motionManual,
-                      boolean paused, boolean sensorFresh, String status) {
+                      boolean steerManual, boolean motionManual, boolean paused,
+                      boolean sensorFresh, String status) {
             this.mapX = mapX;
             this.mapY = mapY;
             this.mapZ = mapZ;
@@ -103,41 +86,45 @@ final class CarFSD {
             Arrays.fill(ages, Double.POSITIVE_INFINITY);
             return new Visualization(new float[0], new float[0], new float[0],
                     new byte[0], new byte[0], new double[0], new double[0],
-                    new int[0], 0, 0, 0, 0, 1, ages, false,
-                    false, false, false, false,
+                    new int[0], 0, 0, 0, 0, 1, ages,
+                    false, false, false, false, false,
                     "OFF | B: enable FSD, M: navigation");
         }
     }
 
-    private record Candidate(double angle, double clearance,
-                             double observed, int samples, int paved,
-                             double gradient, double trackingError,
-                             boolean blocked) {}
+    private record Candidate(double angle, double clearance, double observed,
+                             int samples, int paved, double gradient,
+                             double trackingError, boolean blocked) {}
 
     private final CarSurfaceGrid grid = new CarSurfaceGrid();
     private volatile boolean enabled;
     private volatile String status = "OFF | manual driving";
     private volatile Visualization visualization = Visualization.empty();
     private CarNavigation.Guidance navigation;
-    private double commandSpeed;
-    private double filteredSteer;
-    private double previousSteer;
-    private double lastX = Double.NaN;
-    private double lastZ = Double.NaN;
-    private double lastHeading = Double.NaN;
-    private double worldVelocityX;
-    private double worldVelocityZ;
-    private double yawRate;
-    private double acceleration;
-    private double integral;
-    private double publishTime;
-    private double[] scanAngles = new double[0];
-    private double[] scanClearances = new double[0];
 
-    void navigate(CarNavigation.Guidance guidance) {
-        navigation = guidance;
-    }
+    private double filteredSteer, previousSteer;
+    private double commandSpeed, acceleration, integral;
+    private double previousX = Double.NaN, previousZ = Double.NaN;
+    private double previousHeading = Double.NaN;
+    private double vx, vz, yawRate, grade, lastPublish;
+    private int direction = 1, requestedDirection = 1;
+    private double shiftTime, blockedTime, stalledTime, facingAwayTime;
+    private double searchTime, maneuverTime, legStopTime, cooldown;
+    private double lastAttemptX = Double.NaN, lastAttemptZ = Double.NaN;
+    private int attempts;
+    private boolean planningRequired;
+    private CarManeuverPlanner.Search search;
+    private CarManeuverPlanner.Plan maneuver;
+    private double[] scanAngles = new double[0], scanClearances = new double[0];
 
+    private double sensorClock, lastFrontGoodTime = Double.NEGATIVE_INFINITY;
+    private double lastFrontGoodX = Double.NaN, lastFrontGoodZ = Double.NaN;
+    private long lastFrontCapture;
+    private double frontFrameInterval = .55;
+    private long lastObstacleCapture;
+    private int obstacleFrames;
+
+    void navigate(CarNavigation.Guidance guidance) { navigation = guidance; }
     boolean isEnabled() { return enabled; }
     String getStatus() { return status; }
     Visualization getVisualization() { return visualization; }
@@ -146,411 +133,761 @@ final class CarFSD {
     void setEnabled(boolean active) {
         enabled = active;
         grid.clear();
-        commandSpeed = 0;
-        filteredSteer = 0;
-        previousSteer = 0;
-        lastX = Double.NaN;
-        lastZ = Double.NaN;
-        lastHeading = Double.NaN;
-        worldVelocityX = 0;
-        worldVelocityZ = 0;
-        yawRate = 0;
-        acceleration = 0;
-        integral = 0;
-        publishTime = 0;
-        scanAngles = new double[0];
-        scanClearances = new double[0];
-        status = active ? "ON | acquiring stereo evidence"
-                : "OFF | manual driving";
+        filteredSteer = previousSteer = commandSpeed = acceleration = integral = 0;
+        previousX = previousZ = previousHeading = Double.NaN;
+        vx = vz = yawRate = grade = lastPublish = 0;
+        direction = requestedDirection = 1;
+        shiftTime = blockedTime = stalledTime = facingAwayTime = 0;
+        searchTime = maneuverTime = legStopTime = cooldown = 0;
+        lastAttemptX = lastAttemptZ = Double.NaN;
+        attempts = 0;
+        cancelManeuver();
+        scanAngles = scanClearances = new double[0];
+
+        sensorClock = 0;
+        lastFrontGoodTime = Double.NEGATIVE_INFINITY;
+        lastFrontGoodX = lastFrontGoodZ = Double.NaN;
+        lastFrontCapture = 0;
+        frontFrameInterval = .55;
+        lastObstacleCapture = 0;
+        obstacleFrames = 0;
+
+        status = active ? "ON | acquiring stereo evidence" : "OFF | manual driving";
         visualization = Visualization.empty();
     }
 
-    Controls update(double dt, CarVehicle car,
-                    CarPerception.Snapshot snapshot,
+    Controls update(double dt, CarVehicle car, CarPerception.Snapshot snapshot,
                     boolean left, boolean right, int intent,
                     boolean manualMotion, boolean focused) {
-        double step = clamp(dt, 0, .1);
+        double step = Double.isFinite(dt) ? clamp(dt, 0, .10) : 0;
+        sensorClock += step;
         grid.integrate(snapshot);
 
-        // Observe actual chassis motion, not just the current wheel angle.
-        // Smoothing rejects small fixed-step/physics fluctuations while
-        // preserving sideways movement that can cause an overshoot.
         double x = car.transform.position.x;
         double z = car.transform.position.z;
         double heading = car.getHeading();
-        if (step > 1e-5 && Double.isFinite(lastX)
-                && Double.isFinite(lastZ) && Double.isFinite(lastHeading)) {
-            double vx = clamp((x - lastX) / step, -80, 80);
-            double vz = clamp((z - lastZ) / step, -80, 80);
-            double turn = Math.atan2(Math.sin(heading - lastHeading),
-                    Math.cos(heading - lastHeading));
-            double measuredYaw = clamp(turn / step, -2, 2);
-            double vBlend = 1 - Math.exp(-step / POSITION_FILTER_SECONDS);
-            double yawBlend = 1 - Math.exp(-step / YAW_FILTER_SECONDS);
-            worldVelocityX += (vx - worldVelocityX) * vBlend;
-            worldVelocityZ += (vz - worldVelocityZ) * vBlend;
-            yawRate += (measuredYaw - yawRate) * yawBlend;
-        } else {
-            worldVelocityX = 0;
-            worldVelocityZ = 0;
-            yawRate = 0;
-        }
-        lastX = x;
-        lastZ = z;
-        lastHeading = heading;
+        double speed = Math.abs(car.getSpeed());
+        updateMotion(car, x, z, heading, step);
 
         double[] ages = new double[4];
         Arrays.fill(ages, Double.POSITIVE_INFINITY);
-        if (snapshot != null) {
-            System.arraycopy(snapshot.cameraAges, 0, ages, 0,
-                    Math.min(4, snapshot.cameraAges.length));
+        if (snapshot != null) System.arraycopy(snapshot.cameraAges, 0, ages, 0,
+                Math.min(ages.length, snapshot.cameraAges.length));
+
+        boolean frontFresh = usable(snapshot, ages, 0);
+        boolean rearFresh = usable(snapshot, ages, 3);
+
+        if (frontFresh) {
+            // Use the actual frame identity, not the snapshot publication rate.
+            // A slower camera cycle must result in a slower safe driving speed.
+            long capture = snapshot.cameraCaptureTimes[0];
+            if (capture > lastFrontCapture) {
+                if (lastFrontCapture != 0) {
+                    double interval = (capture - lastFrontCapture) * 1e-9;
+                    if (interval > 0 && interval < 8) {
+                        frontFrameInterval += .25 *
+                                (clamp(interval, .2, 4) - frontFrameInterval);
+                    }
+                }
+                lastFrontCapture = capture;
+            }
+            lastFrontGoodTime = sensorClock;
+            lastFrontGoodX = x;
+            lastFrontGoodZ = z;
         }
+
+        boolean frontGrace = enabled && !frontFresh
+                && sensorClock - lastFrontGoodTime <= SENSOR_GRACE
+                && Math.hypot(x - lastFrontGoodX,
+                z - lastFrontGoodZ) <= SENSOR_GRACE_TRAVEL;
+
+        boolean frontUsable = frontFresh || frontGrace;
         boolean manualSteer = left || right;
-        boolean frontFresh = snapshot != null && snapshot.ready
-                && ages[0] < 1.9 && snapshot.measuredCoverage[0] > .001;
+
         boolean ready = enabled && focused && navigation != null
                 && navigation.ready() && !navigation.arrived()
                 && !navigation.route().isEmpty();
 
-        double speed = Math.max(0, car.getSpeed());
-        double wanted = 0;
-        double clearance = 0;
-        double observed = 0;
-        double delay = .2;
-        boolean approaching = false;
-        boolean blocked = false;
-        Candidate best = null;
-        double targetSteer = car.getSteering();
-        boolean roadRoute = ready && navigation.status()
-                .contains("Following mapped roads");
+        List<CarNavigation.Point> route = ready ? navigation.route() : List.of();
+        boolean roadRoute = ready && navigation.status().contains("Following mapped roads");
+        cooldown = Math.max(0, cooldown - step);
 
-        if (ready && frontFresh) {
-            List<CarNavigation.Point> route = navigation.route();
-
-            // The steering rack and the vehicle's yaw have latency. Aim
-            // using a short predicted pose. In particular, if the car is
-            // already moving toward the centre it begins unwinding BEFORE
-            // actually reaching the centreline, avoiding a left-right hunt.
-            double preview = clamp(STEERING_PREVIEW_SECONDS
-                            + STEERING_PREVIEW_PER_SPEED * speed,
-                    STEERING_PREVIEW_SECONDS, MAX_PREVIEW_SECONDS);
-            double futureX = x + worldVelocityX * preview;
-            double futureZ = z + worldVelocityZ * preview;
-            double futureHeading = heading + yawRate * preview;
-            double limit = steeringLimit(speed);
-            double geometricSteer = steer(route, futureX, futureZ,
-                    futureHeading, speed);
-            double desired = manualSteer ? car.getSteering()
-                    : clamp(geometricSteer, -limit, limit);
-
-            // Near-centre steering choices must be CONTINUOUS, not one of
-            // seven fixed, large left/right angles. Cap even avoidance arcs
-            // by lateral acceleration at the current road speed.
-            double fine = Math.min(STEER_FINE, limit);
-            double medium = Math.min(STEER_MEDIUM, limit);
-            double large = Math.min(STEER_LARGE, limit);
-            double[] angles = manualSteer
-                    ? new double[]{desired}
-                    : new double[]{desired,
-                    clamp(desired - fine, -limit, limit),
-                    clamp(desired + fine, -limit, limit),
-                    clamp(desired - medium, -limit, limit),
-                    clamp(desired + medium, -limit, limit),
-                    clamp(desired - large, -limit, limit),
-                    clamp(desired + large, -limit, limit),
-                    0.0, -limit, limit};
-            scanAngles = angles.clone();
-            scanClearances = new double[angles.length];
-            double bestScore = Double.NEGATIVE_INFINITY;
-            Candidate preferred = null;
-            double scanRange = clamp(18 + speed * 1.8, 20, 45);
-
-            for (int i = 0; i < angles.length; i++) {
-                Candidate choice = sweep(car, route, speed,
-                        angles[i], scanRange);
-
-                // A measured hazard, not distance from a cartographic line,
-                // determines whether a trajectory is unsafe.
-                double effective = choice.clearance();
-                if (Double.isFinite(snapshot.frontClearance)) {
-                    if (snapshot.frontClearance < 2.5
-                            || (Math.abs(angles[i]) < .18
-                            && Math.abs(car.getSteering()) < .22)) {
-                        effective = Math.min(effective,
-                                Math.max(0, snapshot.frontClearance));
-                    }
-                }
-                choice = new Candidate(choice.angle(), effective,
-                        choice.observed(), choice.samples(), choice.paved(),
-                        choice.gradient(), choice.trackingError(),
-                        choice.blocked());
-                scanClearances[i] = effective;
-                if (i == 0) preferred = choice;
-
-                // Strongly prefer an arc with usable near-term stopping room.
-                // Once both arcs are safe, prefer navigation progress and
-                // moderate steering. Off-road access is deliberately soft.
-                double safetyNeed = Math.max(5,
-                        speed * speed / (2 * BRAKE) + speed * .35 + 2);
-                double score = .30 * Math.min(effective, safetyNeed + 2)
-                        - 5.0 * Math.max(0, safetyNeed - effective)
-                        - (roadRoute ? .75 : .50) * choice.trackingError()
-                        - (8.0 + .5 * speed) * Math.abs(angles[i] - desired)
-                        - (2.5 + .2 * speed)
-                        * Math.abs(angles[i] - car.getSteering())
-                        - 2.0 * choice.gradient();
-                if (choice.blocked()) score -= 40;
-                if (effective < MIN_CLEARANCE) score -= 100;
-                if (score > bestScore) {
-                    bestScore = score;
-                    best = choice;
-                }
-            }
-
-            // Most importantly: "not yet observed" IS NOT an obstacle.
-            // The old search could change sides every frame merely because
-            // stereo coverage was a couple of metres longer elsewhere.
-            // Keep the centred/predicted command unless that actual arc has
-            // a measured obstacle. Insufficient visibility limits SPEED,
-            // never the direction of steering.
-            if (!manualSteer && preferred != null && !preferred.blocked()) {
-                best = preferred;
-            }
-
-            if (best != null) {
-                targetSteer = best.angle();
-                clearance = best.clearance();
-                observed = best.observed();
-                blocked = best.blocked();
-
-                // Road speed requires evidence of actual paved/drivable
-                // ground. Merely having roads in the navigation itinerary
-                // does not mean the car has reached one yet.
-                approaching = !roadRoute || best.samples() < 5
-                        || best.paved() < Math.max(3, best.samples() * .55)
-                        || distanceToRoute(route, x, z) > 3.5;
-                double surfaceSpeed = approaching ? TERRAIN_SPEED : ROAD_SPEED;
-                if (best.samples() < 3 || observed < 8)
-                    surfaceSpeed = Math.min(surfaceSpeed, UNKNOWN_SPEED);
-                if (best.gradient() > .15)
-                    surfaceSpeed = Math.min(surfaceSpeed,
-                            Math.max(2.5, ROAD_SPEED
-                                    / (1 + 3 * best.gradient())));
-
-                // Slow for the actual route bend, not the speed-limited
-                // wheel command. Otherwise a sharp bend at road speed could
-                // appear artificially gentle and lose corner-speed control.
-                double curvature = Math.abs(Math.tan(geometricSteer) / WHEELBASE);
-                double cornerSpeed = Math.sqrt(LATERAL_ACCEL
-                        / Math.max(.0001, curvature));
-                delay = clamp(.16 + .2 * ages[0], .16, .55);
-                double available = Math.max(0, clearance - 1.2);
-                double safeSpeed = Math.sqrt(BRAKE * BRAKE * delay * delay
-                        + 2 * BRAKE * available) - BRAKE * delay;
-                wanted = Math.min(surfaceSpeed, Math.min(cornerSpeed, safeSpeed));
-                wanted = Math.min(wanted, Math.sqrt(7.0 * Math.max(0,
-                        navigation.remaining() - 2)));
-                if (clearance < MIN_CLEARANCE || car.getSpeed() < -.3)
-                    wanted = 0;
-            }
-        } else {
-            scanAngles = new double[0];
-            scanClearances = new double[0];
+        if (!ready || manualSteer || manualMotion) {
+            cancelManeuver();
+            blockedTime = stalledTime = facingAwayTime = 0;
+            obstacleFrames = 0;
+            if (manualMotion && intent != 0) direction = intent < 0 ? -1 : 1;
         }
 
-        if (manualSteer || !ready || !frontFresh) {
-            filteredSteer = car.getSteering();
-            previousSteer = car.getSteering();
+        if (Double.isFinite(lastAttemptX)
+                && Math.hypot(x - lastAttemptX, z - lastAttemptZ) > 7) {
+            attempts = 0;
+            lastAttemptX = lastAttemptZ = Double.NaN;
+        }
+
+        requestedDirection = maneuver == null ? 1 : maneuver.current().direction;
+        boolean sensorFresh = requestedDirection < 0 ? rearFresh : frontUsable;
+
+        double preview = clamp(.10 + speed * .010, .10, .23);
+        double desired = ready ? steer(route, x + vx * preview,
+                z + vz * preview, heading + yawRate * preview, speed)
+                : car.getSteering();
+
+        double limit = steeringLimit(speed);
+        desired = clamp(desired, -limit, limit);
+
+        Candidate best = null, preferred = null;
+        double clearance = 0, observed = 0, wanted = 0;
+        double reaction = .20;
+        boolean approaching = !roadRoute;
+        boolean hold = false, obstacleAhead = false;
+        scanAngles = scanClearances = new double[0];
+
+        if (ready && maneuver == null && frontUsable) {
+            double[] angles = {desired, clamp(desired - .12, -limit, limit),
+                    clamp(desired + .12, -limit, limit),
+                    clamp(desired - .26, -limit, limit),
+                    clamp(desired + .26, -limit, limit),
+                    clamp(previousSteer, -limit, limit), 0};
+
+            scanAngles = angles;
+            scanClearances = new double[angles.length];
+            double horizon = clamp(24 + speed * 1.6, 24, 46);
+            double stopping = speed * speed / (2 * BRAKE)
+                    + speed * (.22 + .06 * Math.min(2, ages[0])) + 1.5;
+            double bestScore = -Double.MAX_VALUE;
+
+            for (int i = 0; i < angles.length; i++) {
+                Candidate candidate = sweep(x, z, heading, car.getSteering(),
+                        route, speed, angles[i], horizon);
+                scanClearances[i] = candidate.clearance();
+                if (i == 0) preferred = candidate;
+
+                double score = Math.min(candidate.clearance(), stopping + 13)
+                        - 6 * Math.max(0, stopping - candidate.clearance())
+                        - (roadRoute ? 2.1 : 1.3) * candidate.trackingError()
+                        - (7 + .2 * speed) * Math.abs(candidate.angle() - desired)
+                        - 2.8 * Math.abs(candidate.angle() - previousSteer)
+                        - 1.2 * candidate.gradient()
+                        - (candidate.blocked() ? 6 : 0);
+
+                if (candidate.clearance() < MIN_CLEARANCE) score -= 100;
+                if (score > bestScore) {
+                    bestScore = score;
+                    best = candidate;
+                }
+            }
+
+            // Keep the mapped line when it really is clear, but don't override
+            // a longer detour with a short trajectory that hits an obstacle.
+            if (preferred != null && best != null
+                    && (!preferred.blocked() && preferred.clearance() > stopping + 3
+                    || (best.clearance() < preferred.clearance() + 2
+                    && best.blocked() == preferred.blocked()))) best = preferred;
+
+            if (best != null) {
+                desired = best.angle();
+                clearance = best.clearance();
+                observed = best.observed();
+                approaching = !roadRoute || best.samples() < 6
+                        || best.paved() < best.samples() * .55
+                        || distanceToRoute(route, x, z) > 3.5;
+
+                double maximum = approaching ? TERRAIN_SPEED : ROAD_SPEED;
+
+                // Do not accelerate faster than the rate at which the cameras
+                // can inspect new ground. A delayed frame is not an all-clear.
+                maximum = Math.min(maximum, clamp(13.0 /
+                        Math.max(.65, frontFrameInterval), 3.8, ROAD_SPEED));
+
+                if (frontGrace) maximum = Math.min(maximum, 2.2);
+
+                if (observed < 4 || best.samples() < 3) {
+                    maximum = Math.min(maximum, SURVEY_SPEED);
+                } else if (observed < 14) {
+                    maximum = Math.min(maximum, SURVEY_SPEED
+                            + (TERRAIN_SPEED - SURVEY_SPEED)
+                            * clamp((observed - 4) / 10, 0, 1));
+                }
+
+                if (best.gradient() > .24) maximum = Math.min(maximum,
+                        ROAD_SPEED / (1 + 1.15 * best.gradient()));
+
+                double curvature = Math.max(Math.abs(Math.tan(desired)),
+                        Math.abs(Math.tan(car.getSteering()))) / WHEELBASE;
+                double corner = Math.sqrt(LATERAL_ACCEL / Math.max(.0001, curvature));
+
+                reaction = clamp(Math.max(.16 + .06 * ages[0],
+                        frontFrameInterval * .24), .16, .65);
+
+                wanted = Math.min(Math.min(maximum, corner),
+                        stopSpeed(clearance - 1.10, reaction));
+                wanted = Math.min(wanted, bendSpeed(route, x, z));
+                wanted = Math.min(wanted,
+                        Math.sqrt(6 * Math.max(0, navigation.remaining() - 2)));
+
+                if (clearance < MIN_CLEARANCE || car.getSpeed() < -.35) wanted = 0;
+
+                // The old code would only plan once ALL short steering arcs
+                // were blocked within 4 m. Such arcs cannot go around a wide
+                // obstacle: they must first steer away from the road.
+                obstacleAhead = preferred != null && preferred.blocked()
+                        && preferred.clearance() < Math.max(12, stopping + 3)
+                        && (best.blocked() || best.clearance() < stopping + 6
+                        || best.clearance() < preferred.clearance() + 3);
+            }
+        }
+
+        if (ready && !manualSteer && !manualMotion) {
+            if (maneuver == null && !planningRequired) {
+                // Time alone is not confirmation: dozens of control ticks
+                // can all be looking at precisely the same stereo image.
+                blockedTime = obstacleAhead ? blockedTime + step : 0;
+                if (!obstacleAhead) obstacleFrames = 0;
+                if (obstacleAhead && frontFresh &&
+                        snapshot.cameraCaptureTimes[0] > lastObstacleCapture) {
+                    lastObstacleCapture = snapshot.cameraCaptureTimes[0];
+                    obstacleFrames = Math.min(10, obstacleFrames + 1);
+                }
+
+                // Being stationary does not prove an obstruction. Keep it
+                // diagnostic, rather than inventing a route around a wall.
+                stalledTime = frontFresh && wanted > 1.3 && commandSpeed > 1.3
+                        && speed < .27 ? stalledTime + step
+                        : Math.max(0, stalledTime - step);
+
+                CarNavigation.Point forward = aim(route, x, z, 10);
+                double bearing = Math.atan2(forward.x() - x, forward.z() - z);
+                boolean facingAway = navigation.remaining() > 12 && speed < .3
+                        && distanceToRoute(route, x, z) < 5
+                        && Math.abs(wrap(bearing - heading)) > 3.0;
+                facingAwayTime = facingAway ? facingAwayTime + step : 0;
+
+                if (frontFresh && cooldown <= 0 && Math.abs(grade) < .24
+                        && ((blockedTime > .90 && obstacleFrames >= 2)
+                        || (stalledTime > 4.0 && obstacleFrames >= 2)
+                        || facingAwayTime > 6.0)) {
+                    planningRequired = true;
+                    search = null;
+                    searchTime = 0;
+                }
+            }
+
+            // If a supposed obstacle disappears before the search finishes,
+            // resume the original route instead of completing a phantom detour.
+            if (planningRequired && maneuver == null &&
+                    !obstacleAhead && facingAwayTime <= 6.0) {
+                cancelManeuver();
+                blockedTime = 0;
+                obstacleFrames = 0;
+                cooldown = .5;
+            }
+
+            if (planningRequired && maneuver == null) {
+                hold = true;
+                wanted = 0;
+
+                if (speed < .40 && frontFresh) {
+                    if (search == null) {
+                        // Retry with several rejoining distances and lateral
+                        // goal offsets. There is no permanent attempt limit.
+                        double distance = switch (attempts % 4) {
+                            case 0 -> 17;
+                            case 1 -> 22;
+                            case 2 -> 13;
+                            default -> 25;
+                        };
+
+                        CarNavigation.Point a = aim(route, x, z, distance);
+                        CarNavigation.Point b = aim(route, x, z, distance + 4);
+                        double goalHeading = Math.atan2(b.x() - a.x(),
+                                b.z() - a.z());
+
+                        double offset = switch (attempts % 6) {
+                            case 2 -> 3.5;
+                            case 3 -> -3.5;
+                            case 4 -> 5;
+                            case 5 -> -5;
+                            default -> 0;
+                        };
+
+                        double goalX = a.x() + offset * Math.cos(goalHeading);
+                        double goalZ = a.z() - offset * Math.sin(goalHeading);
+                        lastAttemptX = x;
+                        lastAttemptZ = z;
+
+                        search = new CarManeuverPlanner.Search(
+                                new CarManeuverPlanner.Pose(x, z, heading),
+                                new CarManeuverPlanner.Pose(goalX, goalZ, goalHeading),
+                                1, false, rearFresh, this::maneuverSafe);
+                    }
+
+                    searchTime += step;
+                    search.step();
+
+                    if (search.done || searchTime > 5) {
+                        CarManeuverPlanner.Plan found = search.done ? search.result : null;
+                        search = null;
+                        searchTime = 0;
+                        planningRequired = false;
+
+                        if (found != null && (obstacleAhead || facingAwayTime > 6.0)
+                                && (found.complete || usefulPartial(found))) {
+                            maneuver = found;
+                            maneuverTime = legStopTime = stalledTime = blockedTime = 0;
+                            requestedDirection = maneuver.current().direction;
+                        } else {
+                            attempts++;
+                            cooldown = Math.min(5, 1.4 + .45 * attempts);
+                        }
+                    }
+                }
+            }
+
+            if (maneuver != null) {
+                maneuverTime += step;
+                CarManeuverPlanner.Leg leg = maneuver.current();
+                CarManeuverPlanner.Command command = leg.follow(x, z, heading);
+                requestedDirection = leg.direction;
+                sensorFresh = requestedDirection < 0 ? rearFresh : frontUsable;
+
+                desired = clamp(command.steer(), -steeringLimit(speed),
+                        steeringLimit(speed));
+
+                Candidate checked = sweepManeuver(x, z, leg);
+                best = checked;
+                clearance = checked.clearance();
+                observed = checked.observed();
+
+                double maximum = requestedDirection < 0 ? REVERSE_SPEED : 4.0;
+                if (requestedDirection > 0 && frontGrace)
+                    maximum = Math.min(maximum, 2.2);
+
+                double cap = Math.min(maximum,
+                        Math.sqrt(5 * Math.max(0, command.remaining() - .10)));
+                wanted = Math.min(cap, stopSpeed(clearance - .9, .2));
+
+                if (clearance < MIN_CLEARANCE) wanted = 0;
+                if (!sensorFresh) wanted = 0;
+
+                boolean atEnd = command.remaining() <= .35;
+                if (atEnd) {
+                    wanted = 0;
+                    hold = true;
+                }
+
+                legStopTime = atEnd && speed < .28 ? legStopTime + step : 0;
+                stalledTime = !atEnd && wanted > .9 && speed < .24
+                        ? stalledTime + step : Math.max(0, stalledTime - step);
+
+                if (legStopTime > .22) {
+                    legStopTime = maneuverTime = stalledTime = 0;
+
+                    // Preserve the completion state before clearing maneuver.
+                    // Otherwise reading maneuver.complete after setting it to
+                    // null causes a NullPointerException at the final leg.
+                    boolean completedPlan = maneuver.complete;
+
+                    if (!maneuver.advance()) {
+                        maneuver = null;
+                        requestedDirection = 1;
+                        cooldown = 1.0;
+                        blockedTime = facingAwayTime = 0;
+                        attempts = completedPlan ? 0 : attempts + 1;
+                    } else {
+                        requestedDirection = maneuver.current().direction;
+                    }
+
+                    hold = true;
+                } else if (command.error() > 2.8 && maneuverTime > 2
+                        || maneuverTime > 35 || stalledTime > 4
+                        || checked.blocked() && clearance < .95 && maneuverTime > 1.2) {
+                    // An invalidated detour triggers another search instead
+                    // of consuming a fixed number of recoveries forever.
+                    cancelManeuver();
+                    attempts++;
+                    cooldown = 1.0;
+                    requestedDirection = 1;
+                    hold = true;
+                    blockedTime = .6;
+                }
+            }
+        }
+
+        if (hold) wanted = 0;
+
+        boolean shifting = requestedDirection != direction;
+        if (shifting) {
+            wanted = 0;
+            shiftTime = speed < .18 ? shiftTime + step : 0;
+
+            if (shiftTime > .25) {
+                direction = requestedDirection;
+                shiftTime = 0;
+                commandSpeed = acceleration = integral = 0;
+            }
         } else {
-            // Minimize the controller's extra lag. CarVehicle already has a
-            // real steering-rack response; two slow filters in series made
-            // the car continue turning long after correction was sufficient.
-            boolean unwinding = Math.abs(targetSteer) < Math.abs(filteredSteer)
-                    || targetSteer * filteredSteer < 0;
-            double response = unwinding ? .045 : .075;
-            double blend = 1 - Math.exp(-step / response);
-            filteredSteer += (targetSteer - filteredSteer) * blend;
-            double rate = speed > 12 ? .85 : speed > 5 ? 1.05 : 1.4;
-            double stepLimit = rate * step;
+            shiftTime = 0;
+        }
+
+        if (!ready || manualSteer || !sensorFresh) {
+            filteredSteer = previousSteer = car.getSteering();
+        } else {
+            if (maneuver == null && Math.abs(desired) < .012) desired = 0;
+            double smoothing = maneuver == null ? .20 : .13;
+            filteredSteer += (desired - filteredSteer)
+                    * (1 - Math.exp(-step / smoothing));
+
+            double rate = maneuver != null ? 1.2 : speed > 9 ? .50 : .85;
             previousSteer += clamp(filteredSteer - previousSteer,
-                    -stepLimit, stepLimit);
+                    -rate * step, rate * step);
             previousSteer = clamp(previousSteer, -steeringLimit(speed),
                     steeringLimit(speed));
         }
 
-        commandSpeed += clamp(wanted - commandSpeed,
-                -8 * step, 5 * step);
-        commandSpeed = clamp(commandSpeed, 0, wanted + .5);
-        boolean emergency = !ready || !frontFresh || best == null
-                || clearance < MIN_CLEARANCE || car.getSpeed() < -.3;
+        if (wanted < commandSpeed) commandSpeed = Math.max(wanted,
+                commandSpeed - 5.2 * step);
+        else commandSpeed = Math.min(wanted, commandSpeed + 3.2 * step);
+
+        boolean emergency = !ready || !sensorFresh || best == null || shifting
+                || hold || clearance < MIN_CLEARANCE
+                || car.getSpeed() * direction < -.35;
 
         if (emergency) {
             commandSpeed = 0;
-            acceleration = -9;
+            acceleration = -8;
             integral = 0;
         } else {
             double error = commandSpeed - speed;
             integral = clamp(integral + error * step, -1.5, 1.5);
-            double demand = clamp(2.0 * error + .3 * integral, -7, 5);
-            acceleration += clamp(demand - acceleration,
-                    -16 * step, 12 * step);
-            double stoppingDistance = speed * speed / (2 * 5.7)
-                    + speed * delay + 1.2;
-            if (stoppingDistance > clearance) acceleration = -8;
+            double demand = clamp(2 * error + .45 * integral, -5.5, 4.8);
+            acceleration += clamp(demand - acceleration, -13 * step, 11 * step);
+            double stopDistance = speed * speed / (2 * BRAKE)
+                    + speed * reaction + .7;
+
+            if (best.blocked() && stopDistance > clearance && speed > .5)
+                acceleration = -8;
         }
 
-        car.commandAutonomy(manualSteer ? Double.NaN : previousSteer,
-                manualMotion ? Double.NaN : acceleration);
+        car.commandAutonomy(!enabled || !ready || manualSteer ? Double.NaN
+                        : previousSteer,
+                !enabled || manualMotion ? Double.NaN : acceleration,
+                direction);
 
-        if (!enabled) {
-            status = "OFF | manual driving";
-        } else if (!focused) {
-            status = "PAUSED | game focus lost";
-        } else if (navigation == null || !navigation.ready()
-                || navigation.arrived()) {
-            status = navigation == null ? "M: select destination"
-                    : navigation.status();
-        } else if (!frontFresh) {
-            status = "STOP | waiting for usable front stereo evidence";
-        } else if (clearance < MIN_CLEARANCE) {
-            status = "STOP | no safe forward arc (measured/nearby hazard)";
-        } else {
-            String mode = approaching
-                    ? (roadRoute ? "JOINING ROAD" : "TERRAIN ACCESS")
-                    : "FOLLOWING ROAD";
-            status = String.format(Locale.ROOT,
-                    "%s | %.0f km/h target | %.0f m clear "
-                            + "(%.0f m observed) | %s",
-                    mode, commandSpeed * 3.6, clearance,
-                    observed, navigation.status());
-        }
+        if (!enabled) status = "OFF | manual driving";
+        else if (!focused) status = "PAUSED | game focus lost";
+        else if (!ready) status = navigation == null
+                ? "M: select destination" : navigation.status();
+        else if (manualSteer || manualMotion) status = "MANUAL OVERRIDE";
+        else if (shifting) status = "BRAKING | selecting "
+                + (requestedDirection < 0 ? "REVERSE" : "FORWARD");
+        else if (planningRequired) status = "PLANNING | route around obstacle";
+        else if (!sensorFresh) status = "STOP | waiting for fresh "
+                + (requestedDirection < 0 ? "rear" : "front") + " stereo";
+        else if (frontGrace && requestedDirection > 0)
+            status = "CAUTION | updating front stereo | reduced speed";
+        else if (maneuver != null) status = String.format(Locale.ROOT,
+                "DETOUR %d/%d | %.1f m free | %.0f km/h",
+                maneuver.index + 1, maneuver.legs.size(), clearance,
+                commandSpeed * 3.6);
+        else if (cooldown > 0 && blockedTime > .2)
+            status = "REPLANNING | checking alternate detour";
+        else if (clearance < MIN_CLEARANCE) status = "STOP | observed hazard";
+        else status = String.format(Locale.ROOT,
+                    "%s | %.0f km/h target | %.1f m free, %.1f m observed | %s",
+                    observed < 4 ? "SURVEYING"
+                            : approaching ? "TERRAIN/ROAD ACCESS" : "FOLLOWING ROAD",
+                    commandSpeed * 3.6, clearance, observed, navigation.status());
+
         publish(car, ages, manualSteer, manualMotion, !focused,
-                ready && frontFresh && !emergency, clearance);
-        return new Controls(false, false, false, false, emergency);
+                ready && (requestedDirection < 0 ? rearFresh : frontFresh)
+                        && !emergency, clearance);
+
+        return new Controls(false, false, false, false,
+                enabled && emergency && !manualMotion);
     }
 
-    /**
-     * A forward bicycle-model rollout using only the stereo surface grid.
-     * Unknown terrain SHORTENS the horizon; measured unsafe terrain STOPS it.
-     * The road polyline is never a hard boundary while approaching it.
-     */
-    private Candidate sweep(CarVehicle car, List<CarNavigation.Point> route,
-                            double speed, double firstSteer, double horizon) {
-        double x = car.transform.position.x;
-        double z = car.transform.position.z;
-        double heading = car.getHeading();
-        double rack = car.getSteering();
-        double steeringBound = steeringLimit(speed);
-        double observed = 0;
-        double obstruction = horizon;
-        double highestGradient = 0;
-        double trackingSum = 0;
-        int tracked = 0;
-        int samples = 0;
-        int paved = 0;
+    private static boolean usable(CarPerception.Snapshot s, double[] ages, int view) {
+        return s != null && s.ready && ages[view] < SENSOR_MAX_AGE
+                && s.measuredCoverage[view] > .0008;
+    }
+
+    private void updateMotion(CarVehicle car, double x, double z,
+                              double heading, double dt) {
+        if (dt > 1e-5 && Double.isFinite(previousX)
+                && Double.isFinite(previousHeading)) {
+            double blend = 1 - Math.exp(-dt / .16);
+            vx += (clamp((x - previousX) / dt, -60, 60) - vx) * blend;
+            vz += (clamp((z - previousZ) / dt, -60, 60) - vz) * blend;
+            yawRate += (clamp(wrap(heading - previousHeading) / dt, -2, 2)
+                    - yawRate) * (1 - Math.exp(-dt / .15));
+        } else vx = vz = yawRate = 0;
+
+        previousX = x;
+        previousZ = z;
+        previousHeading = heading;
+
+        double dx = car.worldX(0, 0, 1) - car.worldX(0, 0, 0);
+        double dy = car.worldY(0, 0, 1) - car.worldY(0, 0, 0);
+        double dz = car.worldZ(0, 0, 1) - car.worldZ(0, 0, 0);
+        double current = dy / Math.max(.1, Math.hypot(dx, dz));
+
+        if (Double.isFinite(current)) grade += (clamp(current, -2, 2) - grade)
+                * (1 - Math.exp(-dt / .4));
+    }
+
+    private void cancelManeuver() {
+        search = null;
+        maneuver = null;
+        planningRequired = false;
+        searchTime = maneuverTime = legStopTime = 0;
+    }
+
+    private static boolean usefulPartial(CarManeuverPlanner.Plan plan) {
+        if (plan.legs.isEmpty()) return false;
+        double distance = 0;
+
+        for (CarManeuverPlanner.Leg leg : plan.legs) {
+            for (int i = 1; i < leg.points.size(); i++) {
+                CarManeuverPlanner.Sample a = leg.points.get(i - 1);
+                CarManeuverPlanner.Sample b = leg.points.get(i);
+                distance += Math.hypot(a.x() - b.x(), a.z() - b.z());
+            }
+        }
+
+        return distance >= 3.5;
+    }
+
+    private Candidate sweep(double x, double z, double heading, double rack,
+                            List<CarNavigation.Point> route, double speed,
+                            double first, double horizon) {
+        double originX = x, originZ = z;
+        double clearance = horizon, observed = 0, gradient = 0, track = 0;
+        double lastHeight = Double.NaN, lastX = 0, lastZ = 0;
+        int samples = 0, paved = 0, tracked = 0;
         boolean blocked = false;
-        double lastX = Double.NaN, lastZ = Double.NaN;
-        double lastHeight = Double.NaN;
-        double unknownFrom = Double.NaN;
 
-        for (double d = STEP; d <= horizon + .001; d += STEP) {
-            // Hold candidate steering long enough to take a distinct path,
-            // then smoothly resume pure-pursuit along the chosen itinerary.
-            double follow = clamp(steer(route, x, z, heading, speed),
-                    -steeringBound, steeringBound);
-            double join = clamp((d - 7.0) / 9.0, 0, 1);
-            double requested = firstSteer * (1 - join) + follow * join;
-            double seconds = STEP / Math.max(3, speed);
-            rack += clamp((requested - rack) * (1 - Math.exp(-9 * seconds)),
-                    -1.30 * seconds, 1.30 * seconds);
-            rack = clamp(rack, -steeringBound, steeringBound);
-            double yaw = Math.tan(rack) * STEP / WHEELBASE;
-            double midHeading = heading + .5 * yaw;
-            x += Math.sin(midHeading) * STEP;
-            z += Math.cos(midHeading) * STEP;
-            heading += yaw;
+        for (double d = STEP; d <= horizon; d += STEP) {
+            double follow = steer(route, x, z, heading, speed);
+            double blend = clamp((d - 6) / 15, 0, 1);
+            double requested = first * (1 - blend) + follow * blend;
+            double seconds = STEP / Math.max(2.5, speed);
 
-            // The desired position at this travel distance is measured
-            // relative to the nearest point on the *current* route.
-            if (d <= 18 && ((int) (d / STEP)) % 2 == 0) {
-                CarNavigation.Point reference = aim(route,
-                        car.transform.position.x, car.transform.position.z,
-                        d + 4);
-                trackingSum += Math.min(35,
-                        Math.hypot(x - reference.x(), z - reference.z()));
+            rack = clamp(rack + clamp(requested - rack,
+                            -1.6 * seconds, 1.6 * seconds),
+                    -steeringLimit(speed), steeringLimit(speed));
+
+            double yaw = STEP * Math.tan(rack) / WHEELBASE;
+            x += STEP * Math.sin(heading + yaw * .5);
+            z += STEP * Math.cos(heading + yaw * .5);
+            heading = wrap(heading + yaw);
+
+            if (d < 24 && (int) Math.round(d / STEP) % 4 == 0) {
+                CarNavigation.Point ref = aim(route, originX, originZ, d + 3);
+                track += Math.min(20, Math.hypot(x - ref.x(), z - ref.z()));
                 tracked++;
             }
 
-            CarSurfaceGrid.Surface center = grid.surface(x, z);
-            double sideX = Math.cos(heading) * HALF_WIDTH;
-            double sideZ = -Math.sin(heading) * HALF_WIDTH;
-            CarSurfaceGrid.Surface a = grid.surface(x + sideX, z + sideZ);
-            CarSurfaceGrid.Surface b = grid.surface(x - sideX, z - sideZ);
+            double frontX = x + HALF_LENGTH * Math.sin(heading);
+            double frontZ = z + HALF_LENGTH * Math.cos(heading);
+            double sideX = HALF_WIDTH * Math.cos(heading);
+            double sideZ = -HALF_WIDTH * Math.sin(heading);
 
-            if (center.type() == 2 || edgeHazard(center, a)
-                    || edgeHazard(center, b)) {
+            CarSurfaceGrid.Surface a = grid.surface(frontX + sideX, frontZ + sideZ);
+            CarSurfaceGrid.Surface b = grid.surface(frontX - sideX, frontZ - sideZ);
+            CarSurfaceGrid.Surface center = grid.surface(x, z);
+
+            if (hazard(a, b, center)
+                    || abruptObstacle(frontX + sideX, frontZ + sideZ)
+                    || abruptObstacle(frontX - sideX, frontZ - sideZ)
+                    || abruptObstacle(x, z)) {
                 blocked = true;
-                obstruction = d;
+                clearance = Math.max(0, d - STEP);
                 break;
             }
 
-            if (center.type() == 0) {
-                if (!Double.isFinite(unknownFrom)) unknownFrom = d;
-                // Limited motion into unmeasured ground; do not mistake
-                // an absence of stereo matches for a physical obstacle.
-                if (d > 9 && d - unknownFrom > 9) {
-                    obstruction = d;
-                    break;
-                }
-            } else {
-                unknownFrom = Double.NaN;
-                if (Double.isFinite(lastHeight)) {
+            int verified = (known(a) ? 1 : 0) + (known(b) ? 1 : 0)
+                    + (known(center) ? 1 : 0);
+
+            if (verified >= 2 || known(center) && center.support() > .38) {
+                observed = d;
+                samples++;
+
+                if (center.type() == 1 && center.road() >= .4) paved++;
+
+                if (Double.isFinite(lastHeight) && known(center)) {
                     double run = Math.hypot(x - lastX, z - lastZ);
                     double rise = Math.abs(center.height() - lastHeight);
-                    // Do not label a long unseen gap as a vertical cliff.
-                    if (run <= 3.0) {
-                        if (rise > .35 + MAX_GRADIENT * run) {
-                            blocked = true;
-                            obstruction = d;
-                            break;
-                        }
-                        if (run > .1)
-                            highestGradient = Math.max(highestGradient, rise / run);
+
+                    if (rise > .42 + .90 * run
+                            && grid.confirmedHeight(x, z)
+                            && grid.confirmedHeight(lastX, lastZ)) {
+                        blocked = true;
+                        clearance = Math.max(0, d - STEP);
+                        break;
                     }
+
+                    if (run > .2) gradient = Math.max(gradient, rise / run);
                 }
-                lastX = x;
-                lastZ = z;
-                lastHeight = center.height();
-                if (center.support() >= .18) {
-                    observed = d;
-                    samples++;
-                    if (center.type() == 1 && center.road() >= .40) paved++;
+
+                if (known(center)) {
+                    lastHeight = center.height();
+                    lastX = x;
+                    lastZ = z;
                 }
+            }
+
+            double gap = observed >= 10 ? 5.4 : observed >= 3 ? 4.2 : 3.2;
+
+            if (d - observed > gap) {
+                clearance = Math.min(clearance, observed + gap);
+                break;
             }
         }
 
-        // Obstacles are measured, but short unobserved stretches still
-        // restrict speed. Neither off-road access nor grass is a stop reason.
-        double visibleHorizon = Math.max(13, observed + 8);
-        double clearance = Math.max(0,
-                Math.min(obstruction, visibleHorizon) - FRONT_OVERHANG);
-        return new Candidate(firstSteer, clearance,
-                Math.max(0, observed - FRONT_OVERHANG),
-                samples, paved, highestGradient,
-                tracked == 0 ? 0 : trackingSum / tracked, blocked);
+        return new Candidate(first, clearance, observed, samples, paved,
+                gradient, tracked == 0 ? 0 : track / tracked, blocked);
     }
 
-    private static boolean edgeHazard(CarSurfaceGrid.Surface center,
-                                      CarSurfaceGrid.Surface edge) {
-        if (edge.type() == 2) return true;
-        boolean centerGround = center.type() == 1 || center.type() == 3;
-        boolean edgeGround = edge.type() == 1 || edge.type() == 3;
-        return centerGround && edgeGround
-                && Math.abs(center.height() - edge.height())
-                > .35 + MAX_GRADIENT * HALF_WIDTH;
+    /** Preview only the upcoming leg; distant hazards reduce speed, not to zero. */
+    private Candidate sweepManeuver(double x, double z, CarManeuverPlanner.Leg leg) {
+        double px = x, pz = z, travelled = 0, observed = 0;
+        double clearance = 14;
+        boolean blocked = false;
+        int count = 0;
+        int end = Math.min(leg.points.size(), leg.nearest + 55);
+
+        for (int i = Math.max(1, leg.nearest + 1); i < end; i += 2) {
+            CarManeuverPlanner.Sample p = leg.points.get(i);
+            double advance = Math.hypot(p.x() - px, p.z() - pz);
+            travelled += advance;
+
+            if (!maneuverSafe(p.x(), p.z(), p.heading())) {
+                blocked = true;
+                clearance = Math.max(0, travelled - advance);
+                break;
+            }
+
+            if (footprintObserved(p.x(), p.z(), p.heading())) observed = travelled;
+
+            if (travelled - observed > 2.8) {
+                clearance = Math.max(0, observed + 2.8);
+                break;
+            }
+
+            px = p.x();
+            pz = p.z();
+            count++;
+            clearance = travelled + .6;
+            if (travelled >= 14) break;
+        }
+
+        return new Candidate(previousSteer, clearance, observed,
+                count, count, 0, 0, blocked);
     }
 
-    /** Maximum comfortable wheel angle for the current speed. */
+    /** Search rejects measured obstacles; unknown cells remain unverified. */
+    private boolean maneuverSafe(double x, double z, double heading) {
+        double c = Math.cos(heading), s = Math.sin(heading);
+
+        for (int row = -1; row <= 1; row++) {
+            double along = row * 2.3;
+            double mx = x + s * along, mz = z + c * along;
+            CarSurfaceGrid.Surface middle = grid.surface(mx, mz);
+
+            if (middle.type() == 2 || abruptObstacle(mx, mz)) return false;
+
+            for (int col = -1; col <= 1; col++) {
+                CarSurfaceGrid.Surface edge = grid.surface(
+                        mx + c * col * HALF_WIDTH,
+                        mz - s * col * HALF_WIDTH);
+
+                if (edge.type() == 2 || abruptObstacle(
+                        mx + c * col * HALF_WIDTH,
+                        mz - s * col * HALF_WIDTH)
+                        || edgeHazard(middle, edge,
+                        Math.abs(col) * HALF_WIDTH)) return false;
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * A flat-topped object can look like flat ground to local plane fitting.
+     * Check actual neighbouring stereo heights as well, so the edge of a
+     * raised object is not silently classified as unknown / traversable.
+     */
+    private boolean abruptObstacle(double x, double z) {
+        int ix = CarSurfaceGrid.index(x), iz = CarSurfaceGrid.index(z);
+        CarSurfaceGrid.Cell a = grid.cells.get(CarSurfaceGrid.key(ix, iz));
+
+        if (!grid.confirmed(a)) return false;
+
+        double now = System.nanoTime() * 1e-9;
+        if (a.max - a.min > 1.3) return true;
+
+        double height = a.mean();
+
+        for (int i = 0; i < 4; i++) {
+            int dx = i == 0 ? -1 : i == 1 ? 1 : 0;
+            int dz = i == 2 ? -1 : i == 3 ? 1 : 0;
+            CarSurfaceGrid.Cell b = grid.cells.get(
+                    CarSurfaceGrid.key(ix + dx, iz + dz));
+
+            if (grid.confirmed(b)
+                    && now - b.seen <= CarSurfaceGrid.TTL
+                    && Math.abs(height - b.mean())
+                    > .65 + .90 * CarSurfaceGrid.CELL) return true;
+        }
+
+        return false;
+    }
+
+    private boolean footprintObserved(double x, double z, double heading) {
+        double c = Math.cos(heading), s = Math.sin(heading);
+        int verified = 0;
+
+        for (int row = -1; row <= 1; row++) {
+            double along = row * 2.3;
+            double mx = x + s * along, mz = z + c * along;
+
+            for (int col = -1; col <= 1; col++) {
+                if (known(grid.surface(mx + c * col * HALF_WIDTH,
+                        mz - s * col * HALF_WIDTH))) verified++;
+            }
+        }
+
+        return verified >= 3;
+    }
+
+    private static boolean known(CarSurfaceGrid.Surface s) {
+        return s.type() != 0 && s.type() != 2 && s.support() >= .10;
+    }
+
+    private static boolean hazard(CarSurfaceGrid.Surface a,
+                                  CarSurfaceGrid.Surface b,
+                                  CarSurfaceGrid.Surface center) {
+        return a.type() == 2 || b.type() == 2 || center.type() == 2
+                || edgeHazard(a, b, 2 * HALF_WIDTH)
+                || edgeHazard(a, center, Math.hypot(HALF_WIDTH, HALF_LENGTH))
+                || edgeHazard(b, center, Math.hypot(HALF_WIDTH, HALF_LENGTH));
+    }
+
+    private static boolean edgeHazard(CarSurfaceGrid.Surface a,
+                                      CarSurfaceGrid.Surface b,
+                                      double distance) {
+        return known(a) && known(b) && a.support() >= .45
+                && b.support() >= .45 && Math.abs(a.height() - b.height())
+                > .48 + .90 * distance;
+    }
+
+    private static double stopSpeed(double distance, double reaction) {
+        double free = Math.max(0, distance);
+        return Math.max(0, Math.sqrt(BRAKE * BRAKE * reaction * reaction
+                + 2 * BRAKE * free) - BRAKE * reaction);
+    }
+
     private static double steeringLimit(double speed) {
         return Math.min(MAX_STEER, Math.atan(LATERAL_ACCEL * WHEELBASE
                 / Math.max(9, speed * speed)));
@@ -561,38 +898,38 @@ final class CarFSD {
                                 double speed) {
         if (route.isEmpty()) return 0;
 
-        // Longer lookahead at road speed permits a slow, smooth return to
-        // centre instead of a hard correction for every small deviation.
-        double lookahead = clamp(5.5 + .90 * speed, 5.5, 24);
-        CarNavigation.Point target = aim(route, x, z, lookahead);
-        double dx = target.x() - x;
-        double dz = target.z() - z;
+        CarNavigation.Point target = aim(route, x, z,
+                clamp(3.8 + .72 * speed, 4, 19));
+        double dx = target.x() - x, dz = target.z() - z;
         double side = Math.cos(heading) * dx - Math.sin(heading) * dz;
         double ahead = Math.sin(heading) * dx + Math.cos(heading) * dz;
 
-        // Pure pursuit alone makes an almost straight command for a point
-        // behind the rear axle. Turn decisively instead of deadlocking.
-        if (ahead < -.5)
-            return side < 0 ? -MAX_STEER : MAX_STEER;
-        double d2 = dx * dx + dz * dz;
+        if (Math.abs(side) < .20 && ahead > 3) return 0;
+
         return clamp(Math.atan2(2 * WHEELBASE * side,
-                Math.max(4, d2)), -MAX_STEER, MAX_STEER);
+                        Math.max(9, dx * dx + dz * dz)),
+                ahead < -1 ? -.30 : -MAX_STEER,
+                ahead < -1 ? .30 : MAX_STEER);
     }
 
     private static CarNavigation.Point aim(List<CarNavigation.Point> route,
                                            double x, double z, double ahead) {
+        if (route.isEmpty()) return new CarNavigation.Point(x, z);
         if (route.size() == 1) return route.get(0);
-        int nearest = 0;
+
         double best = Double.POSITIVE_INFINITY;
-        double px = route.get(0).x();
-        double pz = route.get(0).z();
+        int nearest = 0;
+        double px = route.get(0).x(), pz = route.get(0).z();
+
         for (int i = 0; i + 1 < route.size(); i++) {
             CarNavigation.Point a = route.get(i), b = route.get(i + 1);
             double dx = b.x() - a.x(), dz = b.z() - a.z();
             double t = clamp(((x - a.x()) * dx + (z - a.z()) * dz)
                     / Math.max(1e-9, dx * dx + dz * dz), 0, 1);
+
             double qx = a.x() + t * dx, qz = a.z() + t * dz;
-            double miss = Math.hypot(qx - x, qz - z);
+            double miss = Math.hypot(x - qx, z - qz);
+
             if (miss < best) {
                 best = miss;
                 nearest = i;
@@ -600,58 +937,93 @@ final class CarFSD {
                 pz = qz;
             }
         }
+
         for (int i = nearest + 1; i < route.size(); i++) {
             CarNavigation.Point b = route.get(i);
             double length = Math.hypot(b.x() - px, b.z() - pz);
-            if (length >= ahead && length > 1e-6)
+
+            if (length >= ahead && length > 1e-8)
                 return new CarNavigation.Point(px + (b.x() - px) * ahead / length,
                         pz + (b.z() - pz) * ahead / length);
+
             ahead -= length;
             px = b.x();
             pz = b.z();
         }
+
         return new CarNavigation.Point(px, pz);
     }
 
     private static double distanceToRoute(List<CarNavigation.Point> route,
                                           double x, double z) {
-        if (route.isEmpty()) return Double.POSITIVE_INFINITY;
-        if (route.size() == 1)
-            return Math.hypot(route.get(0).x() - x, route.get(0).z() - z);
+        if (route.size() < 2) return route.isEmpty()
+                ? Double.POSITIVE_INFINITY
+                : Math.hypot(route.get(0).x() - x, route.get(0).z() - z);
+
         double best = Double.POSITIVE_INFINITY;
+
         for (int i = 0; i + 1 < route.size(); i++) {
             CarNavigation.Point a = route.get(i), b = route.get(i + 1);
             double dx = b.x() - a.x(), dz = b.z() - a.z();
             double t = clamp(((x - a.x()) * dx + (z - a.z()) * dz)
-                    / Math.max(1e-9, dx * dx + dz * dz), 0, 1);
+                    / Math.max(1e-8, dx * dx + dz * dz), 0, 1);
+
             best = Math.min(best, Math.hypot(x - a.x() - t * dx,
                     z - a.z() - t * dz));
         }
+
         return best;
     }
 
-    private void publish(CarVehicle car, double[] ages, boolean steerManual,
-                         boolean motionManual, boolean paused,
-                         boolean fresh, double clearance) {
-        double now = System.nanoTime() * 1e-9;
-        if (now - publishTime < .1) return;
-        publishTime = now;
+    private static double bendSpeed(List<CarNavigation.Point> route,
+                                    double x, double z) {
+        double limit = ROAD_SPEED;
 
-        int capacity = 61 * 76;
-        float[] xs = new float[capacity];
-        float[] ys = new float[capacity];
+        for (double d = 4; d <= 44; d += 4) {
+            CarNavigation.Point a = aim(route, x, z, d - 4);
+            CarNavigation.Point b = aim(route, x, z, d);
+            CarNavigation.Point c = aim(route, x, z, d + 4);
+            double ab = Math.hypot(b.x() - a.x(), b.z() - a.z());
+            double bc = Math.hypot(c.x() - b.x(), c.z() - b.z());
+            double ac = Math.hypot(c.x() - a.x(), c.z() - a.z());
+
+            if (ab * bc * ac < .01) continue;
+
+            double cross = Math.abs((b.x() - a.x()) * (c.z() - a.z())
+                    - (b.z() - a.z()) * (c.x() - a.x()));
+            double corner = Math.sqrt(LATERAL_ACCEL
+                    / Math.max(.0001, 2 * cross / (ab * bc * ac)));
+
+            limit = Math.min(limit, Math.sqrt(corner * corner
+                    + 7 * Math.max(0, d - 4)));
+        }
+
+        return limit;
+    }
+
+    private void publish(CarVehicle car, double[] ages, boolean steerManual,
+                         boolean motionManual, boolean paused, boolean fresh,
+                         double clearance) {
+        double now = System.nanoTime() * 1e-9;
+        if (now - lastPublish < .2) return;
+        lastPublish = now;
+
+        int capacity = 51 * 61;
+        float[] xs = new float[capacity], ys = new float[capacity];
         float[] zs = new float[capacity];
-        byte[] types = new byte[capacity];
-        byte[] sources = new byte[capacity];
+        byte[] types = new byte[capacity], sources = new byte[capacity];
         int count = 0;
         double c = Math.cos(car.getHeading()), s = Math.sin(car.getHeading());
-        for (int row = -15; row <= 60; row++) {
-            for (int col = -30; col <= 30; col++) {
-                double lx = col * .8, lz = row * .8;
+
+        for (int row = -12; row <= 48; row++) {
+            for (int col = -25; col <= 25; col++) {
+                double lx = col * .95, lz = row * .95;
                 double wx = car.transform.position.x + c * lx + s * lz;
                 double wz = car.transform.position.z - s * lx + c * lz;
                 CarSurfaceGrid.Surface surface = grid.surface(wx, wz);
+
                 if (surface.type() == 0) continue;
+
                 xs[count] = (float) lx;
                 ys[count] = (float) (surface.height() - car.transform.position.y);
                 zs[count] = (float) lz;
@@ -660,18 +1032,24 @@ final class CarFSD {
                 count++;
             }
         }
+
         int[] directions = new int[scanAngles.length];
-        Arrays.fill(directions, 1);
+        Arrays.fill(directions, requestedDirection);
+
         visualization = new Visualization(Arrays.copyOf(xs, count),
                 Arrays.copyOf(ys, count), Arrays.copyOf(zs, count),
                 Arrays.copyOf(types, count), Arrays.copyOf(sources, count),
                 scanAngles.clone(), scanClearances.clone(), directions,
-                previousSteer, clearance, commandSpeed, car.getSpeed(), 1,
-                ages.clone(), enabled, steerManual, motionManual,
-                paused, fresh, status);
+                previousSteer, clearance, commandSpeed, car.getSpeed(), direction,
+                ages.clone(), enabled, steerManual, motionManual, paused,
+                fresh, status);
     }
 
-    private static double clamp(double v, double lo, double hi) {
-        return Math.max(lo, Math.min(hi, v));
+    private static double wrap(double a) {
+        return Math.atan2(Math.sin(a), Math.cos(a));
+    }
+
+    private static double clamp(double value, double low, double high) {
+        return Math.max(low, Math.min(high, value));
     }
 }

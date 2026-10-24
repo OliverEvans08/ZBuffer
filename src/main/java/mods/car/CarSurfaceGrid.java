@@ -1,27 +1,21 @@
-
 package mods.car;
 
 import java.util.HashMap;
 import java.util.Map;
 
 /**
- * Short-lived, world-space stereo surface evidence.
+ * World-space, short-term stereo evidence.
  *
- * All elevations are world-space values. The local ground model
- * is y = height + slopeX * dx + slopeZ * dz.
- *
- * Normal hills and banked roads must not be confused with
- * vertical obstacles.
- *
- * The navigation map does not manufacture stereo observations.
+ * Unknown cells are not obstacles or free space.
+ * Smooth hills are distinguished from local height discontinuities.
  */
 final class CarSurfaceGrid {
     static final double CELL = 0.8;
-    static final double TTL = 2.2;
+    static final double TTL = 5.0;
 
-    private static final double MAX_GRADIENT = 0.90;
-    private static final double MAX_PLANE_RESIDUAL = 0.48;
-    private static final double OBSTACLE_HEIGHT = 0.60;
+    private static final double MAX_GRADIENT = .90;
+    private static final double MAX_RESIDUAL = .68;
+    private static final double OBSTACLE_HEIGHT = .65;
 
     static final class Cell {
         double min = Double.POSITIVE_INFINITY;
@@ -29,42 +23,46 @@ final class CarSurfaceGrid {
 
         double sum;
         double weight;
-        double seen;
-        double grass;
         double road;
+        double grass;
+        double seen;
+        long frameId;
+        int visits; // Independent camera captures of comparable geometry.
 
         int count;
 
         void add(
                 double y,
-                double quality,
+                double confidence,
                 int rgb,
-                double time
+                long sampleCapture
         ) {
             if (!Double.isFinite(y)
-                    || !Double.isFinite(quality)
-                    || quality <= 0) {
+                    || !Double.isFinite(confidence)
+                    || confidence <= 0) {
                 return;
             }
 
             min = Math.min(min, y);
             max = Math.max(max, y);
 
-            sum += y * quality;
-            weight += quality;
-            count++;
-            seen = time;
+            sum += y * confidence;
+            weight += confidence;
 
-            int r = (rgb >> 16) & 255;
-            int g = (rgb >> 8) & 255;
+            count++;
+            frameId = Math.max(frameId, sampleCapture);
+            seen = Math.max(seen, sampleCapture * 1e-9);
+
+            int r = rgb >> 16 & 255;
+            int g = rgb >> 8 & 255;
             int b = rgb & 255;
 
             if (g > r * 1.18
                     && g > b * 1.15
                     && g - r > 12) {
-                grass += quality;
+                grass += confidence;
             } else {
-                road += quality;
+                road += confidence;
             }
         }
 
@@ -75,8 +73,14 @@ final class CarSurfaceGrid {
         }
     }
 
-    // 0 unknown, 1 smooth measured ground,
-    // 2 obstacle/unsafe surface, 3 vegetation.
+    /*
+     * Surface classification:
+     *
+     * 0 = unknown
+     * 1 = measured smooth ground
+     * 2 = observed hazard
+     * 3 = vegetation
+     */
     record Surface(
             int type,
             double height,
@@ -86,19 +90,28 @@ final class CarSurfaceGrid {
 
     final Map<Long, Cell> cells = new HashMap<>();
 
+    private static final Surface UNKNOWN =
+            new Surface(
+                    0,
+                    Double.NaN,
+                    0,
+                    0
+            );
+
     private long capture;
     private double now;
 
     void clear() {
         cells.clear();
         capture = 0;
+        now = System.nanoTime() * 1e-9;
     }
 
     void integrate(CarPerception.Snapshot snapshot) {
         now = System.nanoTime() * 1e-9;
 
         cells.values().removeIf(
-                c -> now - c.seen > TTL
+                cell -> now - cell.seen > TTL
         );
 
         if (snapshot == null
@@ -109,9 +122,8 @@ final class CarSurfaceGrid {
 
         capture = snapshot.captureTime;
 
-        double timestamp = capture * 1e-9;
-        double cosine = Math.cos(snapshot.poseHeading);
-        double sine = Math.sin(snapshot.poseHeading);
+        double c = Math.cos(snapshot.poseHeading);
+        double s = Math.sin(snapshot.poseHeading);
 
         Map<Long, Cell> frame = new HashMap<>();
 
@@ -124,16 +136,32 @@ final class CarSurfaceGrid {
         );
 
         for (int i = 0; i < count; i++) {
-            double quality = snapshot.pointConfidences[i];
+            double confidence =
+                    snapshot.pointConfidences[i];
 
-            if (!Double.isFinite(quality)
-                    || quality < 0.28) {
+            if (!Double.isFinite(confidence)
+                    || confidence < .26) {
                 continue;
             }
 
-            double lx = snapshot.surfaces[i * 3];
-            double ly = snapshot.surfaces[i * 3 + 1];
-            double lz = snapshot.surfaces[i * 3 + 2];
+            // A snapshot reuses the most recent frame from each camera.
+            // Replaying it must NOT count as a new obstacle observation.
+            int view = i < snapshot.nearestCamera.length
+                    ? snapshot.nearestCamera[i] : -1;
+            if (view < 0 || view >= snapshot.cameraCaptureTimes.length)
+                continue;
+            long sampleCapture = snapshot.cameraCaptureTimes[view];
+            if (sampleCapture <= 0 ||
+                    now - sampleCapture * 1e-9 > TTL) continue;
+
+            double lx =
+                    snapshot.surfaces[3 * i];
+
+            double ly =
+                    snapshot.surfaces[3 * i + 1];
+
+            double lz =
+                    snapshot.surfaces[3 * i + 2];
 
             if (!Double.isFinite(lx)
                     || !Double.isFinite(ly)
@@ -142,37 +170,52 @@ final class CarSurfaceGrid {
                 continue;
             }
 
-            double x = snapshot.poseX
-                    + cosine * lx
-                    + sine * lz;
+            double x =
+                    snapshot.poseX + c * lx + s * lz;
 
-            double y = snapshot.poseY + ly;
+            double z =
+                    snapshot.poseZ - s * lx + c * lz;
 
-            double z = snapshot.poseZ
-                    - sine * lx
-                    + cosine * lz;
+            double y =
+                    snapshot.poseY + ly;
 
             frame.computeIfAbsent(
                     key(index(x), index(z)),
                     k -> new Cell()
             ).add(
                     y,
-                    quality,
+                    confidence,
                     snapshot.pointColors[i],
-                    timestamp
+                    sampleCapture
             );
         }
 
-        cells.putAll(frame);
+        // Only genuinely newer camera captures replace a cell. Retain the
+        // number of independent, geometrically consistent observations.
+        // A single bad stereo frame can therefore cause caution, but not a
+        // fully confirmed wall or an immediate phantom detour.
+        for (Map.Entry<Long, Cell> entry : frame.entrySet()) {
+            Cell next = entry.getValue();
+            Cell previous = cells.get(entry.getKey());
+            if (previous != null && next.frameId <= previous.frameId)
+                continue;
+
+            next.visits = previous != null
+                    && now - previous.seen < TTL
+                    && Math.abs(next.mean() - previous.mean()) < 1.0
+                    ? Math.min(6, previous.visits + 1) : 1;
+            cells.put(entry.getKey(), next);
+        }
     }
 
-    Surface surface(double x, double z) {
-        Surface unknown = new Surface(
-                0,
-                Double.NaN,
-                0,
-                0
-        );
+    Surface surface(
+            double x,
+            double z
+    ) {
+        if (!Double.isFinite(x)
+                || !Double.isFinite(z)) {
+            return UNKNOWN;
+        }
 
         int ix = index(x);
         int iz = index(z);
@@ -192,10 +235,19 @@ final class CarSurfaceGrid {
         double grass = 0;
 
         double nearest2 = Double.POSITIVE_INFINITY;
-        int support = 0;
 
-        for (int dz = -2; dz <= 2; dz++) {
-            for (int dx = -2; dx <= 2; dx++) {
+        double min = Double.POSITIVE_INFINITY;
+        double max = Double.NEGATIVE_INFINITY;
+
+        int support = 0;
+        int persistentSupport = 0;
+
+        /*
+         * Fit local measured ground instead of checking absolute
+         * height differences against a flat horizontal plane.
+         */
+        for (int dz = -3; dz <= 3; dz++) {
+            for (int dx = -3; dx <= 3; dx++) {
                 Cell cell = cells.get(
                         key(ix + dx, iz + dz)
                 );
@@ -206,53 +258,88 @@ final class CarSurfaceGrid {
                     continue;
                 }
 
-                double a = (ix + dx + 0.5) * CELL - x;
-                double b = (iz + dz + 0.5) * CELL - z;
+                double ax =
+                        (ix + dx + .5) * CELL - x;
 
-                double d2 = a * a + b * b;
+                double az =
+                        (iz + dz + .5) * CELL - z;
 
-                if (d2 > 2.25) {
+                double d2 =
+                        ax * ax + az * az;
+
+                if (d2 > 5.76) {
                     continue;
                 }
 
-                double value = cell.mean();
+                double height = cell.mean();
 
-                if (!Double.isFinite(value)) {
+                if (!Double.isFinite(height)) {
                     continue;
                 }
 
-                nearest2 = Math.min(nearest2, d2);
+                double age = Math.max(
+                        0,
+                        now - cell.seen
+                );
 
-                double w = Math.min(3, cell.weight)
-                        / (0.3 + d2);
+                double w =
+                        Math.min(5, cell.weight)
+                                / (.35 + d2)
+                                * Math.exp(-age / 5);
 
                 sw += w;
-                sx += w * a;
-                sz += w * b;
-                sy += w * value;
+                sx += w * ax;
+                sz += w * az;
+                sy += w * height;
 
-                sxx += w * a * a;
-                szz += w * b * b;
-                sxz += w * a * b;
+                sxx += w * ax * ax;
+                szz += w * az * az;
+                sxz += w * ax * az;
 
-                sxy += w * a * value;
-                szy += w * b * value;
+                sxy += w * ax * height;
+                szy += w * az * height;
 
-                road += w * cell.road
-                        / Math.max(0.01, cell.weight);
+                road +=
+                        w * cell.road
+                                / Math.max(.01, cell.weight);
 
-                grass += w * cell.grass
-                        / Math.max(0.01, cell.weight);
+                grass +=
+                        w * cell.grass
+                                / Math.max(.01, cell.weight);
+
+                if (d2 < 2.0) {
+                    min = Math.min(
+                            min,
+                            cell.min
+                    );
+
+                    max = Math.max(
+                            max,
+                            cell.max
+                    );
+                }
+
+                nearest2 = Math.min(
+                        nearest2,
+                        d2
+                );
 
                 support++;
+                if (confirmed(cell)) persistentSupport++;
             }
         }
 
-        if (support < 3
-                || sw < 0.1
-                || nearest2 > 0.95 * 0.95) {
-            return unknown;
+        /*
+         * Sparse stereo data can be useful, but must have reduced
+         * confidence rather than being treated as fully verified.
+         */
+        if (support == 0
+                || sw < .03
+                || nearest2 > 1.55 * 1.55) {
+            return UNKNOWN;
         }
+
+        double mean = sy / sw;
 
         double xx = sxx - sx * sx / sw;
         double zz = szz - sz * sz / sw;
@@ -261,158 +348,207 @@ final class CarSurfaceGrid {
         double xy = sxy - sx * sy / sw;
         double zy = szy - sz * sy / sw;
 
-        double determinant = xx * zz - xz * xz;
+        double determinant =
+                xx * zz - xz * xz;
 
-        if (determinant < 1e-5) {
-            return unknown;
+        double slopeX = 0;
+        double slopeZ = 0;
+
+        if (support >= 3
+                && determinant > 1e-5) {
+            slopeX =
+                    (xy * zz - zy * xz)
+                            / determinant;
+
+            slopeZ =
+                    (zy * xx - xy * xz)
+                            / determinant;
         }
 
-        double slopeX =
-                (xy * zz - zy * xz) / determinant;
-
-        double slopeZ =
-                (zy * xx - xy * xz) / determinant;
-
         double height =
-                (sy - slopeX * sx - slopeZ * sz) / sw;
+                mean - (
+                        slopeX * sx
+                                + slopeZ * sz
+                ) / sw;
 
         if (!Double.isFinite(height)
                 || !Double.isFinite(slopeX)
                 || !Double.isFinite(slopeZ)) {
-            return unknown;
+            return UNKNOWN;
         }
 
         double confidence =
-                Math.min(1, support / 6.0)
-                        * Math.min(
+                Math.min(
                         1,
-                        0.95 / Math.sqrt(
-                                Math.max(0.05, nearest2)
+                        support / 5.0
+                ) * Math.min(
+                        1,
+                        1.25 / Math.sqrt(
+                                Math.max(.20, nearest2)
                         )
                 );
 
-        double gradient = Math.hypot(slopeX, slopeZ);
-
-        if (gradient > MAX_GRADIENT) {
-            return new Surface(
+        /*
+         * An excessively steep local plane may indicate an
+         * obstacle, but sparse samples around a hill crest
+         * are not sufficient evidence of a wall.
+         */
+        if (Math.hypot(slopeX, slopeZ) > MAX_GRADIENT) {
+            return persistentSupport >= 3 && support >= 5 && confidence > .45
+                    ? new Surface(
                     2,
                     height,
                     0,
                     confidence
-            );
+            )
+                    : UNKNOWN;
         }
 
-        /*
-         * Compare the samples to the sloping plane.
-         * Absolute elevation difference is not an obstacle.
-         */
-        double errorSum = 0;
-        double errorWeight = 0;
+        double residual = 0;
+        double residualWeight = 0;
 
-        for (int dz = -2; dz <= 2; dz++) {
-            for (int dx = -2; dx <= 2; dx++) {
+        for (int dz = -3; dz <= 3; dz++) {
+            for (int dx = -3; dx <= 3; dx++) {
                 Cell cell = cells.get(
                         key(ix + dx, iz + dz)
                 );
 
                 if (cell == null
-                        || cell.count == 0
                         || now - cell.seen > TTL) {
                     continue;
                 }
 
-                double ax = (ix + dx + 0.5) * CELL - x;
-                double az = (iz + dz + 0.5) * CELL - z;
+                double ax =
+                        (ix + dx + .5) * CELL - x;
 
-                double d2 = ax * ax + az * az;
+                double az =
+                        (iz + dz + .5) * CELL - z;
 
-                if (d2 > 2.25) {
+                double d2 =
+                        ax * ax + az * az;
+
+                if (d2 > 5.76) {
                     continue;
                 }
 
-                double expected = height
-                        + slopeX * ax
-                        + slopeZ * az;
+                double w =
+                        Math.min(5, cell.weight)
+                                / (.35 + d2);
 
-                double residual = cell.mean() - expected;
+                double delta =
+                        cell.mean()
+                                - height
+                                - slopeX * ax
+                                - slopeZ * az;
 
-                double w = Math.min(3, cell.weight)
-                        / (0.3 + d2);
+                residual +=
+                        w * delta * delta;
 
-                errorSum += w * residual * residual;
-                errorWeight += w;
+                residualWeight += w;
             }
         }
 
-        double residualRms = Math.sqrt(
-                errorSum / Math.max(0.001, errorWeight)
+        /*
+         * Curved hills and crests do not always fit one plane
+         * perfectly.
+         *
+         * A high fitting residual without a local protrusion
+         * indicates uncertainty, not necessarily a wall.
+         *
+         * Unknown regions will constrain FSD speed, while
+         * local height discontinuities remain hazards.
+         */
+        boolean irregular =
+                support >= 3
+                        && Math.sqrt(
+                        residual
+                                / Math.max(
+                                .01,
+                                residualWeight
+                        )
+                ) > MAX_RESIDUAL;
+
+        Cell own = cells.get(
+                key(ix, iz)
         );
-
-        if (residualRms > MAX_PLANE_RESIDUAL) {
-            return new Surface(
-                    2,
-                    height,
-                    0,
-                    confidence
-            );
-        }
-
-        Cell own = cells.get(key(ix, iz));
 
         if (own != null
                 && now - own.seen <= TTL) {
-            double centerX = (ix + 0.5) * CELL - x;
-            double centerZ = (iz + 0.5) * CELL - z;
+            double ax =
+                    (ix + .5) * CELL - x;
 
-            double expected = height
-                    + slopeX * centerX
-                    + slopeZ * centerZ;
+            double az =
+                    (iz + .5) * CELL - z;
+
+            double expected =
+                    height
+                            + slopeX * ax
+                            + slopeZ * az;
+
+            double variation =
+                    .5 * CELL * (
+                            Math.abs(slopeX)
+                                    + Math.abs(slopeZ)
+                    );
 
             /*
-             * A slope can naturally span different elevations
-             * inside one cell. Allow that expected variation.
+             * Detect an actual vertical protrusion relative
+             * to the locally fitted sloping terrain.
              */
-            double expectedVariation =
-                    CELL * (Math.abs(slopeX)
-                            + Math.abs(slopeZ));
-
-            if (own.max - expected > OBSTACLE_HEIGHT
-                    + expectedVariation * 0.5
-                    || own.max - own.min
-                    > OBSTACLE_HEIGHT + expectedVariation) {
-                return new Surface(
-                        2,
-                        height,
-                        0,
-                        confidence
-                );
+            if (own.max - expected > OBSTACLE_HEIGHT + variation
+                    || own.max - own.min > OBSTACLE_HEIGHT + 2 * variation) {
+                // Do not classify one noisy stereo capture as an obstacle.
+                // Unknown is deliberately different from clear road.
+                return confirmed(own) && confidence > .35
+                        ? new Surface(2, height, 0, confidence) : UNKNOWN;
             }
         }
 
-        double roadFraction = road / sw;
-
-        if (grass / sw > 0.55) {
-            return new Surface(
-                    3,
-                    height,
-                    roadFraction,
-                    confidence
-            );
+        if (irregular) {
+            return UNKNOWN;
         }
 
+        /*
+         * Do not mistake neighbouring sloping ground for a wall
+         * simply because absolute world heights differ.
+         */
+        if (support <= 2
+                && Double.isFinite(min)
+                && Double.isFinite(max)
+                && max - min > 1.8) {
+            return UNKNOWN;
+        }
+
+        double paved = road / sw;
+
         return new Surface(
-                1,
+                grass / sw > .55 ? 3 : 1,
                 height,
-                roadFraction,
-                confidence
+                paved,
+                Math.max(.06, confidence)
         );
     }
 
-    static int index(double value) {
-        return (int) Math.floor(value / CELL);
+    boolean confirmedHeight(double x, double z) {
+        Cell cell = cells.get(key(index(x), index(z)));
+        return confirmed(cell);
     }
 
-    static long key(int x, int z) {
+    boolean confirmed(Cell cell) {
+        return cell != null && cell.visits >= 2 && cell.count >= 3
+                && cell.weight >= .85 && now - cell.seen <= TTL;
+    }
+
+    static int index(double value) {
+        return (int) Math.floor(
+                value / CELL
+        );
+    }
+
+    static long key(
+            int x,
+            int z
+    ) {
         return ((long) x << 32)
                 ^ (z & 0xffffffffL);
     }
