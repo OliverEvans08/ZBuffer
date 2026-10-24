@@ -1,23 +1,38 @@
+
 package mods.car;
 
 import engine.GameEngine;
 import engine.camera.Camera;
 import engine.render.Renderer;
+import objects.GameObject;
 
 import java.awt.Graphics2D;
 import java.awt.image.BufferedImage;
 import java.awt.image.DataBufferInt;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
-/** Four simulated, calibrated stereo pairs; front can be captured alone. */
+/**
+ * Four SIMULATED stereo pairs (not the real Tesla Vision hardware layout).
+ * Anchors track each selected Tesla's physical body size instead of using
+ * fixed Model 3-sized positions for sedans, SUVs and Cybertruck alike.
+ * Tesla's actual outward-facing cameras are primarily monocular and have
+ * model-specific positions; stereo here is a game-depth approximation.
+ */
 final class CarCameraRig implements AutoCloseable {
     static final int WIDTH = 240;
     static final int HEIGHT = 135;
     static final double BASELINE = .70;
     static final double FOV_DEGREES = 100;
     static final String[] NAMES = {"FRONT", "LEFT", "RIGHT", "REAR"};
-    private static final double FRONT_CAMERA_Z = 2.75;
+
+    // Extra front clearance keeps both lenses beyond the bumper, lights
+    // and projection near-plane even when the car is moving or pitching.
+    private static final double FRONT_OFFSET = .85;
+    private static final double SIDE_OFFSET = .10;
+    private static final double REAR_OFFSET = .16;
 
     private final GameEngine engine;
     private final OpticalCamera camera;
@@ -39,15 +54,19 @@ final class CarCameraRig implements AutoCloseable {
         renderer.setFxaaEnabled(false);
     }
 
-    /** Vehicle geometry copied on the fixed-update thread. */
+    /** Initial geometry snapshot; refreshed at capture time under the engine lock. */
     static final class Sample {
+        final CarVehicle car;
         final Pose pose;
+        final TeslaSpec spec;
         final double focal;
         final double x, y, z;
         final double xx, xy, xz, yx, yy, yz, zx, zy, zz;
 
         Sample(CarVehicle car) {
+            this.car = car;
             pose = new Pose(car);
+            spec = car.getConfiguration();
             focal = WIDTH * .5 / Math.tan(Math.toRadians(FOV_DEGREES) * .5);
             x = car.worldX(0, 0, 0);
             y = car.worldY(0, 0, 0);
@@ -62,12 +81,15 @@ final class CarCameraRig implements AutoCloseable {
             zy = car.worldY(0, 0, 1) - y;
             zz = car.worldZ(0, 0, 1) - z;
         }
+
         double worldX(double lx, double ly, double lz) {
             return x + lx * xx + ly * yx + lz * zx;
         }
+
         double worldY(double lx, double ly, double lz) {
             return y + lx * xy + ly * yy + lz * zy;
         }
+
         double worldZ(double lx, double ly, double lz) {
             return z + lx * xz + ly * yz + lz * zz;
         }
@@ -92,10 +114,24 @@ final class CarCameraRig implements AutoCloseable {
     }
 
     private Frame captureInternal(Sample sample, int view) {
-        double lx = view == 1 ? -1.10 : view == 2 ? 1.10 : 0;
-        double ly = view == 0 ? 1.34 : view == 3 ? 1.02 : 1.12;
-        double lz = view == 0 ? FRONT_CAMERA_Z
-                : view == 3 ? -2.48 : -.05;
+        // Perception queues work asynchronously. A position saved when a job
+        // was queued can trail a moving car and end up inside its body by the
+        // time it is rendered. Use the most recent pose for BOTH stereo views
+        // and their 3D reconstruction metadata.
+        sample = new Sample(sample.car);
+
+        // Body-local axes: +X right, +Y up, +Z forward. Put the FRONT and
+        // REAR pair beyond the bumper, and LEFT/RIGHT outside the side doors.
+        // The 0.70 m stereo baseline runs across each view (sideways for
+        // front/rear, fore-aft for side views), not through the car body.
+        TeslaSpec spec = sample.spec;
+        double sideAnchor = spec.widthM * .5 + SIDE_OFFSET;
+        double lx = view == 1 ? -sideAnchor : view == 2 ? sideAnchor : 0;
+        double ly = view == 0 ? Math.max(1.00, spec.heightM * .72)
+                : view == 3 ? Math.max(.72, spec.heightM * .56)
+                : Math.max(.82, spec.heightM * .70);
+        double lz = view == 0 ? spec.lengthM * .5 + FRONT_OFFSET
+                : view == 3 ? -spec.lengthM * .5 - REAR_OFFSET : -.05;
         double angle = view == 1 ? -Math.PI / 2
                 : view == 2 ? Math.PI / 2 : view == 3 ? Math.PI : 0;
         double dx = Math.sin(angle), dz = Math.cos(angle);
@@ -103,8 +139,11 @@ final class CarCameraRig implements AutoCloseable {
         double wy = sample.xy * dx + sample.zy * dz;
         double wz = sample.xz * dx + sample.zz * dz;
         double yaw = -Math.atan2(wx, wz);
+
+        // Follow the vehicle's heading and slope while looking slightly
+        // down at the road. Camera/view axes also calibrate stereo depth.
         double pitch = clamp(Math.atan2(-wy, Math.hypot(wx, wz))
-                + (view == 0 || view == 3 ? .30 : .12), -1.3, 1.3);
+                + (view == 0 ? .16 : view == 3 ? .24 : .12), -1.3, 1.3);
         double cy = Math.cos(yaw), sy = Math.sin(yaw);
         double cp = Math.cos(pitch), sp = Math.sin(pitch);
         double[] right = {cy, 0, sy};
@@ -118,16 +157,24 @@ final class CarCameraRig implements AutoCloseable {
 
         camera.opticalYaw = yaw;
         camera.opticalPitch = pitch;
+
+        // Only suppress the host car in the optical renders. Never hide the
+        // car from the live scene or omit OTHER cars (which are obstacles).
+        // This also prevents self-occlusion on steep slopes and body roll.
+        List<GameObject> opticalScene = new ArrayList<>(engine.rootObjects);
+        opticalScene.removeIf(sample.car::owns);
+
         long capturedAt = System.nanoTime();
-        BufferedImage left = render(origin[0], y, origin[2]);
+        BufferedImage left = render(opticalScene, origin[0], y, origin[2]);
         if (Thread.currentThread().isInterrupted()) return null;
-        BufferedImage rightImage = render(x + right[0] * half, y,
-                z + right[2] * half);
+        BufferedImage rightImage = render(opticalScene,
+                x + right[0] * half, y, z + right[2] * half);
         return new Frame(view, capturedAt, sample.pose, sample.focal,
                 origin, right, up, forward, left, rightImage);
     }
 
-    private BufferedImage render(double x, double y, double z) {
+    private BufferedImage render(List<GameObject> opticalScene,
+                                 double x, double y, double z) {
         camera.opticalX = x;
         camera.opticalY = y;
         camera.opticalZ = z;
@@ -135,7 +182,7 @@ final class CarCameraRig implements AutoCloseable {
                 BufferedImage.TYPE_INT_RGB);
         Graphics2D g = image.createGraphics();
         try {
-            renderer.render(g, engine.rootObjects, WIDTH, HEIGHT);
+            renderer.render(g, opticalScene, WIDTH, HEIGHT);
         } finally {
             g.dispose();
         }
@@ -149,6 +196,7 @@ final class CarCameraRig implements AutoCloseable {
 
     static final class Pose {
         final double x, y, z, c, s;
+
         Pose(CarVehicle car) {
             x = car.transform.position.x;
             y = car.transform.position.y;
@@ -156,10 +204,12 @@ final class CarCameraRig implements AutoCloseable {
             c = Math.cos(car.getHeading());
             s = Math.sin(car.getHeading());
         }
+
         double[] local(double wx, double wy, double wz) {
             double dx = wx - x, dz = wz - z;
             return new double[]{c * dx - s * dz, wy - y, s * dx + c * dz};
         }
+
         double[] world(double lx, double ly, double lz) {
             return new double[]{x + c * lx + s * lz, y + ly,
                     z - s * lx + c * lz};
@@ -244,7 +294,11 @@ final class CarCameraRig implements AutoCloseable {
 
     private static final class OpticalCamera extends Camera {
         double opticalX, opticalY, opticalZ, opticalYaw, opticalPitch;
-        OpticalCamera(GameEngine engine) { super(0, 0, 0, 0, 0, engine); }
+
+        OpticalCamera(GameEngine engine) {
+            super(0, 0, 0, 0, 0, engine);
+        }
+
         @Override public double getViewX() { return opticalX; }
         @Override public double getViewY() { return opticalY; }
         @Override public double getViewZ() { return opticalZ; }

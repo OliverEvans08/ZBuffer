@@ -1,3 +1,4 @@
+
 package mods.car;
 
 import engine.render.Material;
@@ -5,23 +6,46 @@ import objects.GameObject;
 
 import java.awt.Color;
 import java.util.ArrayList;
+import java.util.IdentityHashMap;
+import java.util.List;
+import java.util.Map;
 
+/**
+ * Procedural Tesla models.
+ *
+ * X = left/right
+ * Y = up
+ * +Z = forward
+ *
+ * The driver camera is calibrated to each cabin.
+ * All windows have completely clear openings.
+ * Solid inner wheel housings prevent the tyres
+ * from appearing inside the passenger compartment.
+ */
 final class CarModel {
-    static final double EYE_X = -.44;
-    static final double EYE_Y = 1.285;
-    static final double EYE_Z = -.20;
 
-    private static final double[][] EMPTY_VERTICES = new double[0][3];
-    private static final int[][] EMPTY_FACES = new int[0][3];
+    // Used by CarMod.positionCamera().
+    // Updated when the selected car changes.
+    static volatile double EYE_X = -.42;
+    static volatile double EYE_Y = 1.27;
+    static volatile double EYE_Z = .12;
+
+    private static final double EYE_FORWARD_OF_SEAT = -.10;
+    private static final double ROAD_GAP = .012;
+    private static final int CIRCLE_STEPS = 64;
 
     private static final double[][] CUBE = {
-            {-.5, -.5, -.5}, {.5, -.5, -.5},
-            {.5, .5, -.5}, {-.5, .5, -.5},
-            {-.5, -.5, .5}, {.5, -.5, .5},
-            {.5, .5, .5}, {-.5, .5, .5}
+            {-.5, -.5, -.5},
+            {.5, -.5, -.5},
+            {.5, .5, -.5},
+            {-.5, .5, -.5},
+            {-.5, -.5, .5},
+            {.5, -.5, .5},
+            {.5, .5, .5},
+            {-.5, .5, .5}
     };
 
-    private static final int[][] FACES = {
+    private static final int[][] CUBE_FACES = {
             {0, 2, 1}, {0, 3, 2},
             {4, 5, 6}, {4, 6, 7},
             {0, 4, 7}, {0, 7, 3},
@@ -30,814 +54,2234 @@ final class CarModel {
             {0, 1, 5}, {0, 5, 4}
     };
 
+    private static final Material RED = color(170, 29, 40);
+    private static final Material SILVER = color(167, 180, 192);
+    private static final Material WHITE = color(220, 228, 236);
+    private static final Material BLUE = color(41, 60, 90);
+    private static final Material STEEL = color(150, 162, 171);
+
+    private static final Material BLACK = color(19, 22, 27);
+    private static final Material TRIM = color(48, 54, 62);
+    private static final Material CABIN = color(34, 37, 43);
+    private static final Material SEAT = color(62, 67, 72);
+    private static final Material ALLOY = color(180, 189, 198);
+    private static final Material LIGHT = color(233, 245, 252);
+    private static final Material TAIL = color(220, 32, 43);
+
+    // No solid GLASS material.
+    // Window openings are intentionally left empty.
+
     private final GameObject root;
-    private final ArrayList<GameObject> parts = new ArrayList<>();
+    private final Map<TeslaSpec, Body> cache =
+            new IdentityHashMap<>();
 
-    private final Node[] wheelPivots = new Node[4];
-    private final Node[] wheelRotors = new Node[4];
-    private final Node steering;
+    private Body active;
 
-    private final Part[] sensorDots = new Part[512];
-    private final Part[] laneDots = new Part[120];
-    private final Part[] pathDots = new Part[32];
-    private final Part[][] digits = new Part[3][7];
-    private final Part[] screenOutline = new Part[800];
+    private static final class Body {
+        final Node group;
+        final Node[] pivots = new Node[4];
+        final Node[] rotors = new Node[4];
+        final double wheelRadius;
 
-    private static final int GRID_COLS = 24;
-    private static final int GRID_ROWS = 21;
-    private static final double GRID_X_MIN = -12;
-    private static final double GRID_X_MAX = 12;
-    private static final double GRID_Z_MIN = -2;
-    private static final double GRID_Z_MAX = 36;
-    private static final double BASE_Y = .06;
-    private static final double MAX_RAISE = 2.2;
+        Node steering;
 
-    private final double[] gridX = new double[512];
-    private final double[] gridZ = new double[512];
-    private final double[] currentRaise = new double[512];
-    private final double[] targetRaise = new double[512];
-    private final byte[] cellType = new byte[512];
+        Body(Node group, double wheelRadius) {
+            this.group = group;
+            this.wheelRadius = wheelRadius;
+        }
+    }
 
-    private final CarSurfaceGrid displayGrid = new CarSurfaceGrid();
-    private final Material clearGround = material(65, 210, 130);
-    private final Material unknownGround = material(63, 73, 86);
+    private static final class Shape {
 
-    private long lastMarkerSmooth = System.nanoTime();
+        final double length;
+        final double width;
+        final double halfWidth;
 
-    private final Material paint = material(190, 31, 43);
-    private final Material paintLight = material(218, 44, 54);
-    private final Material black = material(16, 18, 21);
-    private final Material trim = material(42, 44, 48);
-    private final Material leather = material(37, 38, 41);
-    private final Material silver = material(153, 159, 165);
-    private final Material glass = material(26, 40, 49);
-    private final Material white = material(237, 241, 241);
-    private final Material blue = material(58, 148, 220);
-    private final Material amber = material(235, 158, 40);
-    private final Material red = material(235, 48, 48);
+        final double front;
+        final double rear;
+        final double belt;
+        final double base;
 
-    CarModel(GameObject root) {
-        this.root = root;
+        final double wheelRadius;
+        final double frontAxle;
+        final double rearAxle;
 
-        buildShell();
-        buildCabin();
+        final double frontCabinBase;
+        final double rearCabinBase;
 
-        Node column = node(root, "Steering column", -.44, .925, .43);
-        column.transform.rotation.x = Math.toRadians(-12);
+        final boolean truck;
 
-        steering = node(column, "Rotating steering wheel", 0, 0, 0);
+        final double roofY;
+        final double frontRoofZ;
+        final double rearRoofZ;
+        final double rearRoofY;
 
-        for (int i = 0; i < 40; i++) {
-            double angle = i * Math.PI * 2 / 40;
+        final double[] z = new double[9];
+        final double[] widths;
+        final double[] tops;
 
-            Part rim = box(
-                    steering, "Steering rim",
-                    .176 * Math.cos(angle), .166 * Math.sin(angle), 0,
-                    .032, .029, .034, black
+        Shape(TeslaSpec spec) {
+
+            truck =
+                    spec.model == TeslaSpec.Model.CYBERTRUCK;
+
+            boolean suv =
+                    spec.model == TeslaSpec.Model.Y
+                            || spec.model == TeslaSpec.Model.X;
+
+            length = Math.max(3.4, spec.lengthM);
+            width = Math.max(1.5, spec.widthM);
+            halfWidth = width * .5;
+
+            front = length * .5;
+            rear = -front;
+
+            double wheelbase = Math.min(
+                    length - .65,
+                    Math.max(2.0, spec.wheelbaseM)
             );
 
-            rim.transform.rotation.z = angle + Math.PI / 2;
-        }
+            frontAxle = wheelbase * .5;
+            rearAxle = -wheelbase * .5;
 
-        box(steering, "Airbag", 0, -.005, -.008, .135, .092, .047, trim);
-        box(steering, "Left spoke", -.10, -.024, 0, .13, .028, .028, trim);
-        box(steering, "Right spoke", .10, -.024, 0, .13, .028, .028, trim);
-        box(steering, "Lower spoke", 0, -.103, 0, .030, .108, .029, silver);
-        box(steering, "Left scroll wheel", -.11, -.017, -.027,
-                .024, .017, .009, silver);
-        box(steering, "Right scroll wheel", .11, -.017, -.027,
-                .024, .017, .009, silver);
+            wheelRadius = truck
+                    ? .43
+                    : suv
+                    ? .36
+                    : spec.model == TeslaSpec.Model.S
+                    ? .355
+                    : .335;
 
-        buildScreen();
-        buildWheels();
+            base = clamp(
+                    spec.clearanceM + .12,
+                    .19,
+                    wheelRadius * .96
+            );
 
-        for (GameObject part : parts) part.transform.invalidate();
+            belt = truck
+                    ? 1.25
+                    : spec.model == TeslaSpec.Model.X
+                    ? 1.12
+                    : spec.model == TeslaSpec.Model.Y
+                    ? 1.06
+                    : spec.model == TeslaSpec.Model.S
+                    ? .98
+                    : .94;
 
-        for (int i = 0; i < sensorDots.length; i++) {
-            int col = i % GRID_COLS;
-            int row = i / GRID_COLS;
+            frontCabinBase =
+                    front - (truck ? .72 : 1.18);
 
-            if (row >= GRID_ROWS) {
-                gridX[i] = gridZ[i] = currentRaise[i] = targetRaise[i] = 0;
-                continue;
+            rearCabinBase = rear + (
+                    truck
+                            ? 1.35
+                            : spec.model == TeslaSpec.Model.X
+                            ? .70
+                            : .78
+            );
+
+            // Roof geometry is shared with the camera
+            // calculations so the driver stays below it.
+            roofY = truck
+                    ? Math.max(
+                    Math.max(1.64, belt + .48),
+                    spec.heightM - .055
+            )
+                    : Math.max(
+                    belt + .38,
+                    spec.heightM - .055
+            );
+
+            frontRoofZ = truck
+                    ? front - 2.55
+                    : front - (
+                    spec.model == TeslaSpec.Model.Y
+                            ? 1.89
+                            : spec.model == TeslaSpec.Model.X
+                            ? 1.72
+                            : 1.91
+            );
+
+            rearRoofZ = truck
+                    ? rear + 1.42
+                    : rear + (
+                    spec.model == TeslaSpec.Model.X
+                            ? 1.56
+                            : spec.model == TeslaSpec.Model.Y
+                            ? 1.45
+                            : 1.50
+            );
+
+            rearRoofY = truck ? roofY - .16 : roofY;
+
+            double[] positions = {
+                    0, .028, .105, .245, .45,
+                    .69, .885, .971, 1
+            };
+
+            for (int i = 0; i < z.length; i++) {
+                z[i] = rear + length * positions[i];
             }
 
-            double u = col / (double) (GRID_COLS - 1);
-            double v = row / (double) (GRID_ROWS - 1);
+            if (truck) {
+                widths = new double[]{
+                        .91, .96, .99,
+                        1, 1, 1,
+                        .99, .96, .91
+                };
 
-            gridX[i] = GRID_X_MIN + u * (GRID_X_MAX - GRID_X_MIN);
-            gridZ[i] = GRID_Z_MIN + v * (GRID_Z_MAX - GRID_Z_MIN);
-            currentRaise[i] = targetRaise[i] = 0;
+                tops = new double[]{
+                        1.13, 1.20, 1.26,
+                        1.25, 1.25, 1.19,
+                        1.12, 1.05, 1.00
+                };
+            } else {
+
+                double nose =
+                        spec.model == TeslaSpec.Model.X
+                                ? 1.04
+                                : spec.model == TeslaSpec.Model.Y
+                                ? 1.00
+                                : spec.model == TeslaSpec.Model.S
+                                ? .87
+                                : .84;
+
+                double deck =
+                        spec.model == TeslaSpec.Model.X
+                                ? 1.09
+                                : spec.model == TeslaSpec.Model.Y
+                                ? 1.04
+                                : spec.model == TeslaSpec.Model.S
+                                ? .90
+                                : .85;
+
+                widths = new double[]{
+                        .76, .86, .96,
+                        .99, 1, .99,
+                        .96, .88, .77
+                };
+
+                tops = new double[]{
+                        deck - .12,
+                        deck - .05,
+                        deck,
+                        belt,
+                        belt,
+                        belt,
+                        nose,
+                        nose - .03,
+                        nose - .09
+                };
+            }
         }
-    }
 
-    private void buildShell() {
-        box(root, "Battery floor", 0, .245, -.03, 1.62, .19, 3.03, black);
-        box(root, "Cabin floor", 0, .375, -.26, 1.51, .055, 2.72, black);
+        double widthAt(double position) {
+            return sample(widths, position) * halfWidth;
+        }
 
-        double[] zs = {-2.36, -2.12, -1.65, -1.10, -.40, .45, 1.15, 1.80, 2.35};
-        double[] widths = {.70, .84, .915, .90, .89, .89, .915, .85, .71};
-        double[] tops = {.69, .80, .92, .97, .985, .98, .925, .84, .70};
+        double topAt(double position) {
+            return sample(tops, position);
+        }
 
-        for (int side : new int[]{-1, 1}) {
-            for (int i = 0; i < zs.length - 1; i++) {
-                sidePanel(
-                        side, zs[i], zs[i + 1],
-                        widths[i], widths[i + 1], tops[i], tops[i + 1]
-                );
+        private double sample(
+                double[] values,
+                double position
+        ) {
+            if (position <= z[0]) {
+                return values[0];
             }
 
-            box(root, "Side skirt", side * .87, .35, -.02,
-                    .075, .065, 2.65, black);
+            for (int i = 0; i < z.length - 1; i++) {
+                if (position <= z[i + 1]) {
+                    double t =
+                            (position - z[i])
+                                    / (z[i + 1] - z[i]);
 
-            beam(root, "Window belt trim",
-                    side * .845, .98, -1.28,
-                    side * .845, .98, 1.04, .022, black);
+                    t = t * t * (3 - 2 * t);
 
-            beam(root, "A pillar",
-                    side * .80, .95, 1.17,
-                    side * .66, 1.405, .34, .046, trim);
-
-            beam(root, "B pillar",
-                    side * .84, .98, -.35,
-                    side * .665, 1.43, -.40, .039, black);
-
-            beam(root, "C pillar",
-                    side * .80, .95, -1.48,
-                    side * .65, 1.37, -1.03, .072, paint);
-
-            beam(root, "Roof rail",
-                    side * .66, 1.405, .34,
-                    side * .65, 1.37, -1.03, .037, black);
-
-            box(root, "Front flush handle", side * .899, .89, .01,
-                    .018, .022, .155, black);
-            box(root, "Rear flush handle", side * .899, .89, -.91,
-                    .018, .022, .155, black);
-            box(root, "Mirror arm", side * .91, 1.01, .80,
-                    .14, .037, .065, black);
-            box(root, "Mirror shell", side * 1.025, 1.03, .77,
-                    .20, .105, .235, paint);
-            box(root, "Mirror surface", side * 1.025, 1.03, .648,
-                    .16, .071, .008, glass);
-
-            Part lamp = box(root, "Slim front LED",
-                    side * .58, .755, 2.326, .37, .031, .025, white);
-            lamp.transform.rotation.y = side * -.13;
-
-            box(root, "Front corner intake", side * .69, .48, 2.319,
-                    .13, .14, .035, black);
-            box(root, "Rear horizontal lamp", side * .58, .79, -2.333,
-                    .39, .045, .028, red);
-            box(root, "Rear lamp corner", side * .775, .74, -2.27,
-                    .032, .12, .10, red);
-            box(root, "Side camera", side * .909, .86, 1.09,
-                    .023, .047, .10, black);
-
-            for (double axleZ : new double[]{2.875 * .52, -2.875 * .48}) {
-                for (int i = 0; i < 20; i++) {
-                    double a = Math.PI * i / 20;
-                    double b = Math.PI * (i + 1) / 20;
-
-                    beam(root, "Wheel arch",
-                            side * .915, .335 + Math.sin(a) * .395,
-                            axleZ + Math.cos(a) * .395,
-                            side * .915, .335 + Math.sin(b) * .395,
-                            axleZ + Math.cos(b) * .395,
-                            .035, paintLight);
+                    return mix(
+                            values[i],
+                            values[i + 1],
+                            t
+                    );
                 }
             }
+
+            return values[values.length - 1];
         }
 
-        curvedDeck("Hood", 1.10, 2.35, .89, .71, .925, .70, paint);
-        curvedDeck("Rear deck", -2.36, -1.42, .70, .87, .79, .94, paint);
+        double archBottom(double zPosition) {
 
-        box(root, "Front bumper", 0, .49, 2.30, 1.48, .22, .13, paint);
-        box(root, "Front lower intake", 0, .405, 2.375, 1.11, .09, .022, black);
-        box(root, "Front splitter", 0, .32, 2.34, 1.61, .033, .19, black);
-        box(root, "Rear bumper", 0, .48, -2.31, 1.51, .23, .13, paint);
-        box(root, "Rear diffuser", 0, .33, -2.36, 1.38, .10, .16, black);
+            double axle =
+                    Math.abs(zPosition - frontAxle)
+                            < Math.abs(zPosition - rearAxle)
+                            ? frontAxle
+                            : rearAxle;
 
-        Part spoiler = box(root, "Carbon spoiler", 0, .955, -2.13,
-                1.48, .026, .14, black);
-        spoiler.transform.rotation.x = -.10;
+            double dz = zPosition - axle;
+            double r = wheelRadius + .080;
 
-        curvedDeck("Panoramic roof", -1.03, .34, .65, .66, 1.37, 1.405, glass);
-
-        beam(root, "Windscreen top",
-                -.66, 1.405, .34, .66, 1.405, .34, .031, black);
-        beam(root, "Windscreen lower edge",
-                -.80, .95, 1.17, .80, .95, 1.17, .028, trim);
-        box(root, "Front camera housing", 0, 1.355, .39, .12, .055, .095, black);
-    }
-
-    private void sidePanel(
-            int side, double z0, double z1,
-            double width0, double width1, double top0, double top1
-    ) {
-        int slices = 6;
-
-        for (int i = 0; i < slices; i++) {
-            double t0 = i / (double) slices;
-            double t1 = (i + 1) / (double) slices;
-
-            double a = mix(z0, z1, t0);
-            double b = mix(z0, z1, t1);
-            double bottomA = archBottom(a);
-            double bottomB = archBottom(b);
-
-            double xa = side * mix(width0, width1, t0);
-            double xb = side * mix(width0, width1, t1);
-            double ya = mix(top0, top1, t0);
-            double yb = mix(top0, top1, t1);
-            double innerA = xa - side * .045;
-            double innerB = xb - side * .045;
-
-            mesh(root, "Hollow body side", new double[][]{
-                    {xa, bottomA, a}, {innerA, bottomA, a},
-                    {innerA, ya, a}, {xa, ya, a},
-                    {xb, bottomB, b}, {innerB, bottomB, b},
-                    {innerB, yb, b}, {xb, yb, b}
-            }, FACES, paint);
-        }
-    }
-
-    private static double archBottom(double z) {
-        double bottom = .36;
-
-        for (double axle : new double[]{2.875 * .52, -2.875 * .48}) {
-            double distance = Math.abs(z - axle);
-            if (distance < .40) {
-                bottom = Math.max(
-                        bottom, .335 + Math.sqrt(.40 * .40 - distance * distance)
-                );
-            }
-        }
-
-        return bottom;
-    }
-
-    private void curvedDeck(
-            String name, double z0, double z1,
-            double w0, double w1, double y0, double y1, Material material
-    ) {
-        int across = 12;
-        int along = 6;
-
-        double[][] vertices = new double[(across + 1) * (along + 1)][3];
-        int[][] faces = new int[across * along * 4][3];
-        int face = 0;
-
-        for (int j = 0; j <= along; j++) {
-            double t = j / (double) along;
-            double width = mix(w0, w1, t);
-
-            for (int i = 0; i <= across; i++) {
-                double u = i / (double) across * 2 - 1;
-                int k = j * (across + 1) + i;
-                vertices[k][0] = width * u;
-                vertices[k][1] = mix(y0, y1, t) + .035 * (1 - u * u);
-                vertices[k][2] = mix(z0, z1, t);
-            }
-        }
-
-        for (int j = 0; j < along; j++) {
-            for (int i = 0; i < across; i++) {
-                int a = j * (across + 1) + i;
-                int b = a + 1;
-                int c = a + across + 2;
-                int d = a + across + 1;
-
-                faces[face++] = new int[]{a, c, b};
-                faces[face++] = new int[]{a, d, c};
-                faces[face++] = new int[]{a, b, c};
-                faces[face++] = new int[]{a, c, d};
-            }
-        }
-
-        mesh(root, name, vertices, faces, material);
-    }
-
-    private void buildCabin() {
-        box(root, "Dashboard", 0, .89, .98, 1.53, .13, .35, trim);
-        box(root, "Dashboard decor", 0, .91, .796, 1.48, .036, .021, silver);
-        box(root, "Dashboard ambient strip", 0, .936, .786,
-                1.46, .008, .012, blue);
-        box(root, "Lower dashboard", 0, .73, 1.02, 1.49, .16, .18, black);
-        box(root, "Centre console", 0, .60, -.13, .30, .30, 1.36, trim);
-        box(root, "Armrest", 0, .775, -.48, .31, .075, .43, leather);
-
-        Part charger = box(root, "Phone charger", 0, .77, .34,
-                .29, .025, .30, black);
-        charger.transform.rotation.x = -.18;
-
-        for (double x : new double[]{-.075, .075}) {
-            box(root, "Cup recess", x, .76, -.04, .09, .013, .12, black);
-        }
-
-        for (double x : new double[]{-.44, .44}) {
-            box(root, "Sport seat cushion", x, .55, -.29,
-                    .46, .13, .58, leather);
-
-            Part back = box(root, "Sport seat back", x, .91, -.64,
-                    .43, .64, .12, leather);
-            back.transform.rotation.x = -.12;
-
-            box(root, "Sport headrest", x, 1.255, -.68,
-                    .28, .20, .105, leather);
-
-            for (int side : new int[]{-1, 1}) {
-                box(root, "Seat back bolster", x + side * .215, .90, -.585,
-                        .064, .49, .14, trim);
-                box(root, "Cushion bolster", x + side * .215, .605, -.27,
-                        .065, .09, .49, trim);
+            if (Math.abs(dz) >= r) {
+                return base;
             }
 
-            box(root, "Seat centre insert", x, .92, -.565,
-                    .28, .39, .015, trim);
-        }
-
-        box(root, "Rear bench", 0, .57, -1.22, 1.37, .17, .48, leather);
-        box(root, "Rear seat back", 0, .86, -1.51, 1.36, .49, .11, leather);
-
-        for (double x : new double[]{-.46, 0, .46}) {
-            box(root, "Rear headrest", x, 1.16, -1.50,
-                    .23, .18, .10, leather);
-        }
-
-        for (int side : new int[]{-1, 1}) {
-            box(root, "Door card", side * .785, .73, -.25,
-                    .055, .32, 1.39, trim);
-            box(root, "Door armrest", side * .725, .71, -.24,
-                    .105, .055, .54, leather);
-            box(root, "Door ambient strip", side * .749, .916, -.22,
-                    .009, .009, 1.36, blue);
-        }
-
-        box(root, "Rear screen bezel", 0, .73, -.75, .23, .13, .025, black);
-    }
-
-    private void buildScreen() {
-        box(root, "Centre display bezel", .20, 1.055, .71,
-                .447, .270, .025, black);
-        box(root, "Centre display surface", .20, 1.055, .694,
-                .426, .248, .006, trim);
-
-        for (int i = 0; i < sensorDots.length; i++) {
-            sensorDots[i] = marker("Live sensor return", amber);
-        }
-        for (int i = 0; i < laneDots.length; i++) {
-            laneDots[i] = marker("Real lane marking", white);
-        }
-        for (int i = 0; i < pathDots.length; i++) {
-            pathDots[i] = marker("Predicted tyre path", blue);
-        }
-        for (int i = 0; i < screenOutline.length; i++) {
-            screenOutline[i] = marker("Screen outline", white);
-        }
-
-        double[][] segments = {
-                {0, .018, .015, .003},
-                {.008, .009, .003, .015},
-                {.008, -.009, .003, .015},
-                {0, -.018, .015, .003},
-                {-.008, -.009, .003, .015},
-                {-.008, .009, .003, .015},
-                {0, 0, .015, .003}
-        };
-
-        for (int digit = 0; digit < digits.length; digit++) {
-            for (int segment = 0; segment < 7; segment++) {
-                double[] a = segments[segment];
-
-                digits[digit][segment] = box(
-                        root, "Live speed digit",
-                        .028 + digit * .025 + a[0],
-                        1.145 + a[1], .674,
-                        a[2], a[3], .003, white
-                );
-            }
+            return Math.max(
+                    base,
+                    wheelRadius + Math.sqrt(
+                            Math.max(0, r * r - dz * dz)
+                    )
+            );
         }
     }
 
-    private Part marker(String name, Material material) {
-        return box(root, name, .20, 1.02, .681,
-                .000001, .000001, .003, material);
+    CarModel(GameObject root) {
+        this(root, TeslaSpec.DEFAULT);
     }
 
-    private void buildWheels() {
-        for (int i = 0; i < 4; i++) {
-            wheelPivots[i] = node(root, "Wheel steering/suspension", 0, 0, 0);
-            wheelRotors[i] = node(wheelPivots[i], "Wheel rotation", 0, 0, 0);
-
-            double width = i < 2 ? .235 : .275;
-            double radius = i < 2 ? .33625 : .3365;
-
-            cylinder(wheelRotors[i], "Tyre", radius, width, black);
-            cylinder(wheelRotors[i], "Alloy wheel", .253, width + .004, trim);
-
-            double outside = (i % 2 == 0 ? -1 : 1) * (width * .5 + .012);
-
-            for (int spoke = 0; spoke < 10; spoke++) {
-                double angle = spoke * Math.PI * 2 / 10;
-
-                Part blade = box(
-                        wheelRotors[i], "Performance alloy spoke",
-                        outside, .145 * Math.cos(angle), .145 * Math.sin(angle),
-                        .017, .186, .027, silver
-                );
-
-                blade.transform.rotation.x = angle;
-            }
-
-            box(wheelRotors[i], "Wheel centre cap", outside, 0, 0,
-                    .024, .09, .09, black);
-            box(wheelPivots[i], "Red brake caliper", outside * .90, 0, -.17,
-                    .040, .135, .065, red);
+    CarModel(GameObject root, TeslaSpec initial) {
+        if (root == null) {
+            throw new IllegalArgumentException("root is null");
         }
+
+        this.root = root;
+        setConfiguration(initial);
+    }
+
+    void setConfiguration(TeslaSpec selected) {
+
+        if (selected == null) {
+            selected = TeslaSpec.DEFAULT;
+        }
+
+        Shape cabin = new Shape(selected);
+
+        // Camera is centred over the actual driver seat.
+        EYE_X = -cabin.halfWidth * .43;
+
+        // Cabin-relative eye height, not one height
+        // shared across every vehicle model.
+        EYE_Y = driverEyeY(cabin);
+
+        // Driver sits behind the windshield and
+        // slightly forward of the seat backrest.
+        EYE_Z = driverEyeZ(cabin);
+
+        Body next = cache.get(selected);
+
+        if (next == null) {
+            next = build(selected);
+            cache.put(selected, next);
+        }
+
+        if (next == active) {
+            return;
+        }
+
+        if (active != null) {
+            setVisibility(active.group, false);
+        }
+
+        active = next;
+        setVisibility(active.group, true);
     }
 
     void animate(
-            double steeringAngle, double[] wheelX, double[] wheelZ,
-            double[] travel, double[] wheelAngles, double[] spin
+            double steeringAngle,
+            double[] wheelX,
+            double[] wheelZ,
+            double[] travel,
+            double[] wheelAngles,
+            double[] spin
     ) {
-        steering.transform.rotation.z = -steeringAngle * 12.0;
-        steering.transform.invalidate();
+
+        if (active == null) {
+            return;
+        }
+
+        if (active.steering != null
+                && Double.isFinite(steeringAngle)) {
+
+            active.steering.transform.rotation.z =
+                    clamp(
+                            -steeringAngle * 9.0,
+                            -2.35,
+                            2.35
+                    );
+
+            active.steering.transform.invalidate();
+        }
 
         for (int i = 0; i < 4; i++) {
-            Node pivot = wheelPivots[i];
 
-            pivot.transform.position.x = wheelX[i];
-            pivot.transform.position.y = .60 - travel[i];
-            pivot.transform.position.z = wheelZ[i];
-            pivot.transform.rotation.y = wheelAngles[i];
+            Node pivot = active.pivots[i];
+            Node rotor = active.rotors[i];
+
+            if (pivot == null || rotor == null) {
+                continue;
+            }
+
+            if (valid(wheelX, i)) {
+                pivot.transform.position.x = wheelX[i];
+            }
+
+            if (valid(wheelZ, i)) {
+                pivot.transform.position.z = wheelZ[i];
+            }
+
+            if (valid(travel, i)) {
+                pivot.transform.position.y = Math.max(
+                        active.wheelRadius + ROAD_GAP,
+                        active.wheelRadius + ROAD_GAP - travel[i]
+                );
+            }
+
+            if (valid(wheelAngles, i)) {
+                pivot.transform.rotation.y = wheelAngles[i];
+            }
+
             pivot.transform.invalidate();
 
-            wheelRotors[i].transform.rotation.x = spin[i];
-            wheelRotors[i].transform.invalidate();
+            if (valid(spin, i)) {
+                rotor.transform.rotation.x = spin[i];
+                rotor.transform.invalidate();
+            }
         }
-
-        smoothWaveHeights();
     }
 
-    void updateDisplay(CarPerception.Snapshot state) {
-        displayGrid.integrate(state);
+    void updateDisplay(CarPerception.Snapshot ignored) {
+        // Sensor overlays are drawn by CarFsdWindow.
+    }
 
-        double cosine = Math.cos(state.poseHeading);
-        double sine = Math.sin(state.poseHeading);
+    private Body build(TeslaSpec spec) {
 
-        for (int i = 0; i < sensorDots.length; i++) {
-            CarSurfaceGrid.Surface surface = displayGrid.surface(
-                    state.poseX + cosine * gridX[i] + sine * gridZ[i],
-                    state.poseZ - sine * gridX[i] + cosine * gridZ[i]
-            );
+        Shape s = new Shape(spec);
 
-            cellType[i] = (byte) surface.type();
-            targetRaise[i] = surface.type() == 2 ? .65 : 0;
+        boolean truck =
+                spec.model == TeslaSpec.Model.CYBERTRUCK;
+
+        Material paint = truck
+                ? STEEL
+                : spec.model == TeslaSpec.Model.S
+                ? SILVER
+                : spec.model == TeslaSpec.Model.Y
+                ? WHITE
+                : spec.model == TeslaSpec.Model.X
+                ? BLUE
+                : RED;
+
+        Node group = node(
+                root,
+                spec.fullName(),
+                0, 0, 0
+        );
+
+        Body body = new Body(group, s.wheelRadius);
+
+        buildShell(group, s, paint);
+
+        if (truck) {
+            buildTruckCabin(group, s);
+        } else {
+            buildClearCabin(group, spec, s, paint);
         }
 
-        int used = 0;
+        buildLighting(group, spec, s);
+        buildExteriorDetails(group, spec, s, paint);
+        buildInterior(group, body, s, spec);
+        buildWheels(group, body, s, spec);
 
-        for (double[] lane : state.lanes) {
-            for (int i = 0; i + 3 < lane.length; i += 2) {
-                double dx = lane[i + 2] - lane[i];
-                double dz = lane[i + 3] - lane[i + 1];
+        // After installing the wheels, seal the inner
+        // wheel arches and lower passenger doors.
+        buildInnerWheelWells(group, s);
 
-                int steps = Math.min(
-                        256, Math.max(1, (int) Math.ceil(Math.hypot(dx, dz)))
+        return body;
+    }
+
+    private void buildShell(
+            Node group,
+            Shape s,
+            Material paint
+    ) {
+
+        MeshBuilder shell = new MeshBuilder();
+        final int steps = 120;
+
+        for (int i = 0; i < steps; i++) {
+
+            double z0 = mix(
+                    s.rear, s.front, (double) i / steps
+            );
+
+            double z1 = mix(
+                    s.rear, s.front, (double) (i + 1) / steps
+            );
+
+            double w0 = s.widthAt(z0);
+            double w1 = s.widthAt(z1);
+
+            double t0 = s.topAt(z0);
+            double t1 = s.topAt(z1);
+
+            double b0 = Math.min(
+                    t0 - .075, s.archBottom(z0)
+            );
+
+            double b1 = Math.min(
+                    t1 - .075, s.archBottom(z1)
+            );
+
+            double m0 = mix(b0, t0, .44);
+            double m1 = mix(b1, t1, .44);
+
+            double h0 = t0 - .052;
+            double h1 = t1 - .052;
+
+            for (int side : new int[]{-1, 1}) {
+
+                shell.panel(
+                        side * w0 * .91, b0, z0,
+                        side * w1 * .91, b1, z1,
+                        side * w1, m1, z1,
+                        side * w0, m0, z0
                 );
 
-                for (int k = 0; k <= steps && used < laneDots.length; k++) {
-                    double t = k / (double) steps;
-                    double x = lane[i] + dx * t;
-                    double z = lane[i + 1] + dz * t;
-                    placeProjected(laneDots[used++], x, .04, z, .0028);
+                shell.panel(
+                        side * w0, m0, z0,
+                        side * w1, m1, z1,
+                        side * w1 * .977, h1, z1,
+                        side * w0 * .977, h0, z0
+                );
+
+                shell.panel(
+                        side * w0 * .977, h0, z0,
+                        side * w1 * .977, h1, z1,
+                        side * w1 * .85, t1, z1,
+                        side * w0 * .85, t0, z0
+                );
+            }
+
+            boolean cabin =
+                    (z0 + z1) * .5 > s.rearCabinBase
+                            && (z0 + z1) * .5 < s.frontCabinBase;
+
+            if (cabin) {
+                for (int side : new int[]{-1, 1}) {
+
+                    shell.panel(
+                            side * w0 * .85, t0, z0,
+                            side * w1 * .85, t1, z1,
+                            side * w1 * .73, t1, z1,
+                            side * w0 * .73, t0, z0
+                    );
+                }
+            } else {
+                shell.panel(
+                        -w0 * .85, t0, z0,
+                        w0 * .85, t0, z0,
+                        w1 * .85, t1, z1,
+                        -w1 * .85, t1, z1
+                );
+            }
+        }
+
+        shell.finish(
+                group,
+                "Sculpted metal shell with open wheel arches",
+                paint
+        );
+
+        box(
+                group, "Battery protection",
+                0, s.base + .016, 0,
+                s.width * .69, .065, s.length * .73,
+                BLACK
+        );
+
+        box(
+                group, "Front bumper",
+                0, (s.topAt(s.front) + s.base) * .5,
+                s.front - .055,
+                s.widthAt(s.front) * 1.93,
+                s.topAt(s.front) - s.base, .11,
+                paint
+        );
+
+        box(
+                group, "Rear bumper",
+                0, (s.topAt(s.rear) + s.base) * .5,
+                s.rear + .055,
+                s.widthAt(s.rear) * 1.93,
+                s.topAt(s.rear) - s.base, .11,
+                paint
+        );
+
+        box(
+                group, "Front black splitter",
+                0, s.base + .048, s.front + .004,
+                s.widthAt(s.front) * 1.77,
+                .073, .08,
+                BLACK
+        );
+
+        box(
+                group, "Rear diffuser",
+                0, s.base + .048, s.rear - .004,
+                s.widthAt(s.rear) * 1.77,
+                .073, .08,
+                BLACK
+        );
+
+        for (int side : new int[]{-1, 1}) {
+
+            double from =
+                    s.rearAxle + s.wheelRadius + .11;
+
+            double to =
+                    s.frontAxle - s.wheelRadius - .11;
+
+            for (int j = 0; j < 24; j++) {
+
+                double z0 = mix(from, to, j / 24.0);
+                double z1 = mix(
+                        from, to, (j + 1) / 24.0
+                );
+
+                beam(
+                        group, "Integrated sill moulding",
+                        side * s.widthAt(z0) * .934,
+                        s.base + .048, z0,
+                        side * s.widthAt(z1) * .934,
+                        s.base + .048, z1,
+                        .025, BLACK
+                );
+            }
+
+            for (double axle : new double[]{
+                    s.rearAxle, s.frontAxle
+            }) {
+
+                double radius = s.wheelRadius + .082;
+                double lastZ = axle + radius;
+                double lastY = s.wheelRadius;
+
+                for (int j = 1; j <= 24; j++) {
+
+                    double angle = Math.PI * j / 24;
+                    double z =
+                            axle + radius * Math.cos(angle);
+
+                    double y =
+                            s.wheelRadius
+                                    + radius * Math.sin(angle);
+
+                    double x =
+                            side * (
+                                    s.widthAt(axle) * .970 + .007
+                            );
+
+                    beam(
+                            group, "Wheel-arch edge",
+                            x, lastY, lastZ,
+                            x, y, z,
+                            .018, TRIM
+                    );
+
+                    lastY = y;
+                    lastZ = z;
                 }
             }
+        }
+    }
 
-            if (used >= laneDots.length) break;
+    /**
+     * Prevent tyres from being rendered through the
+     * cabin's interior, footwell and lower door panels.
+     *
+     * These are opaque body panels below the windows.
+     * The side and rear window openings remain clear.
+     */
+    private void buildInnerWheelWells(Node group, Shape s) {
+
+        double floor = .24;
+
+        double top = Math.max(
+                s.belt - .025,
+                s.wheelRadius * 2 + .13
+        );
+
+        double cabinZ =
+                (s.rearCabinBase + s.frontCabinBase) * .5;
+
+        double cabinDepth =
+                s.frontCabinBase - s.rearCabinBase;
+
+        for (int side : new int[]{-1, 1}) {
+
+            // Opaque inner metal door below the window.
+            box(
+                    group, "Inside lower door and kick panel",
+                    side * s.halfWidth * .77,
+                    (floor + s.belt - .015) * .5,
+                    cabinZ,
+                    .075,
+                    s.belt - .015 - floor,
+                    cabinDepth + .10,
+                    CABIN
+            );
+
+            for (double axle : new double[]{
+                    s.frontAxle, s.rearAxle
+            }) {
+
+                double tyreWidth =
+                        s.truck ? .32 : .28;
+
+                double wheelX =
+                        s.widthAt(axle) - tyreWidth * .47;
+
+                double innerX = side * (
+                        wheelX - tyreWidth * .58 - .06
+                );
+
+                double span = s.wheelRadius + .17;
+
+                // Vertical housing hides the tyre sidewall.
+                box(
+                        group, "Closed inner wheel housing",
+                        innerX,
+                        (floor + top) * .5,
+                        axle,
+                        .11,
+                        top - floor,
+                        2 * span,
+                        CABIN
+                );
+
+                // Upper housing hides the rotating tyre
+                // when looking down through the cabin.
+                box(
+                        group, "Inner wheel housing upper cover",
+                        side * (
+                                wheelX - tyreWidth * .45
+                        ),
+                        top - .025,
+                        axle,
+                        tyreWidth + .17,
+                        .065,
+                        2 * span,
+                        CABIN
+                );
+            }
         }
 
-        while (used < laneDots.length) hide(laneDots[used++]);
+        // Separates the passenger footwell from
+        // the front wheels and engine compartment.
+        box(
+                group, "Front cabin firewall",
+                0,
+                (floor + s.belt) * .5,
+                s.frontCabinBase - .055,
+                s.width * .75,
+                s.belt - floor,
+                .12,
+                CABIN
+        );
+    }
 
-        double direction = state.signedSpeed < -.15 ? -1 : 1;
-        double curvature = Math.tan(state.steering) / 2.875;
+    /**
+     * Model S, 3, X and Y cabin.
+     *
+     * Windshield, side windows and rear window:
+     * NO dark solid polygons are created.
+     *
+     * Only the pillars, seals, frame and roof
+     * are rendered, allowing visibility outside.
+     */
+    private void buildClearCabin(
+            Node group,
+            TeslaSpec spec,
+            Shape s,
+            Material paint
+    ) {
 
-        for (int i = 0; i < pathDots.length; i++) {
-            double distance = (i / 2 + 1) * .85 * direction;
-            double angle = distance * curvature;
+        boolean modelX = spec.model == TeslaSpec.Model.X;
+        boolean modelY = spec.model == TeslaSpec.Model.Y;
 
-            double x = Math.abs(curvature) < 1e-7
-                    ? 0 : (1 - Math.cos(angle)) / curvature;
-            double z = Math.abs(curvature) < 1e-7
-                    ? distance : Math.sin(angle) / curvature;
-            double side = (i % 2 == 0 ? -1 : 1) * .79;
+        double roofY = s.roofY;
+        double frontRoofZ = s.frontRoofZ;
+        double rearRoofZ = s.rearRoofZ;
 
-            placeProjected(
-                    pathDots[i], x + side * Math.cos(angle), .08,
-                    z - side * Math.sin(angle), .0026
+        double frontBaseZ = s.frontCabinBase;
+        double rearBaseZ = s.rearCabinBase;
+
+        double frontY = s.topAt(frontBaseZ) + .014;
+        double rearY = s.topAt(rearBaseZ) + .014;
+
+        double frontX = s.widthAt(frontBaseZ) * .85;
+        double rearX = s.widthAt(rearBaseZ) * .85;
+        double roofX = s.halfWidth * .725;
+
+        beam(
+                group, "Windshield bottom seal",
+                -frontX, frontY, frontBaseZ,
+                frontX, frontY, frontBaseZ,
+                .034, BLACK
+        );
+
+        beam(
+                group, "Windshield header",
+                -roofX, roofY, frontRoofZ,
+                roofX, roofY, frontRoofZ,
+                .046, BLACK
+        );
+
+        beam(
+                group, "Rear glass bottom seal",
+                -rearX, rearY, rearBaseZ,
+                rearX, rearY, rearBaseZ,
+                .036, BLACK
+        );
+
+        beam(
+                group, "Rear glass header",
+                -roofX, roofY, rearRoofZ,
+                roofX, roofY, rearRoofZ,
+                .047, BLACK
+        );
+
+        for (int side : new int[]{-1, 1}) {
+
+            beam(
+                    group, "Integrated A-pillar",
+                    side * frontX, frontY, frontBaseZ,
+                    side * roofX, roofY, frontRoofZ,
+                    .074, paint
+            );
+
+            beam(
+                    group, "Integrated C-pillar",
+                    side * rearX, rearY, rearBaseZ,
+                    side * roofX, roofY, rearRoofZ,
+                    .092, paint
+            );
+
+            double previousZ = rearRoofZ;
+            double previousY = roofY;
+
+            for (int i = 1; i <= 20; i++) {
+
+                double t = i / 20.0;
+                double z = mix(
+                        rearRoofZ, frontRoofZ, t
+                );
+
+                double y =
+                        roofY + .018 * Math.sin(Math.PI * t);
+
+                beam(
+                        group, "Curved panoramic roof rail",
+                        side * roofX, previousY, previousZ,
+                        side * roofX, y, z,
+                        .048, BLACK
+                );
+
+                previousZ = z;
+                previousY = y;
+            }
+
+            beam(
+                    group, "Side window sill",
+                    side * rearX, rearY, rearBaseZ,
+                    side * frontX, frontY, frontBaseZ,
+                    .032, TRIM
+            );
+
+            double t = .52;
+
+            double lowerZ = mix(
+                    rearBaseZ, frontBaseZ, t
+            );
+
+            double upperZ = mix(
+                    rearRoofZ, frontRoofZ, t
+            );
+
+            double lowerY = mix(rearY, frontY, t);
+            double lowerX = mix(rearX, frontX, t);
+
+            beam(
+                    group,
+                    "B-pillar attached to roof and door",
+                    side * lowerX, lowerY, lowerZ,
+                    side * roofX, roofY + .018, upperZ,
+                    .047, BLACK
+            );
+
+            // Intentionally no solid side glass.
+            // The outside world remains visible.
+        }
+
+        if (modelX || modelY) {
+
+            double crossZ = mix(
+                    rearRoofZ, frontRoofZ, .47
+            );
+
+            beam(
+                    group, "Panoramic roof brace",
+                    -roofX, roofY + .018, crossZ,
+                    roofX, roofY + .018, crossZ,
+                    .037, BLACK
             );
         }
 
-        drawScreenOutline();
+        // No windshield or rear glass mesh.
 
-        int speed = Math.max(0, Math.min(999, (int) Math.round(state.speed)));
-        int[] values = {speed / 100, speed / 10 % 10, speed % 10};
-        int[] masks = {
-                0x3F, 0x06, 0x5B, 0x4F, 0x66,
-                0x6D, 0x7D, 0x07, 0x7F, 0x6F
-        };
+        box(
+                group, "Front roof header",
+                0, roofY - .016, frontRoofZ,
+                roofX * 2, .05, .07,
+                paint
+        );
 
-        for (int digit = 0; digit < 3; digit++) {
-            boolean leading = digit == 0 && speed < 100
-                    || digit == 1 && speed < 10;
+        box(
+                group, "Rear roof header",
+                0, roofY - .016, rearRoofZ,
+                roofX * 2, .05, .07,
+                paint
+        );
+    }
 
-            for (int segment = 0; segment < 7; segment++) {
-                digits[digit][segment].setMaterial(
-                        !leading && (masks[values[digit]] & (1 << segment)) != 0
-                                ? white : trim
+    /**
+     * Cybertruck cabin.
+     *
+     * The actual roof is metal, but every window
+     * opening is fully clear.
+     */
+    private void buildTruckCabin(
+            Node group,
+            Shape s
+    ) {
+
+        double roofY = s.roofY;
+        double peakZ = s.frontRoofZ;
+
+        double rearRoofZ = s.rearRoofZ;
+        double rearRoofY = s.rearRoofY;
+
+        double frontBaseZ = s.frontCabinBase;
+        double rearBaseZ = rearRoofZ - .22;
+
+        double frontY =
+                s.topAt(frontBaseZ) + .016;
+
+        double rearY =
+                s.topAt(rearBaseZ) + .016;
+
+        double frontX =
+                s.widthAt(frontBaseZ) * .85;
+
+        double rearX =
+                s.widthAt(rearBaseZ) * .85;
+
+        double roofX = s.halfWidth * .775;
+
+        quad(
+                group, "Folded stainless roof",
+                -roofX, rearRoofY, rearRoofZ,
+                roofX, rearRoofY, rearRoofZ,
+                roofX, roofY, peakZ,
+                -roofX, roofY, peakZ,
+                STEEL
+        );
+
+        quad(
+                group, "Attached vault tonneau",
+
+                -s.widthAt(s.rear + .15) * .83,
+                s.topAt(s.rear + .15) + .014,
+                s.rear + .15,
+
+                s.widthAt(s.rear + .15) * .83,
+                s.topAt(s.rear + .15) + .014,
+                s.rear + .15,
+
+                s.widthAt(rearBaseZ) * .83,
+                s.topAt(rearBaseZ) + .014,
+                rearBaseZ,
+
+                -s.widthAt(rearBaseZ) * .83,
+                s.topAt(rearBaseZ) + .014,
+                rearBaseZ,
+
+                STEEL
+        );
+
+        beam(
+                group, "Truck windshield lower seal",
+                -frontX, frontY, frontBaseZ,
+                frontX, frontY, frontBaseZ,
+                .038, BLACK
+        );
+
+        beam(
+                group, "Truck windshield upper seal",
+                -roofX, roofY, peakZ,
+                roofX, roofY, peakZ,
+                .044, BLACK
+        );
+
+        for (int side : new int[]{-1, 1}) {
+
+            beam(
+                    group, "Truck A-pillar",
+                    side * frontX, frontY, frontBaseZ,
+                    side * roofX, roofY, peakZ,
+                    .077, STEEL
+            );
+
+            beam(
+                    group, "Truck sloping roof rail",
+                    side * roofX, roofY, peakZ,
+                    side * roofX, rearRoofY, rearRoofZ,
+                    .069, STEEL
+            );
+
+            beam(
+                    group, "Truck C-pillar",
+                    side * roofX, rearRoofY, rearRoofZ,
+                    side * rearX, rearY, rearBaseZ,
+                    .085, STEEL
+            );
+
+            beam(
+                    group, "Truck window sill",
+                    side * frontX, frontY, frontBaseZ,
+                    side * rearX, rearY, rearBaseZ,
+                    .040, BLACK
+            );
+
+            double middleZ = mix(
+                    rearBaseZ, frontBaseZ, .52
+            );
+
+            double middleY = mix(rearY, frontY, .52);
+            double middleX = mix(rearX, frontX, .52);
+
+            beam(
+                    group, "Truck B-pillar",
+                    side * middleX, middleY, middleZ,
+                    side * roofX,
+                    mix(rearRoofY, roofY, .52),
+                    mix(rearRoofZ, peakZ, .52),
+                    .055, BLACK
+            );
+
+            // The truck side window remains clear.
+        }
+
+        beam(
+                group, "Truck rear roof header",
+                -roofX, rearRoofY, rearRoofZ,
+                roofX, rearRoofY, rearRoofZ,
+                .055, STEEL
+        );
+
+        // The rear window also remains clear.
+    }
+
+    private void buildLighting(
+            Node group,
+            TeslaSpec spec,
+            Shape s
+    ) {
+
+        boolean bar =
+                spec.model == TeslaSpec.Model.CYBERTRUCK
+                        || spec.model == TeslaSpec.Model.Y;
+
+        double frontY = s.topAt(s.front) - .085;
+        double rearY = s.topAt(s.rear) - .085;
+
+        double nose = s.widthAt(s.front);
+        double tail = s.widthAt(s.rear);
+
+        if (bar) {
+
+            box(
+                    group, "Flush front LED bar",
+                    0, frontY, s.front + .008,
+                    nose * 1.67, .036, .024,
+                    LIGHT
+            );
+
+            box(
+                    group, "Flush rear LED bar",
+                    0, rearY, s.rear - .008,
+                    tail * 1.67, .045, .024,
+                    TAIL
+            );
+
+        } else {
+
+            for (int side : new int[]{-1, 1}) {
+
+                box(
+                        group, "Recessed headlamp",
+                        side * nose * .48,
+                        frontY,
+                        s.front + .008,
+                        nose * .57, .066, .024,
+                        LIGHT
+                );
+
+                box(
+                        group, "Recessed tail lamp",
+                        side * tail * .48,
+                        rearY,
+                        s.rear - .008,
+                        tail * .57, .071, .024,
+                        TAIL
                 );
             }
         }
     }
 
-    private void smoothWaveHeights() {
-        long now = System.nanoTime();
-        double dt = (now - lastMarkerSmooth) * 1e-9;
-        lastMarkerSmooth = now;
+    private void buildExteriorDetails(
+            Node group,
+            TeslaSpec spec,
+            Shape s,
+            Material paint
+    ) {
 
-        if (dt <= 0 || dt > .25) dt = .016;
+        boolean truck =
+                spec.model == TeslaSpec.Model.CYBERTRUCK;
 
-        double alpha = 1 - Math.exp(-6.5 * dt);
+        double frontDoorZ =
+                s.frontCabinBase - .62;
 
-        for (int i = 0; i < sensorDots.length; i++) {
-            if (i / GRID_COLS >= GRID_ROWS) {
-                hide(sensorDots[i]);
-                continue;
+        double rearDoorZ =
+                s.rearCabinBase + .58;
+
+        double seamZ = mix(
+                rearDoorZ, frontDoorZ, .50
+        );
+
+        for (int side : new int[]{-1, 1}) {
+
+            for (double z : new double[]{
+                    frontDoorZ, rearDoorZ
+            }) {
+
+                box(
+                        group, "Recessed flush door handle",
+                        side * (
+                                s.widthAt(z) * .980 + .012
+                        ),
+                        s.belt - .13,
+                        z,
+                        .024, .026, .16,
+                        truck ? STEEL : TRIM
+                );
             }
 
-            currentRaise[i] += (targetRaise[i] - currentRaise[i]) * alpha;
-
-            double[] projected = projectToScreen(
-                    gridX[i], BASE_Y + currentRaise[i], gridZ[i]
+            beam(
+                    group, "Door shut line",
+                    side * s.widthAt(seamZ) * .978,
+                    s.base + .09, seamZ,
+                    side * s.widthAt(seamZ) * .978,
+                    s.belt - .048, seamZ,
+                    .009, TRIM
             );
 
-            Part marker = sensorDots[i];
+            double mirrorZ =
+                    s.frontCabinBase - .045;
 
-            if (projected == null) {
-                hide(marker);
-                continue;
-            }
+            double x = s.widthAt(mirrorZ);
 
-            marker.setMaterial(
-                    cellType[i] == 2 ? red
-                            : cellType[i] == 1 ? clearGround
-                            : cellType[i] == 3 ? amber : unknownGround
+            beam(
+                    group, "Mirror mounting arm",
+                    side * x * .96,
+                    s.belt + .035, mirrorZ,
+                    side * (x + .165),
+                    s.belt + .085, mirrorZ,
+                    .038, BLACK
             );
 
-            double size = .0032 + Math.min(.004, currentRaise[i] * .0018);
+            box(
+                    group, "Aerodynamic side mirror",
+                    side * (x + .195),
+                    s.belt + .105,
+                    mirrorZ,
+                    .21, .105, .20,
+                    truck ? BLACK : paint
+            );
 
-            marker.transform.position.x = projected[0];
-            marker.transform.position.y = projected[1];
-            marker.transform.position.z = .681;
-            marker.transform.scale.x = size;
-            marker.transform.scale.y = size;
-            marker.transform.invalidate();
+            box(
+                    group, "Reflective mirror face",
+                    side * (x + .195),
+                    s.belt + .106,
+                    mirrorZ - .101,
+                    .175, .075, .008,
+                    ALLOY
+            );
+
+            double cameraZ = mirrorZ - .30;
+
+            box(
+                    group, "Fender camera (flush)",
+                    side * (
+                            s.widthAt(cameraZ) * .978 + .012
+                    ),
+                    s.belt - .15,
+                    cameraZ,
+                    .025, .036, .068,
+                    BLACK
+            );
+        }
+
+        if (spec.type == TeslaSpec.Type.PERFORMANCE
+                && !truck) {
+
+            double z = s.rear + .17;
+
+            box(
+                    group, "Integrated deck spoiler",
+                    0, s.topAt(z) + .025, z,
+                    s.widthAt(z) * 1.58,
+                    .045, .15,
+                    BLACK
+            );
+        }
+
+        if (truck) {
+
+            box(
+                    group, "Truck integrated front bumper",
+                    0, s.base + .14, s.front + .011,
+                    s.widthAt(s.front) * 1.88,
+                    .18, .080,
+                    BLACK
+            );
+
+            box(
+                    group, "Truck rear step bumper",
+                    0, s.base + .09, s.rear - .035,
+                    s.widthAt(s.rear) * 1.84,
+                    .13, .105,
+                    BLACK
+            );
         }
     }
 
-    private void drawScreenOutline() {
-        int count = 0;
-        double halfWidth = 1.05;
-        double halfLength = 2.15;
-        double y = .55;
-        int pointsPerSide = 160;
-
-        for (int i = 0; i < pointsPerSide && count < screenOutline.length; i++) {
-            double t = i / (double) (pointsPerSide - 1);
-            double x = -halfWidth + t * 2 * halfWidth;
-            screenOutline[count].setMaterial(white);
-            placeProjected(screenOutline[count++], x, y, halfLength, .0009);
-        }
-
-        for (int i = 0; i < pointsPerSide && count < screenOutline.length; i++) {
-            double t = i / (double) (pointsPerSide - 1);
-            double z = halfLength - t * 2 * halfLength;
-            screenOutline[count].setMaterial(white);
-            placeProjected(screenOutline[count++], halfWidth, y, z, .0009);
-        }
-
-        for (int i = 0; i < pointsPerSide && count < screenOutline.length; i++) {
-            double t = i / (double) (pointsPerSide - 1);
-            double x = halfWidth - t * 2 * halfWidth;
-            screenOutline[count].setMaterial(white);
-            placeProjected(screenOutline[count++], x, y, -halfLength, .0009);
-        }
-
-        for (int i = 0; i < pointsPerSide && count < screenOutline.length; i++) {
-            double t = i / (double) (pointsPerSide - 1);
-            double z = -halfLength + t * 2 * halfLength;
-            screenOutline[count].setMaterial(white);
-            placeProjected(screenOutline[count++], -halfWidth, y, z, .0009);
-        }
-
-        while (count < screenOutline.length) hide(screenOutline[count++]);
-    }
-
-    private double[] projectToScreen(double lx, double ly, double lz) {
-        // Full-grid orthographic projection; nearby cells no longer disappear
-        // below the display because of the old perspective division.
-        double screenX = .20 + lx * .012;
-        double screenY = .963 + (lz + 2) * .0044
-                + Math.min(2.2, Math.max(0, ly)) * .002;
-
-        if (screenX < .025 || screenX > .375
-                || screenY < .945 || screenY > 1.145) {
-            return null;
-        }
-
-        return new double[]{screenX, screenY};
-    }
-
-    private boolean placeProjected(
-            Part marker, double lx, double ly, double lz, double size
+    private void buildInterior(
+            Node group,
+            Body body,
+            Shape s,
+            TeslaSpec spec
     ) {
-        double[] projected = projectToScreen(lx, ly, lz);
 
-        if (projected == null) {
-            hide(marker);
-            return false;
+        boolean truck =
+                spec.model == TeslaSpec.Model.CYBERTRUCK;
+
+        double cabinCenter =
+                (s.rearCabinBase + s.frontCabinBase) * .5;
+
+        double cabinDepth =
+                s.frontCabinBase - s.rearCabinBase;
+
+        // Dashboard position is also used to calculate
+        // the driver seat position.
+        double dashboardZ = dashboardZ(s);
+
+        box(
+                group, "Interior floor pan",
+                0, .33, cabinCenter,
+                s.width * .73,
+                .09,
+                cabinDepth + .08,
+                CABIN
+        );
+
+        double dashY =
+                truck ? s.belt - .08 : s.belt - .115;
+
+        box(
+                group, "Full-width dashboard",
+                0, dashY, dashboardZ,
+                s.width * .76,
+                truck ? .22 : .19,
+                .34,
+                CABIN
+        );
+
+        beam(
+                group, "Dash upper padded edge",
+                -s.width * .36,
+                s.belt - .014,
+                dashboardZ - .16,
+                s.width * .36,
+                s.belt - .014,
+                dashboardZ - .16,
+                .043, TRIM
+        );
+
+        double frontSeatZ = frontSeatZ(s);
+
+        double seatCushionY = truck ? .72 : .56;
+        double seatBackY = truck ? 1.08 : .92;
+        double seatHeadY = truck ? 1.38 : 1.23;
+
+        double seatBackZOff = truck ? -.22 : -.24;
+        double seatHeadZOff = truck ? -.27 : -.29;
+
+        for (int side : new int[]{-1, 1}) {
+
+            double x = side * s.halfWidth * .43;
+
+            box(
+                    group, "Front seat rail",
+                    x, seatCushionY - .155, frontSeatZ,
+                    .32, .085, .60,
+                    TRIM
+            );
+
+            box(
+                    group, "Contoured front cushion",
+                    x, seatCushionY, frontSeatZ,
+                    .45, .17, .57,
+                    SEAT
+            );
+
+            box(
+                    group, "Contoured front backrest",
+                    x, seatBackY,
+                    frontSeatZ + seatBackZOff,
+                    .44,
+                    truck ? .68 : .60,
+                    .16,
+                    SEAT
+            );
+
+            box(
+                    group, "Padded front headrest",
+                    x, seatHeadY,
+                    frontSeatZ + seatHeadZOff,
+                    .29, .20, .15,
+                    SEAT
+            );
         }
 
-        marker.transform.position.x = projected[0];
-        marker.transform.position.y = projected[1];
-        marker.transform.position.z = .681;
-        marker.transform.scale.x = size;
-        marker.transform.scale.y = size;
-        marker.transform.invalidate();
-        return true;
-    }
+        double backSeatZ =
+                s.rearCabinBase + (truck ? .55 : .46);
 
-    private static boolean onScreen(double x, double z) {
-        return x >= -24 && x <= 24 && z >= -12 && z <= 42;
-    }
+        double rearCushionY =
+                truck ? .68 : .54;
 
-    private static double screenY(double z) {
-        return .942 + (z + 12) / 54 * .190;
-    }
+        double rearBackY =
+                truck ? .98 : .83;
 
-    private void placeMarker(Part marker, double x, double z, double size) {
-        placeProjected(marker, x, .3, z, size);
-    }
+        box(
+                group, "Rear bench supports",
+                0, rearCushionY - .13, backSeatZ,
+                s.width * .62, .11, .42,
+                TRIM
+        );
 
-    private static void hide(Part part) {
-        part.transform.scale.x = .000001;
-        part.transform.scale.y = .000001;
-        part.transform.invalidate();
-    }
+        box(
+                group, "Rear bench cushion",
+                0, rearCushionY, backSeatZ,
+                s.width * .67, .16, .49,
+                SEAT
+        );
 
-    private Node node(GameObject parent, String name, double x, double y, double z) {
-        Node node = new Node();
-        node.setName(name);
-        node.setSolid(false);
-        node.transform.position.x = x;
-        node.transform.position.y = y;
-        node.transform.position.z = z;
-        parent.addChild(node);
-        parts.add(node);
-        return node;
-    }
+        box(
+                group, "Rear bench backrest",
+                0, rearBackY, backSeatZ - .19,
+                s.width * .67,
+                truck ? .58 : .53,
+                .15,
+                SEAT
+        );
 
-    private Part box(
-            GameObject parent, String name,
-            double x, double y, double z,
-            double width, double height, double depth, Material material
-    ) {
-        Part part = mesh(parent, name, CUBE, FACES, material);
-        part.transform.position.x = x;
-        part.transform.position.y = y;
-        part.transform.position.z = z;
-        part.transform.scale.x = width;
-        part.transform.scale.y = height;
-        part.transform.scale.z = depth;
-        return part;
-    }
+        for (int side : new int[]{-1, 0, 1}) {
 
-    private Part mesh(
-            GameObject parent, String name,
-            double[][] vertices, int[][] faces, Material material
-    ) {
-        Part part = new Part(vertices, faces, material);
-        part.setName(name);
-        parent.addChild(part);
-        parts.add(part);
-        return part;
-    }
-
-    private void beam(
-            GameObject parent, String name,
-            double ax, double ay, double az,
-            double bx, double by, double bz,
-            double thickness, Material material
-    ) {
-        double dx = bx - ax;
-        double dy = by - ay;
-        double dz = bz - az;
-        double length = Math.sqrt(dx * dx + dy * dy + dz * dz);
-
-        if (length < 1e-9) return;
-
-        dx /= length;
-        dy /= length;
-        dz /= length;
-
-        double ux = dz;
-        double uz = -dx;
-        double horizontalLength = Math.hypot(ux, uz);
-
-        if (horizontalLength < 1e-9) {
-            ux = 1;
-            uz = 0;
-        } else {
-            ux /= horizontalLength;
-            uz /= horizontalLength;
+            box(
+                    group, "Attached rear headrest",
+                    side * s.width * .21,
+                    rearBackY + .29,
+                    backSeatZ - .23,
+                    .23, .16, .15,
+                    TRIM
+            );
         }
 
-        double vx = dy * uz;
-        double vy = dz * ux - dx * uz;
-        double vz = -dy * ux;
+        double consoleZ = mix(
+                frontSeatZ, dashboardZ, .42
+        );
 
-        double[][] vertices = new double[8][3];
-        double radius = thickness * .5;
+        box(
+                group, "Connected center console",
+                0, truck ? .58 : .49, consoleZ,
+                .24, .18,
+                Math.max(.44, dashboardZ - frontSeatZ),
+                CABIN
+        );
 
-        for (int end = 0; end < 2; end++) {
-            for (int i = 0; i < 4; i++) {
-                double a = i == 0 || i == 3 ? -radius : radius;
-                double b = i < 2 ? -radius : radius;
+        box(
+                group, "Armrest",
+                0, truck ? .72 : .62,
+                frontSeatZ - .14,
+                .25, .12, .36,
+                TRIM
+        );
 
-                vertices[end * 4 + i][0] =
-                        (end == 0 ? ax : bx) + ux * a + vx * b;
-                vertices[end * 4 + i][1] =
-                        (end == 0 ? ay : by) + vy * b;
-                vertices[end * 4 + i][2] =
-                        (end == 0 ? az : bz) + uz * a + vz * b;
+        // Steering wheel position follows the dashboard
+        // and therefore also adjusts for the Cybertruck.
+        double steeringX = -s.halfWidth * .43;
+        double steeringY = truck ? 1.12 : 1.005;
+        double steeringZ = dashboardZ - .28;
+
+        beam(
+                group, "Steering column",
+                steeringX,
+                steeringY - .015,
+                steeringZ + .025,
+                steeringX,
+                dashY - .04,
+                dashboardZ + .08,
+                .075,
+                TRIM
+        );
+
+        Node steering = node(
+                group,
+                "Rotating steering wheel",
+                steeringX,
+                steeringY,
+                steeringZ
+        );
+
+        body.steering = steering;
+
+        torus(
+                steering,
+                "Smooth circular steering rim",
+                .168, .020,
+                CIRCLE_STEPS, 12,
+                BLACK
+        );
+
+        for (int side : new int[]{-1, 1}) {
+
+            beam(
+                    steering, "Wheel spoke",
+                    side * .042, -.022, -.009,
+                    side * .152, -.050, 0,
+                    .030, TRIM
+            );
+        }
+
+        beam(
+                steering, "Lower wheel spoke",
+                0, -.042, -.008,
+                0, -.155, 0,
+                .026, TRIM
+        );
+
+        box(
+                steering, "Steering wheel horn pad",
+                0, 0, -.013,
+                .110, .082, .044,
+                CABIN
+        );
+
+        double screenZ = dashboardZ - .20;
+
+        box(
+                group, "Touchscreen anchored to dash",
+                .11, s.belt + .05, screenZ + .032,
+                .43, .285, .068,
+                BLACK
+        );
+
+        box(
+                group, "Touchscreen display",
+                .11, s.belt + .05, screenZ - .004,
+                .401, .255, .007,
+                TRIM
+        );
+
+        beam(
+                group, "Touchscreen support",
+                .11, dashY - .05, screenZ + .04,
+                .11, s.belt + .03, screenZ + .04,
+                .057, CABIN
+        );
+    }
+
+    private void buildWheels(
+            Node group,
+            Body body,
+            Shape s,
+            TeslaSpec spec
+    ) {
+
+        double tyreWidth =
+                spec.model == TeslaSpec.Model.CYBERTRUCK
+                        ? .32
+                        : spec.type == TeslaSpec.Type.PERFORMANCE
+                        ? .28
+                        : .245;
+
+        for (int i = 0; i < 4; i++) {
+
+            int side = i % 2 == 0 ? -1 : 1;
+            double z = i < 2 ? s.frontAxle : s.rearAxle;
+
+            double x = side * (
+                    s.widthAt(z) - tyreWidth * .47
+            );
+
+            Node pivot = node(
+                    group,
+                    "Suspension and steering pivot " + i,
+                    x,
+                    s.wheelRadius + ROAD_GAP,
+                    z
+            );
+
+            Node rotor = node(
+                    pivot,
+                    "Axial wheel rotor " + i,
+                    0, 0, 0
+            );
+
+            body.pivots[i] = pivot;
+            body.rotors[i] = rotor;
+
+            double r = s.wheelRadius;
+
+            double[][] tireSection = {
+                    {-.48 * tyreWidth, .70 * r},
+                    {-.52 * tyreWidth, .82 * r},
+                    {-.50 * tyreWidth, .92 * r},
+                    {-.34 * tyreWidth, .985 * r},
+                    {-.24 * tyreWidth, r},
+                    {.24 * tyreWidth, r},
+                    {.34 * tyreWidth, .985 * r},
+                    {.50 * tyreWidth, .92 * r},
+                    {.52 * tyreWidth, .82 * r},
+                    {.48 * tyreWidth, .70 * r},
+                    {.30 * tyreWidth, .69 * r},
+                    {-.30 * tyreWidth, .69 * r}
+            };
+
+            revolved(
+                    rotor,
+                    "Rounded rubber tyre",
+                    tireSection,
+                    BLACK
+            );
+
+            cylinder(
+                    rotor,
+                    "Recessed rim barrel",
+                    r * .695,
+                    tyreWidth * .91,
+                    TRIM
+            );
+
+            double outsideX =
+                    side * (tyreWidth * .52 + .004);
+
+            annulus(
+                    rotor,
+                    "Machined outer rim lip",
+                    outsideX,
+                    r * .57,
+                    r * .695,
+                    ALLOY
+            );
+
+            int spokes =
+                    spec.type == TeslaSpec.Type.PERFORMANCE
+                            ? 10
+                            : 8;
+
+            for (int j = 0; j < spokes; j++) {
+
+                double a = 2 * Math.PI * j / spokes;
+
+                beam(
+                        rotor,
+                        "Integrated alloy spoke",
+                        outsideX,
+                        Math.cos(a) * r * .12,
+                        Math.sin(a) * r * .12,
+                        outsideX,
+                        Math.cos(a) * r * .615,
+                        Math.sin(a) * r * .615,
+                        .034,
+                        ALLOY
+                );
             }
-        }
 
-        mesh(parent, name, vertices, FACES, material);
+            cylinder(
+                    rotor,
+                    "Center hub and cap",
+                    r * .135,
+                    tyreWidth + .025,
+                    ALLOY
+            );
+        }
     }
 
-    private void cylinder(
-            GameObject parent, String name,
-            double radius, double width, Material material
+    /**
+     * Cabin calibration.
+     *
+     * Non-truck models retain the original dashboard
+     * placement. Cybertruck uses the actual windshield
+     * roof edge to avoid putting the driver in front of it.
+     */
+    private static double dashboardZ(Shape s) {
+        return Math.min(
+                s.frontCabinBase - .26,
+                s.frontRoofZ + (s.truck ? .48 : .80)
+        );
+    }
+
+    private static double frontSeatZ(Shape s) {
+        return clamp(
+                dashboardZ(s) - .78,
+                s.rearCabinBase + .70,
+                Math.min(
+                        s.frontCabinBase - .40,
+                        s.frontRoofZ - .26
+                )
+        );
+    }
+
+    private static double driverEyeZ(Shape s) {
+        return frontSeatZ(s) + EYE_FORWARD_OF_SEAT;
+    }
+
+    private static double driverEyeY(Shape s) {
+
+        double minimum = s.truck ? 1.48 : 1.26;
+
+        // Eye level adjusts to beltline and roof height
+        // while preserving headroom in low-roof vehicles.
+        return clamp(
+                s.belt + .62 * (s.roofY - s.belt),
+                minimum,
+                Math.max(minimum, s.roofY - .105)
+        );
+    }
+
+    private static boolean valid(
+            double[] a,
+            int index
     ) {
-        int segments = 32;
-        double[][] vertices = new double[segments * 2 + 2][3];
-        int[][] faces = new int[segments * 4][3];
-
-        for (int side = 0; side < 2; side++) {
-            for (int i = 0; i < segments; i++) {
-                double angle = i * Math.PI * 2 / segments;
-                vertices[side * segments + i][0] = (side == 0 ? -.5 : .5) * width;
-                vertices[side * segments + i][1] = Math.cos(angle) * radius;
-                vertices[side * segments + i][2] = Math.sin(angle) * radius;
-            }
-        }
-
-        vertices[segments * 2][0] = -width * .5;
-        vertices[segments * 2 + 1][0] = width * .5;
-
-        for (int i = 0; i < segments; i++) {
-            int next = (i + 1) % segments;
-            faces[i * 4] = new int[]{i, next, next + segments};
-            faces[i * 4 + 1] = new int[]{i, next + segments, i + segments};
-            faces[i * 4 + 2] = new int[]{segments * 2, next, i};
-            faces[i * 4 + 3] =
-                    new int[]{segments * 2 + 1, i + segments, next + segments};
-        }
-
-        mesh(parent, name, vertices, faces, material);
+        return a != null
+                && index < a.length
+                && Double.isFinite(a[index]);
     }
 
-    private static double mix(double a, double b, double t) {
+    private static double mix(
+            double a,
+            double b,
+            double t
+    ) {
         return a + (b - a) * t;
     }
 
-    private static Material material(int r, int g, int b) {
-        return Material.solid(new Color(r, g, b))
+    private static double clamp(
+            double value,
+            double lo,
+            double hi
+    ) {
+        return Math.max(lo, Math.min(hi, value));
+    }
+
+    private static void setVisibility(
+            Node node,
+            boolean visible
+    ) {
+
+        double scale = visible ? 1 : .000001;
+
+        node.transform.scale.x = scale;
+        node.transform.scale.y = scale;
+        node.transform.scale.z = scale;
+
+        node.transform.invalidate();
+    }
+
+    private static Node node(
+            GameObject parent,
+            String name,
+            double x,
+            double y,
+            double z
+    ) {
+
+        Node result = new Node();
+
+        result.setName(name);
+        result.setSolid(false);
+
+        result.transform.position.x = x;
+        result.transform.position.y = y;
+        result.transform.position.z = z;
+
+        parent.addChild(result);
+        result.transform.invalidate();
+
+        return result;
+    }
+
+    private static Part box(
+            GameObject parent,
+            String name,
+            double x,
+            double y,
+            double z,
+            double width,
+            double height,
+            double depth,
+            Material material
+    ) {
+
+        Part part = new Part(
+                CUBE,
+                CUBE_FACES,
+                material
+        );
+
+        part.setName(name);
+        parent.addChild(part);
+
+        part.transform.position.x = x;
+        part.transform.position.y = y;
+        part.transform.position.z = z;
+
+        part.transform.scale.x = width;
+        part.transform.scale.y = height;
+        part.transform.scale.z = depth;
+
+        part.transform.invalidate();
+
+        return part;
+    }
+
+    private static void quad(
+            GameObject parent,
+            String name,
+            double ax, double ay, double az,
+            double bx, double by, double bz,
+            double cx, double cy, double cz,
+            double dx, double dy, double dz,
+            Material material
+    ) {
+
+        MeshBuilder mesh = new MeshBuilder();
+
+        mesh.panel(
+                ax, ay, az,
+                bx, by, bz,
+                cx, cy, cz,
+                dx, dy, dz
+        );
+
+        mesh.finish(parent, name, material);
+    }
+
+    private static void beam(
+            GameObject parent,
+            String name,
+            double ax, double ay, double az,
+            double bx, double by, double bz,
+            double thickness,
+            Material material
+    ) {
+
+        double dx = bx - ax;
+        double dy = by - ay;
+        double dz = bz - az;
+
+        double length = Math.sqrt(
+                dx * dx + dy * dy + dz * dz
+        );
+
+        if (length < 1e-9) {
+            return;
+        }
+
+        double tx = dx / length;
+        double ty = dy / length;
+        double tz = dz / length;
+
+        double ux;
+        double uy;
+        double uz;
+
+        if (Math.abs(ty) < .9) {
+
+            ux = -tz;
+            uy = 0;
+            uz = tx;
+
+        } else {
+
+            ux = 0;
+            uy = tz;
+            uz = -ty;
+        }
+
+        double size = Math.sqrt(
+                ux * ux + uy * uy + uz * uz
+        );
+
+        ux /= size;
+        uy /= size;
+        uz /= size;
+
+        double vx = ty * uz - tz * uy;
+        double vy = tz * ux - tx * uz;
+        double vz = tx * uy - ty * ux;
+
+        final int n = 10;
+
+        double[][] vertices = new double[n * 2 + 2][3];
+        int[][] faces = new int[n * 4][3];
+
+        for (int end = 0; end < 2; end++) {
+
+            double cx = end == 0 ? ax : bx;
+            double cy = end == 0 ? ay : by;
+            double cz = end == 0 ? az : bz;
+
+            for (int j = 0; j < n; j++) {
+
+                double a = 2 * Math.PI * j / n;
+
+                double cs =
+                        Math.cos(a) * thickness * .5;
+
+                double sn =
+                        Math.sin(a) * thickness * .5;
+
+                vertices[end * n + j] = new double[]{
+                        cx + ux * cs + vx * sn,
+                        cy + uy * cs + vy * sn,
+                        cz + uz * cs + vz * sn
+                };
+            }
+
+            vertices[n * 2 + end] = new double[]{
+                    cx, cy, cz
+            };
+        }
+
+        for (int j = 0; j < n; j++) {
+
+            int next = (j + 1) % n;
+
+            faces[j * 4] = new int[]{
+                    j, next, j + n
+            };
+
+            faces[j * 4 + 1] = new int[]{
+                    next, next + n, j + n
+            };
+
+            faces[j * 4 + 2] = new int[]{
+                    n * 2, next, j
+            };
+
+            faces[j * 4 + 3] = new int[]{
+                    n * 2 + 1, j + n, next + n
+            };
+        }
+
+        Part part = new Part(
+                vertices,
+                faces,
+                material
+        );
+
+        part.setName(name);
+        parent.addChild(part);
+    }
+
+    private static void torus(
+            GameObject parent,
+            String name,
+            double radius,
+            double tube,
+            int major,
+            int minor,
+            Material material
+    ) {
+
+        double[][] vertices =
+                new double[major * minor][3];
+
+        int[][] faces =
+                new int[major * minor * 2][3];
+
+        for (int i = 0; i < major; i++) {
+
+            double a = 2 * Math.PI * i / major;
+
+            for (int j = 0; j < minor; j++) {
+
+                double b = 2 * Math.PI * j / minor;
+                double outer = radius + tube * Math.cos(b);
+
+                vertices[i * minor + j] = new double[]{
+                        outer * Math.cos(a),
+                        outer * Math.sin(a),
+                        tube * Math.sin(b)
+                };
+            }
+        }
+
+        for (int i = 0; i < major; i++) {
+
+            int nextI = (i + 1) % major;
+
+            for (int j = 0; j < minor; j++) {
+
+                int nextJ = (j + 1) % minor;
+
+                int a = i * minor + j;
+                int b = nextI * minor + j;
+                int c = nextI * minor + nextJ;
+                int d = i * minor + nextJ;
+
+                int f = (i * minor + j) * 2;
+
+                faces[f] = new int[]{
+                        a, b, c
+                };
+
+                faces[f + 1] = new int[]{
+                        a, c, d
+                };
+            }
+        }
+
+        Part part = new Part(
+                vertices,
+                faces,
+                material
+        );
+
+        part.setName(name);
+        parent.addChild(part);
+    }
+
+    private static void revolved(
+            GameObject parent,
+            String name,
+            double[][] section,
+            Material material
+    ) {
+
+        int bands = section.length;
+        int n = CIRCLE_STEPS;
+
+        double[][] vertices = new double[bands * n][3];
+        int[][] faces = new int[bands * n * 2][3];
+
+        for (int b = 0; b < bands; b++) {
+
+            for (int i = 0; i < n; i++) {
+
+                double a = i * 2 * Math.PI / n;
+
+                vertices[b * n + i] = new double[]{
+                        section[b][0],
+                        section[b][1] * Math.cos(a),
+                        section[b][1] * Math.sin(a)
+                };
+            }
+        }
+
+        for (int b = 0; b < bands; b++) {
+
+            int nextB = (b + 1) % bands;
+
+            for (int i = 0; i < n; i++) {
+
+                int next = (i + 1) % n;
+
+                int a = b * n + i;
+                int c = nextB * n + i;
+                int d = nextB * n + next;
+                int e = b * n + next;
+
+                int f = (b * n + i) * 2;
+
+                faces[f] = new int[]{
+                        a, e, d
+                };
+
+                faces[f + 1] = new int[]{
+                        a, d, c
+                };
+            }
+        }
+
+        Part part = new Part(
+                vertices,
+                faces,
+                material
+        );
+
+        part.setName(name);
+        parent.addChild(part);
+    }
+
+    private static void annulus(
+            GameObject parent,
+            String name,
+            double x,
+            double inner,
+            double outer,
+            Material material
+    ) {
+
+        MeshBuilder mesh = new MeshBuilder();
+
+        for (int i = 0; i < CIRCLE_STEPS; i++) {
+
+            double a =
+                    2 * Math.PI * i / CIRCLE_STEPS;
+
+            double b =
+                    2 * Math.PI * (i + 1) / CIRCLE_STEPS;
+
+            mesh.panel(
+                    x,
+                    inner * Math.cos(a),
+                    inner * Math.sin(a),
+
+                    x,
+                    outer * Math.cos(a),
+                    outer * Math.sin(a),
+
+                    x,
+                    outer * Math.cos(b),
+                    outer * Math.sin(b),
+
+                    x,
+                    inner * Math.cos(b),
+                    inner * Math.sin(b)
+            );
+        }
+
+        mesh.finish(parent, name, material);
+    }
+
+    private static void cylinder(
+            GameObject parent,
+            String name,
+            double radius,
+            double width,
+            Material material
+    ) {
+
+        int n = CIRCLE_STEPS;
+
+        double[][] vertices = new double[2 * n + 2][3];
+        int[][] faces = new int[4 * n][3];
+
+        for (int side = 0; side < 2; side++) {
+
+            for (int i = 0; i < n; i++) {
+
+                double a = 2 * Math.PI * i / n;
+
+                vertices[side * n + i] = new double[]{
+                        (side == 0 ? -.5 : .5) * width,
+                        radius * Math.cos(a),
+                        radius * Math.sin(a)
+                };
+            }
+        }
+
+        vertices[2 * n] = new double[]{
+                -width * .5, 0, 0
+        };
+
+        vertices[2 * n + 1] = new double[]{
+                width * .5, 0, 0
+        };
+
+        for (int i = 0; i < n; i++) {
+
+            int next = (i + 1) % n;
+
+            faces[i * 4] = new int[]{
+                    i, next, next + n
+            };
+
+            faces[i * 4 + 1] = new int[]{
+                    i, next + n, i + n
+            };
+
+            faces[i * 4 + 2] = new int[]{
+                    2 * n, next, i
+            };
+
+            faces[i * 4 + 3] = new int[]{
+                    2 * n + 1, i + n, next + n
+            };
+        }
+
+        Part part = new Part(
+                vertices,
+                faces,
+                material
+        );
+
+        part.setName(name);
+        parent.addChild(part);
+    }
+
+    private static final class MeshBuilder {
+
+        private final List<double[]> vertices =
+                new ArrayList<>();
+
+        private final List<int[]> faces =
+                new ArrayList<>();
+
+        void panel(
+                double ax, double ay, double az,
+                double bx, double by, double bz,
+                double cx, double cy, double cz,
+                double dx, double dy, double dz
+        ) {
+
+            double ux = bx - ax;
+            double uy = by - ay;
+            double uz = bz - az;
+
+            double vx = cx - ax;
+            double vy = cy - ay;
+            double vz = cz - az;
+
+            double nx = uy * vz - uz * vy;
+            double ny = uz * vx - ux * vz;
+            double nz = ux * vy - uy * vx;
+
+            double length = Math.sqrt(
+                    nx * nx + ny * ny + nz * nz
+            );
+
+            if (length < 1e-10) {
+                return;
+            }
+
+            nx *= .002 / length;
+            ny *= .002 / length;
+            nz *= .002 / length;
+
+            double[][] points = {
+                    {ax, ay, az},
+                    {bx, by, bz},
+                    {cx, cy, cz},
+                    {dx, dy, dz}
+            };
+
+            int start = vertices.size();
+
+            for (int side = 0; side < 2; side++) {
+
+                double sign = side == 0 ? 1 : -1;
+
+                for (double[] v : points) {
+
+                    vertices.add(new double[]{
+                            v[0] + nx * sign,
+                            v[1] + ny * sign,
+                            v[2] + nz * sign
+                    });
+                }
+            }
+
+            faces.add(new int[]{
+                    start,
+                    start + 1,
+                    start + 2
+            });
+
+            faces.add(new int[]{
+                    start,
+                    start + 2,
+                    start + 3
+            });
+
+            faces.add(new int[]{
+                    start + 4,
+                    start + 6,
+                    start + 5
+            });
+
+            faces.add(new int[]{
+                    start + 4,
+                    start + 7,
+                    start + 6
+            });
+        }
+
+        void finish(
+                GameObject parent,
+                String name,
+                Material material
+        ) {
+
+            if (faces.isEmpty()) {
+                return;
+            }
+
+            Part part = new Part(
+                    vertices.toArray(new double[0][]),
+                    faces.toArray(new int[0][]),
+                    material
+            );
+
+            part.setName(name);
+            parent.addChild(part);
+        }
+    }
+
+    private static Material color(
+            int r,
+            int g,
+            int b
+    ) {
+
+        return Material.solid(
+                        new Color(r, g, b)
+                )
                 .setAmbient(.42)
                 .setDiffuse(.80);
     }
 
     private static class Node extends GameObject {
+
         @Override
         public double[][] getVertices() {
-            return EMPTY_VERTICES;
+            return new double[0][3];
         }
 
         @Override
         public int[][] getFacesArray() {
-            return EMPTY_FACES;
+            return new int[0][3];
         }
 
         @Override
@@ -846,12 +2290,19 @@ final class CarModel {
     }
 
     private static final class Part extends Node {
+
         private final double[][] vertices;
         private final int[][] faces;
 
-        Part(double[][] vertices, int[][] faces, Material material) {
+        Part(
+                double[][] vertices,
+                int[][] faces,
+                Material material
+        ) {
+
             this.vertices = vertices;
             this.faces = faces;
+
             setMaterial(material);
             setSolid(false);
         }
